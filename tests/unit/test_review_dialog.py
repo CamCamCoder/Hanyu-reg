@@ -5,14 +5,28 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import hanzi_app.service.importer as importer_module
+import hanzi_app.ui.screen_books as screen_books_module
 from hanzi_app.data.models import LessonBoundary, VocabRow
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.ui.dialog_import import DialogReviewBoundaries
 from hanzi_app.ui.screen_books import DialogReviewBook
+
+
+class _FakePreviewWorker(QObject):
+    loaded = Signal(bytes)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, calls, path, start, end, **kwargs):
+        super().__init__(kwargs.get("parent"))
+        calls.append((path, start, end))
+
+    def start(self):
+        return None
 
 
 def _review_row(order, word, page, needs_review):
@@ -203,6 +217,87 @@ def test_xac_nhan_cac_dong_thuoc_nhieu_bai(tmp_path, monkeypatch):
         assert [row["needs_review"] for row in first] == [0, 1, 0]
         assert [row["needs_review"] for row in second] == [0]
         assert _visible_review_words(dialog) == ["老师"]
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_preview_hang_doi_dung_ranh_gioi_bai_duoc_chon(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    calls = []
+    monkeypatch.setattr(
+        screen_books_module,
+        "PreviewWorker",
+        lambda path, start, end, **kwargs: _FakePreviewWorker(
+            calls, path, start, end, **kwargs
+        ),
+    )
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog._show_review_source(2, 4)
+        assert calls[0][1:3] == (8, 12)
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_tai_lai_hang_doi_vo_hieu_hoa_anh_cu(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        old_worker = object()
+        dialog.review_preview_worker = old_worker
+        dialog.review_preview.setText("Đang tải ảnh cũ…")
+
+        dialog._reload_review_queue()
+        dialog._on_review_preview_failed(old_worker, "lỗi ảnh cũ")
+
+        assert dialog.review_preview_worker is None
+        assert dialog.review_preview.text() != "Không mở được ảnh nguồn: lỗi ảnh cũ"
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_chi_hoan_tat_sach_khi_hang_doi_rong(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog._finish_reviewed_book()
+        assert db.get_book(book_id)["import_state"] == "review"
+
+        for row in range(dialog.review_table.rowCount()):
+            dialog.review_table.item(row, 0).setCheckState(
+                Qt.CheckState.Checked
+            )
+        dialog._confirm_selected_rows()
+        assert dialog.btn_finish_book.isEnabled()
+        dialog._finish_reviewed_book()
+        assert db.get_book(book_id)["import_state"] == "ready"
     finally:
         if dialog is not None:
             dialog.deleteLater()

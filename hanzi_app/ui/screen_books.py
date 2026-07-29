@@ -164,6 +164,8 @@ class DialogReviewBook(QDialog):
         self.vision_worker: VisionRepairWorker | None = None
         self.preview_worker: PreviewWorker | None = None
         self._preview_workers: set[PreviewWorker] = set()
+        self.review_preview_worker: PreviewWorker | None = None
+        self._review_preview_workers: set[PreviewWorker] = set()
         self.lessons = user_db.get_lessons(book["id"])
         self.current_lesson: dict | None = None
         self.setWindowTitle(f"Duyệt kết quả nhập — {book['title']}")
@@ -211,10 +213,21 @@ class DialogReviewBook(QDialog):
         self.review_table = QTableWidget(0, len(self._REVIEW_HEADERS))
         self.review_table.setHorizontalHeaderLabels(self._REVIEW_HEADERS)
         self.review_table.setAlternatingRowColors(True)
+        self.review_table.cellClicked.connect(self._show_review_source)
         review_header = self.review_table.horizontalHeader()
         review_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         review_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         review_lay.addWidget(self.review_table, 1)
+        self.review_preview = QLabel(
+            "Chọn một dòng để xem ảnh nguồn của đúng bài"
+        )
+        self.review_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.review_preview.setMinimumHeight(220)
+        self.review_preview.setStyleSheet(
+            f"background: {PALETTE['bg']}; "
+            f"border: 1px solid {PALETTE['line']};"
+        )
+        review_lay.addWidget(self.review_preview, 1)
         self.review_filter.currentIndexChanged.connect(self._apply_review_filter)
         self.review_search.textChanged.connect(self._apply_review_filter)
         self.review_table.itemChanged.connect(self._update_review_actions)
@@ -237,6 +250,11 @@ class DialogReviewBook(QDialog):
         self.btn_confirm_selected.setEnabled(False)
         self.btn_confirm_selected.clicked.connect(self._confirm_selected_rows)
         review_actions.addWidget(self.btn_confirm_selected)
+        self.btn_finish_book = QPushButton("Hoàn tất nhập sách")
+        self.btn_finish_book.setMinimumHeight(42)
+        self.btn_finish_book.setEnabled(False)
+        self.btn_finish_book.clicked.connect(self._finish_reviewed_book)
+        review_actions.addWidget(self.btn_finish_book)
         review_lay.addLayout(review_actions)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -317,6 +335,11 @@ class DialogReviewBook(QDialog):
         return f"Bài {lesson['index_no']}  ·  {lesson['page_start'] + 1}–{lesson['page_end'] + 1}"
 
     def _reload_review_queue(self) -> None:
+        self.review_preview_worker = None
+        self.review_preview.setPixmap(QPixmap())
+        self.review_preview.setText(
+            "Chọn một dòng để xem ảnh nguồn của đúng bài"
+        )
         queue: list[tuple[dict, dict]] = []
         for lesson in self.lessons:
             for word in self.user_db.get_lesson_words(lesson["id"]):
@@ -376,9 +399,12 @@ class DialogReviewBook(QDialog):
         finally:
             self.review_table.blockSignals(False)
 
-        self.lbl_review_count.setText(
-            f"{len(queue)} từ cần xác nhận · thuộc {len(lesson_ids)} bài"
-        )
+        if queue:
+            self.lbl_review_count.setText(
+                f"{len(queue)} từ cần xác nhận · thuộc {len(lesson_ids)} bài"
+            )
+        else:
+            self.lbl_review_count.setText("Đã xác nhận toàn bộ từ")
         self._apply_review_filter()
         self._update_review_actions()
 
@@ -410,10 +436,14 @@ class DialogReviewBook(QDialog):
 
     def _update_review_actions(self, _item=None) -> None:
         selected_count = len(self._selected_review_rows())
+        has_pending = self.review_table.rowCount() > 0
         self.btn_confirm_selected.setText(
             f"Xác nhận các dòng đã chọn ({selected_count})"
         )
         self.btn_confirm_selected.setEnabled(selected_count > 0)
+        self.btn_select_visible.setEnabled(has_pending)
+        self.btn_clear_selection.setEnabled(has_pending)
+        self.btn_finish_book.setEnabled(not has_pending)
 
     def _select_visible_rows(self) -> None:
         self.review_table.blockSignals(True)
@@ -529,6 +559,85 @@ class DialogReviewBook(QDialog):
         finally:
             self.review_table.blockSignals(False)
         self._update_review_actions()
+
+    def _show_review_source(self, row: int, _column: int) -> None:
+        check_item = self.review_table.item(row, 0)
+        if check_item is None:
+            return
+        metadata = check_item.data(Qt.ItemDataRole.UserRole)
+        self.review_preview_worker = None
+        self.review_preview.setPixmap(QPixmap())
+        self.review_preview.setText(
+            f"Đang tải ảnh nguồn Bài {metadata['lesson_index']}…"
+        )
+        worker = PreviewWorker(
+            self.book["file_path"],
+            metadata["page_start"],
+            metadata["page_end"],
+            dpi=125,
+            parent=self,
+        )
+        self.review_preview_worker = worker
+        self._review_preview_workers.add(worker)
+        worker.loaded.connect(
+            lambda data, w=worker: self._on_review_preview_loaded(w, data)
+        )
+        worker.failed.connect(
+            lambda error, w=worker: self._on_review_preview_failed(w, error)
+        )
+        worker.finished.connect(
+            lambda w=worker: self._on_review_preview_finished(w)
+        )
+        worker.start()
+
+    def _on_review_preview_loaded(
+        self, worker: PreviewWorker, data: bytes
+    ) -> None:
+        if worker is not self.review_preview_worker:
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data, "PNG"):
+            self.review_preview.setText(
+                "Không mở được ảnh nguồn: dữ liệu ảnh không hợp lệ"
+            )
+            return
+        self.review_preview.setPixmap(
+            pixmap.scaled(
+                self.review_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+        )
+
+    def _on_review_preview_failed(
+        self, worker: PreviewWorker, error: str
+    ) -> None:
+        if worker is self.review_preview_worker:
+            self.review_preview.setText(
+                f"Không mở được ảnh nguồn: {error}"
+            )
+
+    def _on_review_preview_finished(self, worker: PreviewWorker) -> None:
+        self._review_preview_workers.discard(worker)
+        if worker is self.review_preview_worker:
+            self.review_preview_worker = None
+        worker.deleteLater()
+
+    def _finish_reviewed_book(self) -> None:
+        remaining = sum(
+            int(word.get("needs_review") or 0)
+            for lesson in self.user_db.get_lessons(self.book["id"])
+            for word in self.user_db.get_lesson_words(lesson["id"])
+        )
+        if remaining:
+            QMessageBox.warning(
+                self,
+                "Còn từ chưa xác nhận",
+                f"Còn {remaining} từ cần xác nhận trước khi hoàn tất sách.",
+            )
+            return
+        self.user_db.set_import_state(self.book["id"], "ready")
+        self.accept()
 
     def _load_selected(self, current, _previous=None) -> None:
         if current is None:
