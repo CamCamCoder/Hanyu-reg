@@ -9,6 +9,7 @@ import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -145,6 +147,10 @@ class DialogReviewBook(QDialog):
     """Duyệt ranh giới và bảng từ mới trước khi chuyển sách sang ready."""
 
     _HEADERS = ("STT", "Chữ Hán", "Pinyin", "Từ loại", "Hán-Việt", "Nghĩa Việt", "Trang")
+    _REVIEW_HEADERS = (
+        "Chọn", "Bài", "Trang", "STT", "Chữ Hán",
+        "Pinyin", "Từ loại", "Hán-Việt", "Nghĩa Việt",
+    )
 
     def __init__(
         self, user_db, book: dict, api_key: str | None = None,
@@ -174,6 +180,43 @@ class DialogReviewBook(QDialog):
             f"padding: 9px; border: 1px solid {PALETTE['warn']};"
         )
         root.addWidget(note)
+
+        self.tabs = QTabWidget()
+        self.review_tab = QWidget()
+        self.all_lessons_tab = QWidget()
+        self.tabs.addTab(self.review_tab, "Cần xác nhận")
+        self.tabs.addTab(self.all_lessons_tab, "Tất cả các bài")
+        root.addWidget(self.tabs, 1)
+
+        review_lay = QVBoxLayout(self.review_tab)
+        review_toolbar = QHBoxLayout()
+        self.lbl_review_count = QLabel()
+        self.lbl_review_count.setFont(ui_font(12, bold=True))
+        review_toolbar.addWidget(self.lbl_review_count)
+        review_toolbar.addStretch(1)
+        review_toolbar.addWidget(QLabel("Bài"))
+        self.review_filter = QComboBox()
+        self.review_filter.addItem("Tất cả các bài", None)
+        for lesson in self.lessons:
+            self.review_filter.addItem(
+                f"Bài {lesson['index_no']}", lesson["id"]
+            )
+        review_toolbar.addWidget(self.review_filter)
+        self.review_search = QLineEdit()
+        self.review_search.setPlaceholderText("Tìm chữ Hán, pinyin hoặc nghĩa…")
+        self.review_search.setMinimumWidth(240)
+        review_toolbar.addWidget(self.review_search)
+        review_lay.addLayout(review_toolbar)
+
+        self.review_table = QTableWidget(0, len(self._REVIEW_HEADERS))
+        self.review_table.setHorizontalHeaderLabels(self._REVIEW_HEADERS)
+        self.review_table.setAlternatingRowColors(True)
+        review_header = self.review_table.horizontalHeader()
+        review_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        review_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        review_lay.addWidget(self.review_table, 1)
+        self.review_filter.currentIndexChanged.connect(self._apply_review_filter)
+        self.review_search.textChanged.connect(self._apply_review_filter)
 
         split = QSplitter(Qt.Orientation.Horizontal)
         self.list_lessons = QListWidget()
@@ -239,7 +282,11 @@ class DialogReviewBook(QDialog):
         right_lay.addLayout(actions)
         split.addWidget(right)
         split.setStretchFactor(1, 1)
-        root.addWidget(split, 1)
+        all_lessons_lay = QVBoxLayout(self.all_lessons_tab)
+        all_lessons_lay.setContentsMargins(0, 0, 0, 0)
+        all_lessons_lay.addWidget(split)
+
+        self._reload_review_queue()
 
         if self.list_lessons.count():
             self.list_lessons.setCurrentRow(0)
@@ -247,6 +294,81 @@ class DialogReviewBook(QDialog):
     @staticmethod
     def _lesson_label(lesson: dict) -> str:
         return f"Bài {lesson['index_no']}  ·  {lesson['page_start'] + 1}–{lesson['page_end'] + 1}"
+
+    def _reload_review_queue(self) -> None:
+        queue: list[tuple[dict, dict]] = []
+        for lesson in self.lessons:
+            for word in self.user_db.get_lesson_words(lesson["id"]):
+                if word.get("needs_review"):
+                    queue.append((lesson, word))
+        queue.sort(
+            key=lambda pair: (
+                pair[0]["index_no"],
+                pair[1].get("order_no") or 0,
+                pair[1]["id"],
+            )
+        )
+
+        self.review_table.setRowCount(len(queue))
+        lesson_ids: set[int] = set()
+        for row, (lesson, word) in enumerate(queue):
+            lesson_ids.add(lesson["id"])
+            metadata = {
+                "lesson_id": lesson["id"],
+                "lesson_index": lesson["index_no"],
+                "page_start": lesson["page_start"],
+                "page_end": lesson["page_end"],
+                "word_id": word["id"],
+            }
+            check_item = QTableWidgetItem()
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            check_item.setCheckState(Qt.CheckState.Unchecked)
+            check_item.setData(Qt.ItemDataRole.UserRole, metadata)
+            self.review_table.setItem(row, 0, check_item)
+
+            values = (
+                f"Bài {lesson['index_no']}",
+                word.get("source_page"),
+                word.get("order_no"),
+                word.get("word"),
+                word.get("pinyin_src"),
+                word.get("pos"),
+                word.get("hanviet_src"),
+                word.get("meaning_src"),
+            )
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem("" if value is None else str(value))
+                if column <= 3:
+                    item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    )
+                self.review_table.setItem(row, column, item)
+
+        self.lbl_review_count.setText(
+            f"{len(queue)} từ cần xác nhận · thuộc {len(lesson_ids)} bài"
+        )
+        self._apply_review_filter()
+
+    def _apply_review_filter(self) -> None:
+        lesson_id = self.review_filter.currentData()
+        query = self.review_search.text().strip().casefold()
+        for row in range(self.review_table.rowCount()):
+            check_item = self.review_table.item(row, 0)
+            metadata = check_item.data(Qt.ItemDataRole.UserRole)
+            matches_lesson = (
+                lesson_id is None or metadata["lesson_id"] == lesson_id
+            )
+            searchable = " ".join(
+                self.review_table.item(row, column).text()
+                for column in (4, 5, 7, 8)
+            ).casefold()
+            self.review_table.setRowHidden(
+                row, not (matches_lesson and query in searchable)
+            )
 
     def _load_selected(self, current, _previous=None) -> None:
         if current is None:

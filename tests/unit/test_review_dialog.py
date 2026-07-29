@@ -5,6 +5,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 import hanzi_app.service.importer as importer_module
@@ -12,6 +13,114 @@ from hanzi_app.data.models import LessonBoundary, VocabRow
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.ui.dialog_import import DialogReviewBoundaries
 from hanzi_app.ui.screen_books import DialogReviewBook
+
+
+def _review_row(order, word, page, needs_review):
+    return VocabRow(
+        order_no=order,
+        word=word,
+        pinyin_src={
+            "教室": "jidoshi",
+            "老师": "lǎoshī",
+            "无聊": "wúliáo",
+            "医院": "yīyuàn",
+        }[word],
+        pos="n.",
+        hanviet_src=None,
+        meaning_src={
+            "教室": "lớp học",
+            "老师": "giáo viên",
+            "无聊": "buồn, vô vị",
+            "医院": "bệnh viện",
+        }[word],
+        source_page=page,
+        extract_by="regex",
+        needs_review=needs_review,
+        review_reason=None,
+    )
+
+
+def _make_review_queue_book(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book(
+        title="Boya queue",
+        file_path=str(tmp_path / "book.pdf"),
+        file_hash="review-queue",
+        page_count=20,
+    )
+    db.replace_lessons(
+        book_id,
+        [
+            LessonBoundary(1, "Bài 1", 3, 7, 0.9, "lesson"),
+            LessonBoundary(2, "Bài 2", 8, 12, 0.9, "lesson"),
+        ],
+    )
+    lessons = db.get_lessons(book_id)
+    db.replace_vocab(
+        lessons[0]["id"],
+        [
+            _review_row(1, "教室", 5, True),
+            _review_row(2, "老师", 5, True),
+            _review_row(3, "医院", 6, False),
+        ],
+    )
+    db.replace_vocab(
+        lessons[1]["id"],
+        [_review_row(1, "无聊", 9, True)],
+    )
+    db.set_import_state(book_id, "review")
+    return db, book_id
+
+
+def _visible_review_words(dialog):
+    return [
+        dialog.review_table.item(row, 4).text()
+        for row in range(dialog.review_table.rowCount())
+        if not dialog.review_table.isRowHidden(row)
+    ]
+
+
+def test_hang_doi_hien_ro_bai_trang_va_khong_tich_san(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+
+        assert dialog.tabs.currentIndex() == 0
+        assert dialog.review_table.rowCount() == 3
+        assert dialog.lbl_review_count.text() == "3 từ cần xác nhận · thuộc 2 bài"
+        assert dialog.review_table.item(0, 1).text() == "Bài 1"
+        assert dialog.review_table.item(0, 2).text() == "5"
+        assert all(
+            dialog.review_table.item(row, 0).checkState()
+            == Qt.CheckState.Unchecked
+            for row in range(dialog.review_table.rowCount())
+        )
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_loc_bai_va_tim_kiem_chi_an_hien_dong(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.review_filter.setCurrentText("Bài 2")
+        assert _visible_review_words(dialog) == ["无聊"]
+
+        dialog.review_filter.setCurrentIndex(0)
+        dialog.review_search.setText("jido")
+        assert _visible_review_words(dialog) == ["教室"]
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
 
 
 def test_source_preview_khong_chan_luong_giao_dien(tmp_path, monkeypatch):
