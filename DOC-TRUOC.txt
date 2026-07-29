@@ -1,0 +1,68 @@
+MO APP BANG MOT CU BAM
+======================
+
+QUAN TRONG: CHEP VAO DAU
+------------------------
+
+Cac tep nay phai nam o GOC KHO, tuc la cung cho voi thu muc hanzi_app va tep
+dict.sqlite. Thuong la:
+
+    D:\Hanyu recognize\chay-app.bat
+    D:\Hanyu recognize\tao-shortcut.bat
+    D:\Hanyu recognize\hoc-tu-bo-thu.ico
+
+Neu ban giai nen ra mot thu muc con nhu "entry-icon-shortcut\" thi phai chep
+cac tep RA NGOAI, vao goc kho. De trong thu muc con thi khong chay duoc.
+
+Kiem nhanh: mo D:\Hanyu recognize, phai thay chay-app.bat NAM CANH thu muc
+hanzi_app.
+
+CACH DUNG
+---------
+
+1. Chep het cac tep vao goc kho nhu tren.
+2. Bam doi vao  tao-shortcut.bat
+3. Cua so den se hien va O LAI cho den khi ban bam phim. Doc dong cuoi:
+     - "Xong. Ma thoat 0"  -> ra Desktop tim shortcut.
+     - co chu LOI          -> doc dong loi, hoac gui lai anh chup man hinh.
+
+CAC TEP
+-------
+
+chay-app.bat          Mo app, KHONG hien cua so den.
+                      Thu lan luot pythonw, pyw, py -w, roi python.
+
+chay-app-go-loi.bat   Ban go loi: GIU cua so den lai de doc traceback.
+                      Dung khi app khong mo len hoac tat ngang.
+
+tao-shortcut.bat      Tao shortcut tren Desktop. Chi can chay mot lan.
+                      Co kiem tra tung buoc va giu cua so lai.
+tao-shortcut.ps1      Phan viec that, tep tren goi tep nay.
+
+hoc-tu-bo-thu.ico     Icon, bay co tu 16 den 256 px.
+
+GHIM VAO TASKBAR
+----------------
+
+Bam phai vao shortcut tren Desktop -> "Show more options" -> "Pin to taskbar".
+
+CACH THU CONG, KHI KICH BAN KHONG CHAY
+--------------------------------------
+
+Khong can PowerShell, chi 5 buoc:
+
+1. Mo D:\Hanyu recognize
+2. Bam phai vao chay-app.bat -> "Show more options" -> "Send to"
+   -> "Desktop (create shortcut)"
+3. Ra Desktop, bam phai vao shortcut vua tao -> Rename
+   -> go: Hoc tu qua bo thu
+4. Bam phai vao no lan nua -> Properties -> Change Icon...
+5. Bam Browse, tro toi D:\Hanyu recognize\hoc-tu-bo-thu.ico -> OK -> OK
+
+Xong.
+
+KHI APP KHONG MO LEN
+--------------------
+
+Bam doi vao chay-app-go-loi.bat, doc dong loi cuoi cung roi gui lai.
+Cua so do co giu lai nen doc duoc, khac voi chay-app.bat.

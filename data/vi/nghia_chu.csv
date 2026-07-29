@@ -1,0 +1,723 @@
+# am Han-Viet va nghia tieng Viet cho bang `char` cua dict.sqlite
+# Dinh dang: char|hanviet|meaning_vi
+# --- chu xuat hien trong tu HSK 1 (174 chu) ---
+一|nhất|một
+七|thất|bảy
+三|tam|ba
+上|thượng|trên, lên
+下|hạ|dưới, xuống
+不|bất|không
+东|đông|phía đông
+个|cá|cái, chiếc
+中|trung|giữa, ở trong
+么|ma|trợ từ nghi vấn
+九|cửu|chín
+习|tập|học, luyện; thói quen
+书|thư|sách; viết
+买|mãi|mua
+了|liễu|xong, rồi
+二|nhị|hai
+五|ngũ|năm (số 5)
+些|ta|một vài, một ít
+京|kinh|kinh đô
+亮|lượng|sáng
+人|nhân|người
+什|thập|cái gì; tạp nhạp
+今|kim|nay, hiện nay
+他|tha|anh ấy; khác
+们|môn|hậu tố số nhiều
+会|hội|biết làm; họp
+住|trụ|ở, cư trú
+作|tác|làm, sáng tác
+你|nhĩ|bạn, anh, chị
+候|hậu|chờ, đợi
+做|tố|làm
+儿|nhi|con, trẻ con
+先|tiên|trước, đầu tiên
+八|bát|tám
+六|lục|sáu
+关|quan|đóng; cửa ải; liên quan
+兴|hưng|hưng thịnh; hứng thú
+再|tái|lại, lần nữa
+写|tả|viết
+冷|lãnh|lạnh
+几|kỷ|mấy, vài
+出|xuất|ra, đi ra
+分|phân|chia; phút
+前|tiền|trước, phía trước
+北|bắc|phía bắc
+医|y|chữa bệnh, y học
+十|thập|mười
+午|ngọ|buổi trưa
+去|khứ|đi
+友|hữu|bạn
+叫|khiếu|gọi, kêu
+号|hiệu|số; dấu hiệu
+吃|cật|ăn
+同|đồng|cùng, giống nhau
+名|danh|tên
+后|hậu|sau, phía sau
+吗|ma|trợ từ nghi vấn
+听|thính|nghe
+呢|ni|trợ từ nghi vấn
+和|hòa|và; hòa thuận
+哪|na|nào
+商|thương|buôn bán
+喂|uy|a lô; cho ăn
+喜|hỉ|vui, mừng
+喝|hát|uống
+四|tứ|bốn
+回|hồi|về, quay lại
+国|quốc|nước, quốc gia
+在|tại|ở, tại
+坐|tọa|ngồi
+块|khối|cục, miếng
+多|đa|nhiều
+大|đại|to, lớn
+天|thiên|trời; ngày
+太|thái|quá, rất
+女|nữ|nữ, con gái
+她|tha|cô ấy
+好|hảo|tốt, hay
+妈|ma|mẹ
+姐|tỷ|chị
+子|tử|con; hạt
+字|tự|chữ
+学|học|học
+客|khách|khách
+家|gia|nhà, gia đình
+对|đối|đúng; đối diện
+小|tiểu|nhỏ
+少|thiểu|ít
+岁|tuế|tuổi
+工|công|công việc; thợ
+师|sư|thầy, bậc thầy
+年|niên|năm
+店|điếm|cửa hàng
+开|khai|mở
+影|ảnh|bóng; hình ảnh
+很|ngận|rất
+怎|chẩm|thế nào
+想|tưởng|nghĩ; muốn; nhớ
+我|ngã|tôi
+打|đả|đánh
+时|thời|thời gian
+明|minh|sáng, rõ
+星|tinh|sao
+昨|tạc|hôm qua
+是|thị|là, phải
+月|nguyệt|trăng; tháng
+有|hữu|có
+朋|bằng|bạn
+服|phục|quần áo; uống thuốc
+期|kỳ|kỳ hạn, thời kỳ
+本|bản|gốc, nguồn
+机|cơ|máy; cơ hội
+来|lai|đến
+杯|bôi|cốc, ly
+果|quả|quả; kết quả
+校|hiệu|trường học
+样|dạng|dáng, kiểu
+桌|trác|cái bàn
+椅|ỷ|cái ghế
+欢|hoan|vui mừng
+气|khí|khí, hơi
+水|thủy|nước
+汉|hán|người Hán, tiếng Hán
+没|một|không có; chìm
+漂|phiêu|trôi nổi; đẹp
+点|điểm|chấm, điểm
+热|nhiệt|nóng
+爱|ái|yêu
+爸|ba|bố
+狗|cẩu|chó
+猫|miêu|mèo
+现|hiện|hiện ra; hiện nay
+生|sinh|sinh, sống
+电|điện|điện
+的|đích|của; đích
+看|khán|xem, nhìn
+睡|thụy|ngủ
+租|tô|thuê
+米|mễ|gạo
+系|hệ|hệ thống; buộc
+老|lão|già
+能|năng|có thể
+脑|não|não
+苹|bình|táo
+茶|trà|trà
+菜|thái|rau; món ăn
+衣|y|áo, quần áo
+西|tây|phía tây
+见|kiến|thấy, gặp
+视|thị|nhìn, xem
+觉|giác|cảm thấy; ngủ
+认|nhận|nhận, biết
+识|thức|biết, hiểu biết
+话|thoại|lời nói
+语|ngữ|ngôn ngữ
+说|thuyết|nói
+请|thỉnh|mời, xin
+读|độc|đọc
+谁|thùy|ai
+谢|tạ|cảm ơn
+起|khởi|dậy; bắt đầu
+车|xa|xe
+这|giá|này, đây
+那|na|đó, kia
+都|đô|đều; đô thị
+里|lý|trong; dặm
+钟|chung|chuông; đồng hồ
+钱|tiền|tiền
+院|viện|viện; sân
+雨|vũ|mưa
+面|diện|mặt; mì
+飞|phi|bay
+饭|phạn|cơm
+高|cao|cao
+# --- thanh phan chiet tu cua chu HSK 1, khong phai bo thu (62 chu) ---
+⺊|bốc|dạng biến thể của bộ 卜, bói toán
+⺍|tiểu|dạng biến thể của bộ 小
+丁|đinh|can thứ tư; cái đinh
+丂|khảo|hơi thở bị cản (chữ cổ)
+丄|thượng|dạng cổ của 上, ở trên
+与|dữ|và, với; cho
+且|thả|vả lại, hơn nữa
+丩|cù|quấn, xoắn (chữ cổ)
+主|chủ|chủ, chính
+乍|sạ|chợt, thoạt
+乛|ất|dạng biến thể của bộ 乙
+乞|khất|xin, ăn xin
+也|dã|cũng
+云|vân|mây; nói rằng
+交|giao|giao nhau, trao đổi
+从|tòng|theo; từ
+令|lệnh|ra lệnh; khiến cho
+兀|ngột|cao mà bằng; trơ trọi
+兑|đoài|đổi; quẻ Đoài
+其|kỳ|ấy, đó
+冉|nhiễm|dần dần
+冋|quynh|vùng ngoài xa (chữ cổ)
+冏|quýnh|sáng; bối rối
+凡|phàm|phàm, thường
+凶|hung|hung dữ, xấu
+刖|nguyệt|hình phạt chặt chân
+勺|chước|cái muôi, cái thìa
+卓|trác|cao, vượt trội
+卖|mại|bán
+占|chiếm|chiếm; bói toán
+反|phản|ngược lại, chống lại
+句|cú|câu
+只|chỉ|chỉ, mỗi; con (lượng từ)
+各|các|mỗi, các
+吾|ngô|ta, tôi
+垂|thùy|rủ xuống, buông
+壴|trú|cái trống (chữ cổ)
+夬|quái|dứt khoát; quẻ Quải
+头|đầu|đầu
+奇|kỳ|lạ, kỳ lạ
+完|hoàn|xong, hoàn thành
+射|xạ|bắn
+尔|nhĩ|ngươi, anh
+尼|ni|ni cô
+巴|ba|mong mỏi; bám vào
+帀|táp|vòng quanh (chữ cổ)
+平|bình|bằng phẳng, yên ổn
+戋|tiên|nhỏ bé, ít ỏi
+才|tài|tài năng; vừa mới
+执|chấp|cầm, nắm giữ
+故|cố|cũ; cho nên
+景|cảnh|cảnh vật
+曷|hạt|sao, cái gì (chữ cổ)
+未|vị|chưa
+此|thử|này, đây
+畏|úy|sợ, kính sợ
+相|tương|lẫn nhau; xem xét
+矦|hầu|dạng cổ của 侯, tước hầu
+票|phiếu|vé, phiếu
+者|giả|người, kẻ
+苗|miêu|mầm, mạ
+采|thái|hái, chọn lấy
+# --- chu trong tu HSK 2-3 va thanh phan chiet tu (482 chu) ---
+万|vạn|vạn, mười nghìn
+丈|trượng|trượng (đơn vị đo); chồng
+世|thế|đời, thế hệ; thế giới
+丙|bính|bính (can thứ ba)
+业|nghiệp|nghề nghiệp; sự nghiệp
+两|lưỡng|hai; lạng
+丰|phong|dồi dào, phong phú
+为|vi|làm; vì
+乂|nghệ|cai trị; cắt cỏ
+乃|nãi|bèn, thì là
+久|cửu|lâu
+义|nghĩa|nghĩa, đạo nghĩa
+乎|hồ|trợ từ nghi vấn (chữ cổ)
+乐|lạc|vui; âm nhạc
+予|dữ|cho, ban cho
+争|tranh|tranh giành
+事|sự|việc, sự việc
+亍|xúc|bước ngắn (chữ cổ)
+于|vu|ở, tại; đối với
+井|tỉnh|cái giếng
+亡|vong|mất, chết; trốn
+亥|hợi|hợi (chi thứ mười hai)
+亦|diệc|cũng
+亲|thân|thân thiết; cha mẹ
+介|giới|trung gian; giới thiệu
+仌|băng|băng giá (chữ cổ)
+付|phó|trả, giao cho
+以|dĩ|lấy, dùng; để mà
+件|kiện|cái, chiếc; vụ việc
+休|hưu|nghỉ ngơi
+伞|tán|cái ô, cái dù
+但|đãn|nhưng; chỉ
+位|vị|vị trí; ngôi
+体|thể|thân thể; hình thức
+余|dư|dư, thừa; ta
+佥|thiêm|đều, cùng (chữ cổ)
+便|tiện|tiện lợi
+信|tín|tin tưởng; lá thư
+借|tá|mượn; cho mượn
+假|giả|giả dối; nghỉ phép
+健|kiện|khỏe mạnh
+像|tượng|giống; hình tượng
+元|nguyên|đầu tiên; đồng (tiền)
+兆|triệu|điềm báo; triệu
+免|miễn|miễn, tránh
+公|công|công cộng; ông
+共|cộng|cùng, chung
+兵|binh|lính, binh sĩ
+具|cụ|đồ dùng; đầy đủ
+典|điển|điển tích, kinh điển
+冈|cương|gò, đồi
+冒|mạo|mạo hiểm; đội lên
+冬|đông|mùa đông
+冰|băng|băng, nước đá
+决|quyết|quyết định
+净|tịnh|sạch sẽ
+准|chuẩn|chuẩn mực; cho phép
+刍|sô|cắt cỏ; cỏ khô
+刚|cương|cứng rắn; vừa mới
+别|biệt|chia lìa; khác; đừng
+刮|quát|cạo; thổi (gió)
+到|đáo|đến, tới
+刷|loát|chải, quét, in
+刻|khắc|khắc, chạm; mười lăm phút
+办|biện|làm, xử lý
+加|gia|thêm vào
+务|vụ|công việc, nhiệm vụ
+动|động|chuyển động
+助|trợ|giúp đỡ
+努|nỗ|nỗ lực, gắng sức
+勿|vật|chớ, đừng
+包|bao|bọc, gói; cái túi
+化|hóa|biến hóa, thay đổi
+千|thiên|nghìn
+卅|táp|ba mươi
+半|bán|một nửa
+卑|ti|thấp hèn; khiêm nhường
+单|đơn|đơn lẻ; tờ đơn
+南|nam|phía nam
+卡|tạp|cái thẻ, phiếu
+卬|ngang|ngẩng lên, cao
+卯|mão|mão (chi thứ tư)
+却|khước|nhưng, lại; lui
+厄|ách|tai ách, khốn khó
+历|lịch|lịch sử; lịch
+原|nguyên|gốc, nguyên; đồng bằng
+参|tham|tham gia
+及|cập|đến, kịp; và
+双|song|đôi, cặp
+发|phát|phát ra, gửi đi
+叔|thúc|chú
+取|thủ|lấy, nhận
+变|biến|biến đổi
+叚|giả|mượn (chữ cổ)
+叟|tẩu|ông già
+古|cổ|xưa, cổ
+另|lánh|khác, riêng
+召|triệu|triệu tập, gọi
+可|khả|có thể
+台|đài|đài, bục; cái (lượng từ máy)
+史|sử|lịch sử
+右|hữu|bên phải
+司|ty|coi giữ, quản lý
+合|hợp|hợp lại; phù hợp
+吉|cát|tốt lành
+向|hướng|hướng về
+君|quân|vua; ngài
+吧|ba|trợ từ đề nghị
+告|cáo|báo, nói cho biết
+员|viên|nhân viên, thành viên
+周|chu|vòng quanh; tuần
+咖|ca|dùng phiên âm, như cà phê
+咸|hàm|mặn; đều
+响|hưởng|vang, kêu; ảnh hưởng
+哥|ca|anh trai
+哭|khốc|khóc
+唱|xướng|hát
+啊|a|trợ từ cảm thán
+啡|phi|dùng phiên âm, như cà phê
+啤|bì|bia
+喿|táo|tiếng chim kêu
+嘴|chủy|miệng, mồm
+因|nhân|nguyên nhân; vì
+园|viên|vườn, công viên
+图|đồ|bản đồ, hình vẽ
+圣|thánh|thánh, thần thánh
+圭|khuê|ngọc khuê
+地|địa|đất, nơi chốn
+场|trường|sân, bãi
+坏|hoại|hỏng; xấu
+城|thành|thành phố, thành lũy
+境|cảnh|ranh giới; hoàn cảnh
+声|thanh|âm thanh, tiếng
+备|bị|chuẩn bị; đầy đủ
+复|phục|lại, lặp lại; trả lời
+夏|hạ|mùa hè
+外|ngoại|ngoài, bên ngoài
+夫|phu|chồng; người đàn ông
+夭|yểu|chết non; tươi tốt
+失|thất|mất; thất bại
+夷|di|bộ tộc phương đông; bằng phẳng
+奂|hoán|rực rỡ, nhiều
+奴|nô|nô lệ, đầy tớ
+奶|nãi|sữa; bà
+如|như|như, giống như
+妹|muội|em gái
+妻|thê|vợ
+妾|thiếp|vợ lẽ
+始|thủy|bắt đầu
+姓|tính|họ
+委|ủy|ủy thác, giao phó
+姨|di|dì, em gái của mẹ
+娄|lâu|sao Lâu; họ Lâu
+婚|hôn|hôn nhân, cưới
+孝|hiếu|hiếu thảo
+季|quý|mùa; con út
+孩|hài|đứa trẻ
+它|tha|nó
+安|an|yên ổn, an toàn
+官|quan|quan chức
+定|định|quyết định; ổn định
+宛|uyển|như thể; uốn khúc
+宜|nghi|thích hợp, nên
+实|thực|thật, thực tế
+室|thất|phòng, nhà
+害|hại|hại, làm hại
+容|dung|chứa đựng; dung mạo
+宾|tân|khách
+寺|tự|chùa; sở quan
+尚|thượng|còn, vẫn; chuộng
+尤|vưu|đặc biệt, càng
+尧|nghiêu|vua Nghiêu
+就|tựu|thì, liền; đi tới
+尺|xích|thước (đơn vị đo)
+层|tằng|tầng, lớp
+居|cư|ở, cư trú
+左|tả|bên trái
+差|sai|sai lệch; kém
+已|dĩ|đã, rồi
+巳|tỵ|tỵ (chi thứ sáu)
+市|thị|chợ; thành phố
+布|bố|vải; bày ra, công bố
+希|hy|hiếm; mong mỏi
+带|đới|dây, đai; mang theo
+帮|bang|giúp đỡ
+常|thường|thường xuyên; bình thường
+帽|mạo|cái mũ
+并|tịnh|hợp lại; đồng thời
+床|sàng|cái giường
+库|khố|kho
+应|ứng|nên; đáp lại
+康|khang|khỏe mạnh, an khang
+建|kiến|xây dựng
+式|thức|kiểu, cách thức
+弟|đệ|em trai
+张|trương|mở ra; tờ (lượng từ)
+当|đương|đang; nên; đảm nhận
+录|lục|ghi chép
+彦|ngạn|người tài giỏi
+往|vãng|đi; hướng về; đã qua
+得|đắc|được, đạt được
+必|tất|tất nhiên, nhất định
+忘|vong|quên
+忙|mang|bận rộn
+快|khoái|nhanh; vui
+怕|phạ|sợ
+思|tư|nghĩ, suy nghĩ
+急|cấp|gấp, vội
+怪|quái|kỳ lạ; trách
+总|tổng|tổng cộng; luôn luôn
+息|tức|ngừng; hơi thở; tin tức
+您|nâm|ngài (kính ngữ)
+情|tình|tình cảm
+惯|quán|quen, thói quen
+意|ý|ý, ý nghĩ
+感|cảm|cảm thấy, cảm động
+愿|nguyện|nguyện, mong muốn
+慢|mạn|chậm
+懂|đổng|hiểu
+戉|việt|cái rìu (chữ cổ)
+戏|hí|trò chơi, tuồng kịch
+成|thành|thành công; trở thành
+或|hoặc|hoặc là
+房|phòng|căn phòng, nhà
+所|sở|nơi chốn; cái mà
+扫|tảo|quét
+找|trảo|tìm
+把|bả|nắm, cầm; đem
+护|hộ|bảo vệ, che chở
+报|báo|báo cáo; tờ báo
+担|đảm|gánh; đảm nhận
+择|trạch|chọn lựa
+拿|nã|cầm, lấy
+换|hoán|đổi, thay
+据|cứ|căn cứ; chiếm giữ
+接|tiếp|nối; tiếp nhận; đón
+提|đề|nâng, xách; nêu ra
+搬|ban|dọn, chuyển
+放|phóng|thả ra; đặt
+教|giáo|dạy, giáo dục
+数|số|số, đếm
+料|liệu|nguyên liệu; liệu trước
+斥|xích|quở trách, bài xích
+新|tân|mới
+斿|du|bơi, đi chơi (chữ cổ)
+旁|bàng|bên cạnh
+旅|lữ|đi xa, lữ hành
+旦|đán|buổi sớm
+旧|cựu|cũ
+早|tảo|sớm
+昌|xương|hưng thịnh, sáng sủa
+昏|hôn|hoàng hôn; mê man
+易|dị|dễ; đổi
+昔|tích|ngày xưa
+春|xuân|mùa xuân
+昭|chiêu|sáng rõ
+晚|vãn|muộn; buổi tối
+晴|tình|trời nắng, quang đãng
+曲|khúc|cong; khúc nhạc
+更|canh|càng; thay đổi
+曼|mạn|dài; đẹp
+最|tối|nhất
+望|vọng|nhìn xa; mong đợi
+末|mạt|cuối, ngọn
+朵|đóa|đóa (hoa); vành tai
+李|lý|cây mận; họ Lý
+束|thúc|bó, buộc; ràng buộc
+条|điều|sợi, dải; điều khoản
+板|bản|tấm ván, cái bảng
+极|cực|cực, rất
+林|lâm|rừng
+查|tra|tra cứu, kiểm tra
+柬|giản|thiếp, thư mời
+树|thụ|cây
+根|căn|rễ, gốc
+梯|thê|cái thang
+检|kiểm|kiểm tra
+楚|sở|rõ ràng; nước Sở
+楼|lâu|lầu, tòa nhà
+次|thứ|thứ tự; lần
+歌|ca|bài hát; hát
+正|chính|ngay thẳng, đúng
+步|bộ|bước đi
+段|đoạn|đoạn, khúc
+每|mỗi|mỗi, mọi
+永|vĩnh|vĩnh viễn, mãi mãi
+氺|thủy|dạng biến thể của bộ 水
+求|cầu|cầu xin; tìm kiếm
+汽|khí|hơi nước; xăng
+河|hà|sông
+法|pháp|phép tắc, phương pháp
+注|chú|chú ý; rót vào
+泳|vịnh|bơi
+洗|tẩy|rửa, giặt
+清|thanh|trong, sạch; rõ
+渴|khát|khát
+游|du|bơi; đi chơi
+满|mãn|đầy, tràn
+澡|táo|tắm rửa
+灯|đăng|đèn
+炼|luyện|luyện, tôi rèn
+烧|thiêu|đốt, nướng; sốt
+無|vô|không có
+焦|tiêu|cháy khét; lo lắng
+然|nhiên|đúng vậy; nhưng
+照|chiếu|chiếu sáng; chụp ảnh
+熊|hùng|con gấu
+爬|ba|bò, leo trèo
+爷|gia|ông nội; cha
+物|vật|vật, đồ vật
+特|đặc|đặc biệt
+玩|ngoạn|chơi đùa
+环|hoàn|vòng, khuyên; bao quanh
+班|ban|lớp, ca kíp
+球|cầu|quả bóng, quả cầu
+理|lý|lý lẽ; quản lý
+瓶|bình|cái bình, cái chai
+甜|điềm|ngọt
+由|do|do, bởi; nguyên do
+男|nam|nam, con trai
+画|họa|vẽ; bức tranh
+畀|tí|cho, ban cho
+界|giới|ranh giới; thế giới
+留|lưu|ở lại, giữ lại
+疼|đông|đau; thương yêu
+病|bệnh|bệnh, ốm
+瘦|sấu|gầy
+百|bách|trăm
+监|giám|giám sát
+盘|bàn|cái mâm, cái đĩa
+直|trực|thẳng, ngay thẳng
+真|chân|thật, chân thật
+眼|nhãn|mắt
+着|trước|trợ từ chỉ đang diễn ra
+睛|tinh|con ngươi, tròng mắt
+知|tri|biết
+短|đoản|ngắn
+矮|ải|thấp, lùn
+碗|oản|cái bát
+礼|lễ|lễ nghi, lễ phép
+禺|ngu|vùng đất; con khỉ
+离|ly|rời xa, cách
+秋|thu|mùa thu
+种|chủng|loại, giống; trồng
+空|không|trống rỗng; không trung
+穿|xuyên|xuyên qua; mặc
+突|đột|đột nhiên; xông ra
+站|trạm|đứng; nhà ga
+竟|cánh|rốt cuộc; xong
+笑|tiếu|cười
+笔|bút|cây bút
+第|đệ|thứ (số thứ tự)
+等|đẳng|hạng, bậc; đợi
+答|đáp|trả lời
+筷|khoái|cái đũa
+简|giản|đơn giản; lá thư
+算|toán|tính toán
+箱|tương|cái hòm, cái thùng
+篮|lam|cái giỏ, cái rổ
+糕|cao|bánh
+累|lụy|mệt; tích lũy
+红|hồng|màu đỏ
+约|ước|hẹn ước, giao ước
+级|cấp|cấp bậc
+纸|chỉ|giấy
+练|luyện|luyện tập
+终|chung|cuối cùng, kết thúc
+绍|thiệu|nối tiếp; giới thiệu
+经|kinh|kinh điển; trải qua
+结|kết|kết, buộc; kết quả
+给|cấp|cấp cho, cho
+绩|tích|thành tích
+绿|lục|màu xanh lá
+羔|cao|con dê con
+考|khảo|thi; khảo sát
+聊|liêu|trò chuyện; tạm
+聪|thông|thông minh; thính
+肰|nhiên|thịt chó (chữ cổ)
+育|dục|nuôi dưỡng, giáo dục
+胖|bàn|béo, mập
+脚|cước|bàn chân
+脸|kiểm|khuôn mặt
+腿|thoái|chân, đùi
+舍|xá|nhà; bỏ đi
+舒|thư|thoải mái; duỗi ra
+舞|vũ|múa, nhảy
+般|ban|loại, kiểu
+船|thuyền|thuyền, tàu
+节|tiết|đốt, mấu; ngày lễ
+花|hoa|hoa; tiêu tiền
+草|thảo|cỏ; bản thảo
+药|dược|thuốc
+董|đổng|giám sát; họ Đổng
+蓝|lam|màu xanh lam
+蕉|tiêu|cây chuối
+虽|tuy|tuy rằng
+蛋|đản|quả trứng
+街|nhai|đường phố
+表|biểu|biểu lộ; đồng hồ; cái bảng
+衫|sam|cái áo
+衬|sấn|áo lót; làm nền
+被|bị|bị (bị động); cái chăn
+裙|quần|cái váy
+裤|khố|cái quần
+要|yếu|quan trọng; muốn
+觜|tuy|mỏ chim
+解|giải|giải thích; cởi ra
+让|nhượng|nhường; để cho
+议|nghị|bàn bạc, nghị luận
+记|ký|ghi chép; nhớ
+讲|giảng|giảng giải, nói
+诉|tố|tố cáo; nói cho biết
+词|từ|từ ngữ
+试|thí|thử; thi
+该|cai|nên, phải; cái đó
+课|khóa|bài học, môn học
+调|điệu|điệu, giọng; điều chỉnh
+象|tượng|con voi; hình tượng
+责|trách|trách nhiệm; quở trách
+贯|quán|xuyên suốt; xâu tiền
+贵|quý|đắt; quý giá
+赛|tái|thi đấu
+超|siêu|vượt qua
+越|việt|vượt qua; nước Việt
+趣|thú|hứng thú
+跑|bào|chạy
+跟|cân|gót chân; đi theo
+路|lộ|con đường
+跳|khiêu|nhảy
+踢|thích|đá
+轻|khinh|nhẹ; xem nhẹ
+较|giảo|so sánh; tương đối
+辆|lượng|chiếc (lượng từ cho xe)
+边|biên|bên, rìa
+过|quá|qua; vượt quá
+迎|nghênh|đón tiếp
+运|vận|vận chuyển; vận may
+近|cận|gần
+还|hoàn|trả lại; còn, vẫn
+进|tiến|tiến vào
+远|viễn|xa
+迟|trì|chậm, muộn
+退|thoái|lùi, rút lui
+送|tống|tiễn; tặng
+选|tuyển|chọn lựa
+遇|ngộ|gặp gỡ
+道|đạo|con đường; đạo lý
+邦|bang|nước, bang
+邮|bưu|bưu điện, thư tín
+邻|lân|hàng xóm
+酒|tửu|rượu
+重|trọng|nặng; quan trọng
+铁|thiết|sắt
+铅|duyên|chì
+银|ngân|bạc; tiền
+错|thác|sai lầm
+锻|đoán|rèn, tôi luyện
+问|vấn|hỏi
+间|gian|khoảng giữa; căn (phòng)
+闻|văn|nghe; tin tức
+阳|dương|dương; mặt trời
+阴|âm|âm; râm mát
+阿|a|tiền tố xưng hô thân mật
+附|phụ|kèm theo; phụ thuộc
+除|trừ|trừ bỏ; ngoài ra
+难|nan|khó
+雪|tuyết|tuyết
+零|linh|số không; lẻ
+需|nhu|cần; nhu cầu
+静|tĩnh|yên tĩnh
+鞋|hài|giày
+须|tu|râu; phải, cần
+顾|cố|nhìn lại; chăm sóc
+题|đề|đề bài, tiêu đề
+颜|nhan|sắc mặt; màu sắc
+饮|ẩm|uống
+饱|bão|no
+饿|ngạ|đói
+馆|quán|quán, nhà (công cộng)
+骑|kỵ|cưỡi
+鲜|tiên|tươi; ngon
+鸡|kê|con gà

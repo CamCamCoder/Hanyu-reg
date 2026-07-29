@@ -1,0 +1,188 @@
+"""Adapter gọi API LLM (Text & Vision) ép lược đồ JSON cho bóc tách sách.
+
+Chỉ tầng adapter chứa mã gọi API / HTTP. Hỗ trợ cả text và ảnh trang quét (Vision AI).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+from typing import Any
+from urllib.error import HTTPError
+
+logger = logging.getLogger(__name__)
+
+
+class AiClientError(RuntimeError):
+    """Lỗi AI phải nổi lên tầng điều phối, không giả thành kết quả rỗng."""
+
+
+class AiRateLimitError(AiClientError):
+    """Google từ chối request do giới hạn tần suất hoặc quota."""
+
+    def __init__(self, retry_after: int | None = None) -> None:
+        self.retry_after = retry_after
+        message = "Gemini đang giới hạn lượt gọi (HTTP 429)"
+        if retry_after is not None:
+            message += f"; thử lại sau {retry_after} giây"
+        super().__init__(message)
+
+# Prompt cho phân tách bài học từ ảnh/text
+PROMPT_SPLIT_LESSONS = """Bạn là chuyên gia phân tích giáo trình tiếng Trung / song ngữ (như Boya, Hán ngữ).
+Dưới đây là thông tin / ảnh các trang PDF.
+Hãy nhận diện danh sách các bài học (Lessons) và trả về KẾT QUẢ DUY NHẤT dưới dạng CHUỖI JSON như sau:
+
+[
+  {{
+    "index_no": 1,
+    "title": "Bài 1: 你好 (Xin chào)",
+    "page_start": 0,
+    "page_end": 10
+  }}
+]
+
+Không kèm theo lời giải thích nào khác ngoài JSON.
+
+Thông tin trang:
+{summaries_text}
+"""
+
+# Prompt cho bóc tách từ vựng từ ảnh/text trang sách
+PROMPT_EXTRACT_VOCAB = """Bạn là chuyên gia bóc tách từ vựng từ giáo trình tiếng Trung (bảng 生词表).
+Ảnh đầu vào đã được crop chỉ còn vùng bảng. Hãy CHÉP NGUYÊN VĂN từng ô,
+không dịch, không bổ sung và không suy đoán nội dung bị khuất. Trả về KẾT QUẢ
+DUY NHẤT dưới dạng CHUỖI JSON như sau:
+
+[
+  {{
+    "order_no": 1,
+    "word": "你好",
+    "pinyin": "nǐhǎo",
+    "pos": "v.",
+    "hanviet": "nhĩ hảo",
+    "meaning_en": "hello",
+    "meaning_vi": "xin chào"
+  }}
+]
+
+Không kèm theo lời giải thích nào khác ngoài JSON.
+"""
+
+
+class AiClient:
+    """Client kết nối API LLM ép đầu ra dạng JSON."""
+
+    def __init__(
+        self, api_key: str | None = None, model: str = "gemini-3.1-flash-lite"
+    ) -> None:
+        self.api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self.model = model
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    def split_lessons(self, summaries_text: str) -> list[dict[str, Any]]:
+        """Gửi tóm tắt các trang cho LLM để phân tách bài học."""
+        prompt = PROMPT_SPLIT_LESSONS.format(summaries_text=summaries_text)
+        response_text = self._call_llm_text(prompt)
+        return self._parse_json_list(response_text)
+
+    def extract_vocab(self, page_text: str) -> list[dict[str, Any]]:
+        """Gửi văn bản trang cho LLM để bóc tách từ vựng."""
+        prompt = PROMPT_EXTRACT_VOCAB.format(page_text=page_text)
+        response_text = self._call_llm_text(prompt)
+        return self._parse_json_list(response_text)
+
+    def extract_vocab_from_image(self, image_bytes: bytes) -> list[dict[str, Any]]:
+        """Sử dụng Vision AI đọc trực tiếp ảnh trang sách quét để bóc tách từ vựng."""
+        if not self.api_key or not image_bytes:
+            return []
+        
+        b64_data = base64.b64encode(image_bytes).decode("utf-8")
+        response_text = self._call_llm_vision(PROMPT_EXTRACT_VOCAB, b64_data)
+        return self._parse_json_list(response_text)
+
+    def _call_llm_text(self, prompt: str) -> str:
+        if not self.api_key:
+            return ""
+
+        try:
+            import urllib.request
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json"}
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                candidates = result.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+        except Exception as err:
+            logger.warning("Lỗi gọi LLM Text API: %s", err)
+
+        return ""
+
+    def _call_llm_vision(self, prompt: str, image_b64: str) -> str:
+        if not self.api_key:
+            return ""
+
+        try:
+            import urllib.request
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": image_b64
+                            }
+                        }
+                    ]
+                }],
+                "generationConfig": {"responseMimeType": "application/json"}
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                candidates = result.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+        except HTTPError as err:
+            if err.code == 429:
+                retry_header = err.headers.get("Retry-After") if err.headers else None
+                try:
+                    retry_after = int(retry_header) if retry_header else None
+                except ValueError:
+                    retry_after = None
+                raise AiRateLimitError(retry_after) from err
+            raise AiClientError(f"Lỗi Gemini Vision HTTP {err.code}") from err
+        except Exception as err:
+            logger.warning("Lỗi gọi LLM Vision API: %s", err)
+            raise AiClientError("Không thể gọi Gemini Vision") from err
+
+    def _parse_json_list(self, text: str) -> list[dict[str, Any]]:
+        if not text:
+            return []
+        try:
+            start = text.find("[")
+            end = text.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                json_str = text[start : end + 1]
+                data = json.loads(json_str)
+                if isinstance(data, list):
+                    return data
+        except Exception as err:
+            logger.warning("Không thể parse JSON từ LLM: %s", err)
+        return []

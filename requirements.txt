@@ -1,0 +1,9 @@
+# Ứng dụng học từ vựng tiếng Trung — phụ thuộc
+# Môi trường đã kiểm: Windows, Python 3.12.9
+# Quy tắc 5 trong CLAUDE.md: không thêm phụ thuộc mới nếu không được yêu cầu.
+# Ba dòng dưới là toàn bộ danh sách được phép, mọi thứ khác dùng thư viện chuẩn.
+
+PySide6==6.11.1
+pytest==9.1.1
+
+PyMuPDF==1.27.2

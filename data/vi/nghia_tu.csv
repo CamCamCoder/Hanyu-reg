@@ -1,0 +1,608 @@
+# nghia tieng Viet cho bang `word` cua dict.sqlite
+# Dinh dang: word_simp|meaning_vi
+# Nghia tu soan dua tren cot meaning_en co san, KHONG lay tu giao trinh.
+# Nap bang: python tools/nap_nghia_vi.py
+# --- HSK 1 (150 tu) ---
+爱|yêu; yêu thích
+八|tám
+爸爸|bố, ba
+杯子|cái cốc, cái ly
+北京|Bắc Kinh
+本|quyển, cuốn (lượng từ cho sách)
+不客气|không có gì; đừng khách sáo
+不|không
+菜|món ăn; rau
+茶|trà, chè
+吃|ăn
+出租车|xe taxi
+打电话|gọi điện thoại
+大|to, lớn
+的|của (trợ từ sở hữu)
+点|chấm; một chút; giờ (chỉ giờ)
+电脑|máy tính, máy vi tính
+电视|tivi, truyền hình
+电影|phim, điện ảnh
+东西|đồ vật, đồ đạc, thứ
+都|đều, cả
+读|đọc; học
+对不起|xin lỗi
+多|nhiều
+多少|bao nhiêu
+儿子|con trai
+二|hai
+饭店|nhà hàng; khách sạn
+飞机|máy bay
+分钟|phút
+高兴|vui, vui mừng
+个|cái, chiếc (lượng từ chung)
+工作|công việc; làm việc
+狗|con chó
+汉语|tiếng Hán, tiếng Trung
+好|tốt; khỏe
+号|số; ngày (trong tháng)
+喝|uống
+和|và; với
+很|rất
+后面|phía sau
+回|về, trở về; trả lời
+会|biết, có thể (do học mà biết)
+几|mấy, vài
+家|nhà; gia đình
+叫|gọi; tên là
+今天|hôm nay
+九|chín
+开|mở; bắt đầu; lái (xe)
+看|xem, nhìn
+看见|nhìn thấy, trông thấy
+块|cục, miếng; đồng (đơn vị tiền)
+来|đến, tới
+老师|giáo viên, thầy cô
+了|rồi, đã xong (trợ từ)
+冷|lạnh
+里|trong; dặm (đơn vị đo Trung Quốc)
+六|sáu
+妈妈|mẹ, má
+吗|không?, à? (trợ từ nghi vấn)
+买|mua
+猫|con mèo
+没关系|không sao, không hề gì
+没有|không có
+米饭|cơm
+明天|ngày mai
+名字|tên
+哪|nào
+哪儿|ở đâu
+那|đó, kia; thế thì
+呢|thì sao?, còn... thì sao? (trợ từ)
+能|có thể, có khả năng
+你|bạn, anh, chị
+年|năm (đơn vị thời gian)
+女儿|con gái
+朋友|bạn, bạn bè
+漂亮|đẹp, xinh
+苹果|quả táo
+七|bảy
+钱|tiền
+前面|phía trước
+请|mời; xin
+去|đi
+热|nóng
+人|người
+认识|quen biết, làm quen; nhận ra
+三|ba
+商店|cửa hàng
+上|trên; lên
+上午|buổi sáng
+少|ít
+谁|ai
+什么|gì, cái gì
+十|mười
+时候|lúc, khi
+是|là
+书|sách
+水|nước
+水果|hoa quả, trái cây
+睡觉|ngủ, đi ngủ
+说|nói
+四|bốn
+岁|tuổi
+他|anh ấy, ông ấy
+她|cô ấy, chị ấy
+太|quá, rất
+天气|thời tiết
+听|nghe
+同学|bạn học, bạn cùng lớp
+喂|a lô (khi nghe điện thoại)|1
+我|tôi, mình
+我们|chúng tôi, chúng ta
+五|năm (số 5)
+喜欢|thích
+下|dưới; xuống
+下午|buổi chiều
+下雨|mưa, trời mưa
+先生|ông, ngài; chồng
+现在|bây giờ, hiện nay
+想|nghĩ; muốn; nhớ
+小|nhỏ, bé
+小姐|cô, tiểu thư
+些|một vài, một ít
+写|viết
+谢谢|cảm ơn
+星期|tuần
+学生|học sinh, sinh viên
+学习|học, học tập
+学校|trường học
+一|một
+衣服|quần áo
+医生|bác sĩ
+医院|bệnh viện
+椅子|cái ghế
+一点儿|một chút, một ít
+有|có
+月|tháng; mặt trăng
+在|ở; đang
+再见|tạm biệt, hẹn gặp lại
+怎么|thế nào, làm sao
+怎么样|thế nào, ra sao
+这|này, đây
+中国|Trung Quốc
+中午|buổi trưa
+住|ở, cư trú
+桌子|cái bàn
+字|chữ
+昨天|hôm qua
+做|làm
+坐|ngồi
+# --- HSK 2 (151 tu) ---
+吧|nhé, đi (trợ từ đề nghị); quán bar
+白|trắng; trống không
+百|trăm
+帮助|giúp đỡ
+报纸|báo, tờ báo
+比|so, so sánh
+别|đừng; khác
+宾馆|khách sạn, nhà khách
+长|dài; lớn lên, trưởng|2
+唱歌|hát
+出|ra, đi ra
+穿|mặc, đi (giày); xuyên qua
+次|lần, lượt
+从|từ; theo
+错|sai, lỗi
+打篮球|chơi bóng rổ
+大家|mọi người
+到|đến, tới
+得|trợ từ bổ ngữ|2
+等|đợi, chờ; hạng; vân vân|2
+弟弟|em trai
+第一|thứ nhất, đầu tiên
+懂|hiểu
+对|đúng; đôi; đối với
+房间|căn phòng
+非常|rất, vô cùng
+服务员|nhân viên phục vụ
+高|cao
+告诉|nói cho biết, bảo
+哥哥|anh trai
+给|cho, đưa cho
+公共汽车|xe buýt
+公司|công ty
+贵|đắt; quý
+过|qua; đã từng (trợ từ)|2
+还|còn, vẫn; thêm nữa|2
+孩子|đứa trẻ, con
+好吃|ngon
+黑|đen, tối
+红|đỏ
+火车站|ga tàu hỏa
+机场|sân bay
+鸡蛋|trứng gà
+件|cái, chiếc (lượng từ cho áo, sự việc)
+教室|phòng học, lớp học
+姐姐|chị gái
+介绍|giới thiệu
+进|vào, đi vào
+近|gần
+就|thì, liền, ngay
+觉得|cảm thấy, thấy rằng
+咖啡|cà phê
+开始|bắt đầu
+考试|thi, kỳ thi
+可能|có thể, có lẽ
+可以|có thể, được phép
+课|bài học, tiết học
+快|nhanh
+快乐|vui vẻ, hạnh phúc
+累|mệt
+离|cách; rời khỏi
+两|hai; lạng (đơn vị khối lượng)
+零|số không; lẻ
+路|đường, con đường; tuyến
+旅游|du lịch
+卖|bán
+慢|chậm
+忙|bận
+每|mỗi, mọi
+妹妹|em gái
+门|cửa
+面条|mì sợi
+男|nam, đàn ông
+您|ngài, ông, bà (kính ngữ)
+牛奶|sữa bò
+女|nữ, phụ nữ
+旁边|bên cạnh
+跑步|chạy bộ
+便宜|rẻ
+票|vé
+妻子|vợ
+起床|ngủ dậy, ra khỏi giường
+千|nghìn
+铅笔|bút chì
+晴|nắng, quang đãng
+去年|năm ngoái
+让|để cho, bảo; nhường
+日|mặt trời; ngày
+上班|đi làm
+身体|cơ thể; sức khỏe
+生病|ốm, bị bệnh
+生日|sinh nhật
+时间|thời gian
+事情|việc, sự việc
+手表|đồng hồ đeo tay
+手机|điện thoại di động
+说话|nói chuyện
+送|tặng; đưa, tiễn
+虽然|tuy rằng, mặc dù
+但是|nhưng, tuy nhiên
+它|nó (đồ vật, con vật)
+踢足球|đá bóng
+题|đề bài, câu hỏi
+跳舞|nhảy múa, khiêu vũ
+外|ngoài, bên ngoài
+完|xong, hoàn thành
+玩|chơi
+晚上|buổi tối
+往|về phía, hướng tới
+为什么|tại sao, vì sao
+问|hỏi
+问题|câu hỏi; vấn đề
+西瓜|dưa hấu
+希望|hy vọng, mong
+洗|rửa, giặt, tắm
+小时|tiếng, giờ đồng hồ
+笑|cười
+新|mới
+姓|họ (trong tên)
+休息|nghỉ ngơi
+雪|tuyết
+颜色|màu sắc
+眼睛|mắt
+羊肉|thịt cừu, thịt dê
+药|thuốc
+要|muốn; cần; sẽ
+也|cũng
+一起|cùng nhau
+一下|một chút, một lát
+已经|đã, đã rồi
+意思|ý nghĩa; ý
+因为|bởi vì
+所以|cho nên, vì vậy
+阴|âm u, râm; âm (trong âm dương)
+游泳|bơi lội
+右边|bên phải
+鱼|con cá
+远|xa
+运动|vận động, thể thao
+再|lại, lần nữa
+早上|buổi sáng sớm
+丈夫|chồng
+找|tìm; trả lại tiền thừa
+着|trợ từ chỉ đang diễn ra
+真|thật, thực sự
+正在|đang
+知道|biết
+准备|chuẩn bị
+走|đi, bước đi
+最|nhất
+左边|bên trái
+# --- HSK 3 (300 tu) ---
+阿姨|dì; cô (xưng hô phụ nữ lớn tuổi)
+啊|à, a (trợ từ cảm thán)
+矮|thấp, lùn
+爱好|sở thích; thích
+安静|yên tĩnh, yên lặng
+把|đem, lấy (giới từ); cái (lượng từ vật có tay cầm)
+班|lớp; ca, kíp
+搬|chuyển, dọn; khiêng
+办法|cách, biện pháp
+办公室|văn phòng
+半|nửa, một nửa
+帮忙|giúp đỡ, giúp một tay
+包|bọc, gói; cái túi; bao gồm
+饱|no
+北方|phương bắc, miền bắc
+被|bị, được (câu bị động); cái chăn
+鼻子|mũi
+比较|so sánh; tương đối
+比赛|thi đấu, trận đấu
+笔记本|vở ghi; máy tính xách tay
+必须|phải, nhất định phải
+变化|thay đổi, biến hóa
+别人|người khác
+冰箱|tủ lạnh
+不但|không những
+而且|mà còn, hơn nữa
+菜单|thực đơn
+参加|tham gia
+草|cỏ; bản nháp
+层|tầng, lớp
+差|kém, thiếu; chênh lệch
+超市|siêu thị
+衬衫|áo sơ mi
+成绩|thành tích, kết quả
+城市|thành phố
+迟到|đến muộn
+除了|ngoài ra, trừ
+船|thuyền, tàu
+春|mùa xuân
+词典|từ điển
+聪明|thông minh
+打扫|quét dọn, dọn dẹp
+打算|dự định, tính
+带|mang theo, dắt; dây, đai
+担心|lo lắng
+蛋糕|bánh ga tô
+当然|đương nhiên, tất nhiên
+地|đất; trợ từ trạng ngữ
+灯|đèn
+地方|nơi, chỗ; địa phương
+地铁|tàu điện ngầm
+地图|bản đồ
+电梯|thang máy
+电子邮件|thư điện tử, email
+东|phía đông
+冬|mùa đông
+动物|động vật
+短|ngắn
+段|đoạn, khúc
+锻炼|rèn luyện, tập luyện
+多么|biết bao, thật là
+饿|đói
+耳朵|tai
+发|phát, gửi đi; nảy sinh
+发烧|sốt, phát sốt
+发现|phát hiện, tìm ra
+方便|tiện, thuận tiện
+放|đặt, để; thả ra
+放心|yên tâm
+分|chia; phút; điểm
+附近|gần đây, lân cận
+复习|ôn tập
+干净|sạch sẽ
+感冒|cảm, cảm lạnh
+感兴趣|thấy hứng thú, quan tâm
+刚才|vừa nãy, vừa rồi
+个子|vóc người, chiều cao
+根据|căn cứ vào, dựa theo
+跟|theo; với, cùng
+更|càng, hơn nữa
+公斤|ki lô gam
+公园|công viên
+故事|câu chuyện
+刮风|nổi gió, có gió
+关|đóng; liên quan; cửa ải
+关系|quan hệ, liên quan
+关心|quan tâm
+关于|về, liên quan đến
+国家|quốc gia, đất nước
+过|qua; đã từng (trợ từ)|3
+过去|quá khứ, trước đây
+还是|hay là; vẫn, tốt hơn là
+害怕|sợ, sợ hãi
+黑板|bảng đen
+后来|sau đó, về sau
+护照|hộ chiếu
+花|hoa; tiêu (tiền)
+画|vẽ; bức tranh
+坏|hỏng; xấu
+欢迎|hoan nghênh, chào đón
+还|còn, vẫn; thêm nữa|3
+环境|môi trường, hoàn cảnh
+换|đổi, thay
+黄河|sông Hoàng Hà
+回答|trả lời
+会议|hội nghị, cuộc họp
+或者|hoặc, hoặc là
+几乎|hầu như, gần như
+机会|cơ hội
+极|cực, rất; cực điểm
+记得|nhớ, nhớ được
+季节|mùa
+检查|kiểm tra
+简单|đơn giản
+见面|gặp mặt
+健康|sức khỏe; khỏe mạnh
+讲|giảng, nói, kể
+教|dạy; tôn giáo
+角|góc; sừng; hào (đơn vị tiền)
+脚|bàn chân
+接|nối; đón; nhận
+街道|đường phố
+节目|tiết mục, chương trình
+节日|ngày lễ, ngày hội
+结婚|kết hôn, cưới
+结束|kết thúc
+解决|giải quyết
+借|mượn; cho mượn
+经常|thường xuyên
+经过|đi qua, trải qua
+经理|giám đốc, quản lý
+久|lâu
+旧|cũ
+句子|câu (ngữ pháp)
+决定|quyết định
+可爱|đáng yêu
+渴|khát
+刻|khắc, mười lăm phút; khắc, chạm
+客人|khách
+空调|điều hòa không khí
+口|miệng; cửa, cổng
+哭|khóc
+裤子|quần
+筷子|đũa
+蓝|xanh lam
+老|già; cũ; thường
+离开|rời khỏi
+礼物|quà tặng
+历史|lịch sử
+脸|mặt
+练习|luyện tập; bài tập
+辆|chiếc (lượng từ cho xe)
+聊天|trò chuyện, tán gẫu
+了解|hiểu rõ, tìm hiểu
+邻居|hàng xóm
+留学|du học
+楼|tầng lầu; tòa nhà
+绿|xanh lá
+马|con ngựa
+马上|ngay lập tức
+满意|hài lòng, vừa ý
+帽子|cái mũ
+米|gạo; mét
+面包|bánh mì
+明白|hiểu rõ; rõ ràng
+拿|cầm, lấy
+奶奶|bà nội
+南|phía nam
+难|khó
+难过|buồn, khó chịu
+年级|khối lớp, niên khóa
+年轻|trẻ, trẻ tuổi
+鸟|con chim
+努力|cố gắng, nỗ lực
+爬山|leo núi
+盘子|cái đĩa
+胖|béo, mập
+皮鞋|giày da
+啤酒|bia
+瓶子|cái chai
+其实|thực ra, kỳ thực
+其他|khác, những cái khác
+奇怪|kỳ lạ, lạ lùng
+骑|cưỡi, đi (xe đạp, ngựa)
+起飞|cất cánh
+起来|dậy, đứng lên; bắt đầu
+清楚|rõ ràng, rõ
+请假|xin nghỉ phép
+秋|mùa thu
+裙子|váy
+然后|sau đó
+热情|nhiệt tình, nồng nhiệt
+认为|cho rằng, nghĩ rằng
+认真|nghiêm túc, chăm chỉ
+容易|dễ, dễ dàng
+如果|nếu, nếu như
+伞|cái ô, cái dù
+上网|lên mạng
+生气|tức giận
+声音|âm thanh, giọng nói
+世界|thế giới
+试|thử; thi
+瘦|gầy; chật
+叔叔|chú
+舒服|dễ chịu, thoải mái
+树|cây
+数学|toán học
+刷牙|đánh răng
+双|đôi, cặp
+水平|trình độ, mức
+司机|tài xế, lái xe
+太阳|mặt trời
+特别|đặc biệt
+疼|đau; thương yêu
+提高|nâng cao
+体育|thể dục, thể thao
+甜|ngọt
+条|sợi, chiếc (lượng từ vật dài); điều khoản
+同事|đồng nghiệp
+同意|đồng ý
+头发|tóc
+突然|đột nhiên, bỗng nhiên
+图书馆|thư viện
+腿|chân, cẳng chân
+完成|hoàn thành
+碗|cái bát
+万|vạn, mười nghìn
+忘记|quên
+为|vì, cho
+为了|để, vì
+位|vị (lượng từ lịch sự cho người); vị trí
+文化|văn hóa
+西|phía tây
+习惯|thói quen; quen với
+洗手间|nhà vệ sinh
+洗澡|tắm
+夏|mùa hè
+先|trước, trước tiên
+相信|tin, tin tưởng
+香蕉|quả chuối
+向|hướng về, về phía
+像|giống, như; hình ảnh
+小心|cẩn thận
+校长|hiệu trưởng
+新闻|tin tức
+新鲜|tươi; mới mẻ
+信用卡|thẻ tín dụng
+行李箱|va li, hòm hành lý
+熊猫|gấu trúc
+需要|cần, cần phải
+选择|lựa chọn
+要求|yêu cầu
+爷爷|ông nội
+一般|thường, bình thường
+一边|một bên; vừa... vừa
+一定|nhất định, chắc chắn
+一共|tổng cộng
+一会儿|một lát, một chốc
+一样|giống nhau, như nhau
+一直|luôn luôn; thẳng
+以前|trước đây, trước kia
+音乐|âm nhạc
+银行|ngân hàng
+饮料|đồ uống
+应该|nên, phải
+影响|ảnh hưởng
+用|dùng, sử dụng
+游戏|trò chơi
+有名|nổi tiếng
+又|lại; vừa... vừa
+遇到|gặp phải, gặp
+元|đồng (đơn vị tiền); đầu tiên
+愿意|bằng lòng, sẵn lòng
+月亮|mặt trăng
+越|càng; vượt qua
+站|đứng; nhà ga, trạm
+张|tờ, tấm (lượng từ vật phẳng); mở ra
+长|dài; lớn lên, trưởng|3
+着急|sốt ruột, lo lắng
+照顾|chăm sóc, trông nom
+照片|bức ảnh
+照相机|máy ảnh
+只|chỉ; con (lượng từ)
+只有|chỉ có
+才|mới; tài năng
+中间|ở giữa, trung gian
+中文|tiếng Trung
+终于|cuối cùng, rốt cuộc
+种|loại, giống; trồng
+重要|quan trọng
+周末|cuối tuần
+主要|chủ yếu
+注意|chú ý
+自己|tự mình, bản thân
+自行车|xe đạp
+总是|luôn luôn
+嘴|miệng, mồm
+最后|cuối cùng
+最近|gần đây
+作业|bài tập về nhà

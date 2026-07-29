@@ -1,0 +1,22 @@
+Thư mục dự án phải trông ĐÚNG như thế này, không thừa không thiếu:
+
+Hanyu recognize/
+    CLAUDE.md                    <- BẮT BUỘC ở gốc, agent tự đọc tệp này
+    dac-ta-ung-dung-v0.5.md
+    dict.sqlite
+    build_dict.py
+    handoff/
+        CACH-CHAY.md
+        01-pinyin.md
+        02-scheduler.md
+        03-decomposer.md
+        04-lookup.md
+    .claude/
+        settings.local.json      <- giữ nguyên, không đụng
+
+PHẢI XOÁ, nếu còn sẽ gây đọc nhầm:
+    files.zip                    <- gói cũ, có 00-quy-tac-chung.md đã lỗi thời
+    instructfiles.zip            <- giải nén rồi thì xoá
+    dac-ta-ung-dung.md           <- bản 0.1
+    dac-ta-ung-dung-v0.4*.md     <- bản 0.4
+    mọi dict.sqlite cũ

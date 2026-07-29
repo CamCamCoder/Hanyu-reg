@@ -1,0 +1,30 @@
+# Dữ liệu người dùng và khóa API được lưu trong SQLite này.
+user.sqlite
+user.sqlite-*
+*.sqlite-shm
+*.sqlite-wal
+
+# Giáo trình và ảnh nguồn/crop sinh trong lúc nhập.
+*.pdf
+data/book_crops/
+output/
+
+# Môi trường và tệp tạm Python/pytest.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp-*/
+tmp/
+.venv/
+venv/
+
+# Cấu hình cục bộ của trợ lý/IDE.
+.claude/
+.env
+.env.*
+
+# Gói bàn giao sinh tự động.
+*.zip
+
+# Bản sao mã thủ công trước các lần vá; lịch sử chính thức nằm trong Git.
+*.truoc-*
