@@ -499,6 +499,27 @@ def test_15b_replace_lessons_hong_giua_chung_khong_de_lai_nua_voi(db):
     assert db._conn.execute("SELECT COUNT(*) FROM lesson").fetchone()[0] == 2
 
 
+def test_15c_replace_vocab_many_loi_bai_sau_huy_ca_bai_truoc(db):
+    book_id = them_sach(db, "Quyển A", "hash-a")
+    db.replace_lessons(book_id, [bound(1, 0, 9), bound(2, 10, 19)])
+    lessons = db.get_lessons(book_id)
+    first_id = lessons[0]["id"]
+    second_id = lessons[1]["id"]
+    db.replace_vocab(first_id, [vocab("旧一")])
+    db.replace_vocab(second_id, [vocab("旧二")])
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.replace_vocab_many(
+            {
+                first_id: [vocab("新一")],
+                999_999: [vocab("无效")],
+            }
+        )
+
+    assert [row["word"] for row in db.get_lesson_words(first_id)] == ["旧一"]
+    assert [row["word"] for row in db.get_lesson_words(second_id)] == ["旧二"]
+
+
 # ------------------------------------------------------------ 16: word_source
 def test_16_word_source_tra_lan_gap_dau_tien(db):
     a = them_sach(db, "Giáo trình Hán ngữ 1", "hash-a")

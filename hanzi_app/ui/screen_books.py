@@ -166,6 +166,7 @@ class DialogReviewBook(QDialog):
         self._preview_workers: set[PreviewWorker] = set()
         self.review_preview_worker: PreviewWorker | None = None
         self._review_preview_workers: set[PreviewWorker] = set()
+        self._pending_review_source: tuple[int, int] | None = None
         self.lessons = user_db.get_lessons(book["id"])
         self.current_lesson: dict | None = None
         self.setWindowTitle(f"Duyệt kết quả nhập — {book['title']}")
@@ -336,6 +337,7 @@ class DialogReviewBook(QDialog):
 
     def _reload_review_queue(self) -> None:
         self.review_preview_worker = None
+        self._pending_review_source = None
         self.review_preview.setPixmap(QPixmap())
         self.review_preview.setText(
             "Chọn một dòng để xem ảnh nguồn của đúng bài"
@@ -489,65 +491,70 @@ class DialogReviewBook(QDialog):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        try:
-            for lesson_id, selected_words in selected_by_lesson.items():
-                saved_rows: list[VocabRow] = []
-                for word in self.user_db.get_lesson_words(lesson_id):
-                    table_row = selected_words.get(word["id"])
-                    if table_row is None:
-                        saved_rows.append(
-                            VocabRow(
-                                order_no=word.get("order_no"),
-                                word=word["word"],
-                                pinyin_src=word.get("pinyin_src"),
-                                pos=word.get("pos"),
-                                hanviet_src=word.get("hanviet_src"),
-                                meaning_src=word.get("meaning_src"),
-                                source_page=word.get("source_page"),
-                                extract_by=word.get("extract_by") or "manual",
-                                needs_review=bool(word.get("needs_review")),
-                                review_reason=None,
-                            )
-                        )
-                        continue
-
-                    def value(column: int) -> str:
-                        item = self.review_table.item(table_row, column)
-                        return "" if item is None else item.text().strip()
-
-                    order_text = value(3)
-                    page_text = value(2)
+        rows_by_lesson: dict[int, list[VocabRow]] = {}
+        for lesson_id, selected_words in selected_by_lesson.items():
+            saved_rows: list[VocabRow] = []
+            for word in self.user_db.get_lesson_words(lesson_id):
+                table_row = selected_words.get(word["id"])
+                if table_row is None:
                     saved_rows.append(
                         VocabRow(
-                            order_no=(
-                                int(order_text)
-                                if order_text.isdigit()
-                                else word.get("order_no")
-                            ),
-                            word=value(4),
-                            pinyin_src=value(5) or None,
-                            pos=value(6) or None,
-                            hanviet_src=value(7) or None,
-                            meaning_src=value(8) or None,
-                            source_page=(
-                                int(page_text)
-                                if page_text.isdigit()
-                                else word.get("source_page")
-                            ),
-                            extract_by="manual",
-                            needs_review=False,
+                            order_no=word.get("order_no"),
+                            word=word["word"],
+                            pinyin_src=word.get("pinyin_src"),
+                            pos=word.get("pos"),
+                            hanviet_src=word.get("hanviet_src"),
+                            meaning_src=word.get("meaning_src"),
+                            source_page=word.get("source_page"),
+                            extract_by=word.get("extract_by") or "manual",
+                            needs_review=bool(word.get("needs_review")),
                             review_reason=None,
                         )
                     )
-                self.user_db.replace_vocab(lesson_id, saved_rows)
+                    continue
+
+                def value(column: int) -> str:
+                    item = self.review_table.item(table_row, column)
+                    return "" if item is None else item.text().strip()
+
+                order_text = value(3)
+                page_text = value(2)
+                saved_rows.append(
+                    VocabRow(
+                        order_no=(
+                            int(order_text)
+                            if order_text.isdigit()
+                            else word.get("order_no")
+                        ),
+                        word=value(4),
+                        pinyin_src=value(5) or None,
+                        pos=value(6) or None,
+                        hanviet_src=value(7) or None,
+                        meaning_src=value(8) or None,
+                        source_page=(
+                            int(page_text)
+                            if page_text.isdigit()
+                            else word.get("source_page")
+                        ),
+                        extract_by="manual",
+                        needs_review=False,
+                        review_reason=None,
+                    )
+                )
+            rows_by_lesson[lesson_id] = saved_rows
+
+        try:
+            self.user_db.replace_vocab_many(rows_by_lesson)
         except Exception as exc:
-            self._reload_review_queue()
             QMessageBox.warning(
                 self, "Không lưu được", f"Không thể xác nhận các từ: {exc}"
             )
             return
 
         self._reload_review_queue()
+        current = self.list_lessons.currentItem()
+        if current is not None:
+            self._load_selected(current)
 
     def _clear_review_selection(self) -> None:
         self.review_table.blockSignals(True)
@@ -565,7 +572,13 @@ class DialogReviewBook(QDialog):
         if check_item is None:
             return
         metadata = check_item.data(Qt.ItemDataRole.UserRole)
-        self.review_preview_worker = None
+        if self.review_preview_worker is not None:
+            self._pending_review_source = (row, _column)
+            self.review_preview.setText(
+                f"Đang chuyển sang ảnh nguồn Bài "
+                f"{metadata['lesson_index']}…"
+            )
+            return
         self.review_preview.setPixmap(QPixmap())
         self.review_preview.setText(
             f"Đang tải ảnh nguồn Bài {metadata['lesson_index']}…"
@@ -619,9 +632,15 @@ class DialogReviewBook(QDialog):
 
     def _on_review_preview_finished(self, worker: PreviewWorker) -> None:
         self._review_preview_workers.discard(worker)
-        if worker is self.review_preview_worker:
+        was_current = worker is self.review_preview_worker
+        if was_current:
             self.review_preview_worker = None
         worker.deleteLater()
+        if was_current and self._pending_review_source is not None:
+            row, column = self._pending_review_source
+            self._pending_review_source = None
+            if row < self.review_table.rowCount():
+                self._show_review_source(row, column)
 
     def _finish_reviewed_book(self) -> None:
         remaining = sum(

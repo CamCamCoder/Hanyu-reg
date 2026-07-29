@@ -241,6 +241,78 @@ def test_xac_nhan_cac_dong_thuoc_nhieu_bai(tmp_path, monkeypatch):
         db.close()
 
 
+def test_xac_nhan_hang_doi_lam_moi_bang_tat_ca_cac_bai(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        assert dialog.table.item(0, 2).text() == "jidoshi"
+
+        dialog.review_table.item(0, 5).setText("jiàoshì")
+        dialog.review_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog._confirm_selected_rows()
+
+        assert dialog.table.item(0, 2).text() == "jiàoshì"
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_loi_luu_nhieu_bai_giu_noi_dung_sua_va_lua_chon(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    def fail_atomically(_rows_by_lesson):
+        raise RuntimeError("ổ đĩa lỗi")
+
+    monkeypatch.setattr(db, "replace_vocab_many", fail_atomically)
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.review_table.item(0, 5).setText("pinyin đã sửa")
+        dialog.review_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog.review_table.item(2, 0).setCheckState(Qt.CheckState.Checked)
+
+        dialog._confirm_selected_rows()
+
+        assert dialog.review_table.rowCount() == 3
+        assert dialog.review_table.item(0, 5).text() == "pinyin đã sửa"
+        assert dialog._selected_review_rows() == [0, 2]
+        remaining = sum(
+            word["needs_review"]
+            for lesson in db.get_lessons(book_id)
+            for word in db.get_lesson_words(lesson["id"])
+        )
+        assert remaining == 3
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
 def test_preview_hang_doi_dung_ranh_gioi_bai_duoc_chon(
     tmp_path, monkeypatch
 ):
@@ -259,6 +331,39 @@ def test_preview_hang_doi_dung_ranh_gioi_bai_duoc_chon(
         dialog = DialogReviewBook(db, db.get_book(book_id))
         dialog._show_review_source(2, 4)
         assert calls[0][1:3] == (8, 12)
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_preview_hang_doi_chi_chay_mot_worker_moi_luc(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    calls = []
+    workers = []
+
+    def make_worker(path, start, end, **kwargs):
+        worker = _FakePreviewWorker(calls, path, start, end, **kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(screen_books_module, "PreviewWorker", make_worker)
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog._show_review_source(0, 4)
+        dialog._show_review_source(2, 4)
+
+        assert len(calls) == 1
+
+        workers[0].finished.emit()
+        app.processEvents()
+        assert len(calls) == 2
+        assert calls[1][1:3] == (8, 12)
     finally:
         if dialog is not None:
             dialog.deleteLater()

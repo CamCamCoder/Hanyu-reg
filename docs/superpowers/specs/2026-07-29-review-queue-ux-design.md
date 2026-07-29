@@ -119,8 +119,10 @@ kiểm rõ ràng để ý nghĩa không phụ thuộc riêng vào màu sắc.
 
 Không đổi schema. `DialogReviewBook` dùng các phương thức hiện có để lấy sách,
 bài và từ. Khi xác nhận nhiều dòng thuộc nhiều bài, giao diện nhóm thay đổi theo
-`lesson_id`, dựng lại danh sách `VocabRow` đầy đủ của từng bài và gọi thao tác
-lưu ở tầng dữ liệu.
+`lesson_id`, dựng lại danh sách `VocabRow` đầy đủ của từng bài và gọi
+`UserDb.replace_vocab_many()` để lưu toàn bộ nhóm trong một giao dịch nguyên tử.
+Phương thức này được bổ sung sau code review nhằm ngăn trạng thái nửa thành công
+nếu một bài ở giữa nhóm lưu lỗi.
 
 Việc dựng lại một bài phải bảo toàn:
 

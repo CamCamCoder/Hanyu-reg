@@ -37,7 +37,7 @@ cột Trạng thái rồi mới sang phiên sau.
 | B7i | sửa preview làm treo giao diện | `PreviewWorker` kết xuất crop ở luồng nền, trạng thái đang tải, giải mã ảnh có kiểm tra và scale nhanh | xong; +1 test, tổng 218 xanh 1 skip, 2 golden xanh; QA thật Bài 5 trả thao tác sau 0,9 ms, ảnh hiện sau 6,12 giây |
 | B7j | sửa locator preview Bài 20 | nhận tiêu đề `生词` bị tách thành nhiều span ở đầu trang, không bắt buộc hậu tố `表` | xong; +1 test, tổng 219 xanh 1 skip, 2 golden xanh; QA dialog thật Bài 20 hiển thị pixmap sau 12,65 giây, không khóa UI |
 | B7k | chặn preview cũ ghi đè bài mới | vô hiệu hóa worker khi chuyển bài, chỉ worker mới nhất được cập nhật preview, giữ và dọn các thread cũ an toàn | xong; +1 test, tổng 220 xanh 1 skip, 2 golden xanh |
-| B7l | hàng đợi duyệt từ cần xác nhận | bảng tổng hợp theo bài/trang, lọc, tìm kiếm, sửa và xác nhận chọn lọc, preview nền đúng bài, nút hoàn tất riêng | xong; +9 test, tổng 229 xanh 3 skip; QA Boya thật còn 16 dòng thuộc 13 bài, không ô tích sẵn, gọi preview trả sau 0,22 ms và ảnh hiện sau 6,32 giây |
+| B7l | hàng đợi duyệt từ cần xác nhận | bảng tổng hợp theo bài/trang, lọc, tìm kiếm, sửa và xác nhận chọn lọc nguyên tử, đồng bộ hai tab, preview nền tuần tự đúng bài, nút hoàn tất riêng | xong; +13 test, tổng 233 xanh 3 skip; QA Boya thật còn 16 dòng thuộc 13 bài, không ô tích sẵn, gọi preview trả sau 0,22 ms và ảnh hiện sau 6,32 giây |
 
 **Phiên tiếp theo phải làm: chờ người dùng nghiệm thu hàng đợi 16 dòng cần xác
 nhận trên app thật; sau đó mới tiếp tục xử lý crop bảng từ mới nhiều khối đã được

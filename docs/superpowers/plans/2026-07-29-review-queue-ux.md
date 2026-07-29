@@ -4,7 +4,7 @@
 
 **Goal:** Thêm hàng đợi tổng hợp giúp người dùng thấy rõ từ cần xác nhận thuộc bài/trang nào, sửa tại chỗ và xác nhận chọn lọc bằng nút lớn.
 
-**Architecture:** Giữ `DialogReviewBook` làm cửa sổ duyệt duy nhất và thêm hai chế độ bằng `QTabWidget`: hàng đợi cần xác nhận là mặc định, màn duyệt từng bài hiện có được giữ nguyên ở tab thứ hai. Hàng đợi chỉ tổng hợp dữ liệu đã có trong `UserDb`; khi xác nhận, nó nhóm các thay đổi theo bài và dùng `replace_vocab()` để bảo toàn toàn bộ các dòng không được chọn.
+**Architecture:** Giữ `DialogReviewBook` làm cửa sổ duyệt duy nhất và thêm hai chế độ bằng `QTabWidget`: hàng đợi cần xác nhận là mặc định, màn duyệt từng bài hiện có được giữ nguyên ở tab thứ hai. Hàng đợi chỉ tổng hợp dữ liệu đã có trong `UserDb`; khi xác nhận, nó nhóm các thay đổi theo bài và dùng `replace_vocab_many()` để bảo toàn toàn bộ các dòng không được chọn trong một giao dịch nguyên tử.
 
 **Tech Stack:** Python 3.12, PySide6 6.11.1, SQLite qua `UserDb`, pytest 9.1.1, PyMuPDF qua `PreviewWorker`.
 
@@ -30,10 +30,14 @@
   - Giữ tab **Tất cả các bài** và luồng Vision hiện có.
 - Modify: `tests/unit/test_review_dialog.py`
   - Kiểm thử hàng đợi, xác nhận chọn lọc, bộ lọc, preview và điều kiện hoàn tất.
+- Modify: `hanzi_app/data/userdb.py`
+  - Lưu thay thế bảng từ của nhiều bài trong một giao dịch.
+- Modify: `tests/unit/test_userdb.py`
+  - Kiểm thử rollback toàn bộ nếu một bài trong nhóm lưu lỗi.
 - Modify: `AGENTS.md`
   - Ghi phiên B7l hoàn thành và trạng thái test/QA thực tế.
 
-Không tạo module Python mới và không đổi `UserDb`.
+Không tạo module Python mới và không đổi schema SQLite.
 
 ---
 
@@ -247,7 +251,7 @@ git commit -m "feat: add review queue overview"
 
 **Interfaces:**
 - Consumes: metadata hàng đợi của Task 1,
-  `UserDb.replace_vocab(lesson_id, rows) -> None`.
+  `UserDb.replace_vocab_many(rows_by_lesson) -> None`.
 - Produces: `DialogReviewBook._select_visible_rows() -> None`,
   `DialogReviewBook._clear_review_selection() -> None`,
   `DialogReviewBook._confirm_selected_rows() -> None`,
@@ -347,7 +351,7 @@ Với mỗi bài có dòng được chọn:
 3. Dựng `VocabRow` cho mọi từ.
 4. Chỉ dòng được chọn lấy giá trị đã sửa và `needs_review=False`.
 5. Dòng còn lại giữ nguyên mọi trường và cờ.
-6. Gọi `replace_vocab()` một lần cho bài đó.
+6. Gom các bài và gọi `replace_vocab_many()` một lần cho toàn bộ nhóm.
 
 Chặn xác nhận nếu chữ Hán của dòng được chọn rỗng. Trước khi lưu, hỏi
 `Xác nhận N từ thuộc M bài?`. Chỉ sau khi tất cả lần lưu thành công mới gọi

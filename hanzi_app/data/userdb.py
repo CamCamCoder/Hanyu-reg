@@ -210,29 +210,39 @@ class UserDb:
 
         Cột hanviet_src lấy nguyên văn từ bảng giáo trình.
         """
+        self.replace_vocab_many({lesson_id: rows})
+
+    def replace_vocab_many(
+        self, rows_by_lesson: dict[int, list[VocabRow]]
+    ) -> None:
+        """Thay bảng từ của nhiều bài trong cùng một giao dịch nguyên tử."""
         with self.transaction() as conn:
-            conn.execute("DELETE FROM lesson_word WHERE lesson_id = ?", (lesson_id,))
-            conn.executemany(
-                "INSERT INTO lesson_word (lesson_id, order_no, word, pos, "
-                "                         pinyin_src, hanviet_src, meaning_src, source_page, "
-                "                         extract_by, needs_review) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        lesson_id,
-                        r.order_no,
-                        r.word,
-                        r.pos,
-                        r.pinyin_src,
-                        r.hanviet_src,
-                        r.meaning_src,
-                        r.source_page,
-                        r.extract_by,
-                        int(r.needs_review),
-                    )
-                    for r in rows
-                ],
-            )
+            for lesson_id, rows in rows_by_lesson.items():
+                conn.execute(
+                    "DELETE FROM lesson_word WHERE lesson_id = ?",
+                    (lesson_id,),
+                )
+                conn.executemany(
+                    "INSERT INTO lesson_word (lesson_id, order_no, word, pos, "
+                    "                         pinyin_src, hanviet_src, meaning_src, source_page, "
+                    "                         extract_by, needs_review) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            lesson_id,
+                            r.order_no,
+                            r.word,
+                            r.pos,
+                            r.pinyin_src,
+                            r.hanviet_src,
+                            r.meaning_src,
+                            r.source_page,
+                            r.extract_by,
+                            int(r.needs_review),
+                        )
+                        for r in rows
+                    ],
+                )
 
     def word_source(self, word: str) -> WordSource | None:
         """Lần gặp ĐẦU TIÊN của từ này trong sách của người dùng.
