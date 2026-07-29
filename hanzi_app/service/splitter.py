@@ -96,14 +96,17 @@ class Splitter:
     @staticmethod
     def _page_offset(evidence: list[PageEvidence]) -> int | None:
         """Infer a printed-to-PDF offset only from repeated heading-page pairs."""
-        offsets = [
-            item.pdf_page - item.printed_page
+        pairs = {
+            (item.printed_page, item.pdf_page)
             for item in evidence
             if item.heading_lesson_no is not None and item.printed_page is not None
-        ]
+        }
+        offsets = [pdf_page - printed_page for printed_page, pdf_page in pairs]
         if len(offsets) < 2:
             return None
-        offset, count = Counter(offsets).most_common(1)[0]
+        offset, count = sorted(
+            Counter(offsets).items(), key=lambda item: (-item[1], item[0])
+        )[0]
         return offset if count >= 2 else None
 
     @staticmethod
@@ -210,7 +213,7 @@ class Splitter:
         evidence_image: bytes | None = None,
     ) -> SplitResult:
         """Fuse local TOC, heading and layout evidence into lesson boundaries."""
-        del evidence_image
+        del ai_client, evidence_image
         page_evidence = list(evidence)
         boundary_evidence: list[BoundaryEvidence] = []
         offset = self._page_offset(page_evidence)
@@ -232,27 +235,39 @@ class Splitter:
                         )
                     )
 
-        fingerprint_headings: dict[str, list[PageEvidence]] = defaultdict(list)
-        for item in page_evidence:
-            if item.layout_fingerprint and item.heading_lesson_no is not None:
-                fingerprint_headings[item.layout_fingerprint].append(item)
-        for heading_pages in fingerprint_headings.values():
-            if len({item.pdf_page for item in heading_pages}) < 2:
-                continue
-            for item in heading_pages:
-                boundary_evidence.append(
-                    BoundaryEvidence(
-                        "layout", item.pdf_page, item.heading_lesson_no,
-                        item.heading_title, 0.7, item.layout_fingerprint or "",
-                    )
-                )
-
         grouped: dict[int, dict[int, list[BoundaryEvidence]]] = defaultdict(
             lambda: defaultdict(list)
         )
         for item in boundary_evidence:
             if item.lesson_no is not None and item.lesson_no > 0:
                 grouped[item.lesson_no][item.page_index].append(item)
+
+        fingerprint_headings: dict[str, set[int]] = defaultdict(set)
+        for item in page_evidence:
+            if item.layout_fingerprint and item.heading_lesson_no is not None:
+                fingerprint_headings[item.layout_fingerprint].add(item.pdf_page)
+        confirmed_fingerprints = {
+            fingerprint
+            for fingerprint, pages in fingerprint_headings.items()
+            if len(pages) >= 2
+        }
+        for item in page_evidence:
+            if item.layout_fingerprint not in confirmed_fingerprints:
+                continue
+            for lesson_no, pages in grouped.items():
+                candidate_items = pages.get(item.pdf_page)
+                if not candidate_items:
+                    continue
+                title = next(
+                    (candidate.title for candidate in candidate_items if candidate.title),
+                    None,
+                )
+                layout = BoundaryEvidence(
+                    "layout", item.pdf_page, lesson_no, title, 0.7,
+                    item.layout_fingerprint,
+                )
+                candidate_items.append(layout)
+                boundary_evidence.append(layout)
 
         total_pages = self._total_pages(summaries, page_evidence)
         boundaries: list[LessonBoundary] = []
@@ -277,14 +292,16 @@ class Splitter:
                     if position + 1 < len(selected)
                     else total_pages - 1
                 )
-                confidence = min(0.95, 0.55 + 0.15 * len(sources))
+                confidence = (
+                    0.65
+                    if len(sources) == 1
+                    else min(0.95, 0.55 + 0.15 * len(sources))
+                )
                 boundaries.append(
                     LessonBoundary(
                         lesson_no, title, page_start, page_end, confidence, "lesson"
                     )
                 )
-        elif ai_client and ai_client.is_configured():
-            boundaries = self.split_by_llm(summaries, ai_client)
         else:
             boundaries = self.split_by_regex(summaries) or self.split_by_heuristics(summaries)
 

@@ -119,3 +119,65 @@ def test_layout_evidence_only_strengthens_existing_heading_candidates():
     assert [boundary.index_no for boundary in result.boundaries] == [1, 2]
     assert all(boundary.confidence > 0.65 for boundary in result.boundaries)
     assert all(item.lesson_no is not None for item in result.evidence if item.source == "layout")
+
+
+def test_single_source_heading_confidence_is_capped_at_point_65():
+    evidence = [
+        PageEvidence(5, "scan", "Lesson 1 One", "", None, None, 1, "Lesson 1 One", False),
+    ]
+
+    result = Splitter().propose([], evidence)
+
+    assert result.boundaries[0].confidence <= 0.65
+
+
+def test_layout_strengthens_a_toc_candidate_on_a_non_heading_page():
+    evidence = [
+        PageEvidence(
+            0,
+            "scan",
+            "Contents",
+            "i",
+            "1 One 001\n2 Two 005\n3 Three 010\n4 Four 015",
+            None,
+            None,
+            None,
+            True,
+        ),
+        PageEvidence(15, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False, "opening"),
+        PageEvidence(19, "scan", "Lesson 2 Two", "5", None, 5, 2, "Lesson 2 Two", False, "opening"),
+        PageEvidence(24, "scan", "Lesson 3 Three", "10", None, 10, 3, "Lesson 3 Three", False),
+        PageEvidence(29, "scan", "Vocabulary", "15", None, 15, None, None, False, "opening"),
+    ]
+
+    result = Splitter().propose([], evidence)
+
+    lesson_four = next(boundary for boundary in result.boundaries if boundary.index_no == 4)
+    assert lesson_four.confidence > 0.65
+    assert any(
+        item.source == "layout" and item.lesson_no == 4 and item.page_index == 29
+        for item in result.evidence
+    )
+
+
+def test_duplicate_offset_pair_does_not_confirm_toc_mapping():
+    heading = PageEvidence(15, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False)
+    evidence = [
+        PageEvidence(0, "scan", "Contents", "i", "1 One 001\n2 Two 005", None, None, None, True),
+        heading,
+        heading,
+    ]
+
+    result = Splitter().propose([], evidence)
+
+    assert [boundary.index_no for boundary in result.boundaries] == [1]
+
+
+def test_propose_does_not_use_ai_when_local_evidence_is_absent():
+    class ForbiddenAi:
+        def is_configured(self):
+            raise AssertionError("Task 2 must not ask an AI client to split boundaries")
+
+    result = Splitter().propose([], [], ai_client=ForbiddenAi())
+
+    assert result.boundaries == ()
