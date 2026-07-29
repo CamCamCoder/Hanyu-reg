@@ -18,6 +18,7 @@ tmp/
 .venv/
 venv/
 .worktrees/
+.superpowers/
 
 # Cấu hình cục bộ của trợ lý/IDE.
 .claude/
