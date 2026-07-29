@@ -17,6 +17,7 @@ __pycache__/
 tmp/
 .venv/
 venv/
+.worktrees/
 
 # Cấu hình cục bộ của trợ lý/IDE.
 .claude/
