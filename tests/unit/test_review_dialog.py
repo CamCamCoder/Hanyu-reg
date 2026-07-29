@@ -6,7 +6,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 import hanzi_app.service.importer as importer_module
 from hanzi_app.data.models import LessonBoundary, VocabRow
@@ -116,6 +116,93 @@ def test_loc_bai_va_tim_kiem_chi_an_hien_dong(tmp_path):
         dialog.review_filter.setCurrentIndex(0)
         dialog.review_search.setText("jido")
         assert _visible_review_words(dialog) == ["教室"]
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_chon_tat_ca_chi_chon_dong_dang_hien(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.review_filter.setCurrentText("Bài 2")
+        dialog._select_visible_rows()
+
+        assert dialog._selected_review_rows() == [2]
+        assert (
+            dialog.btn_confirm_selected.text()
+            == "Xác nhận các dòng đã chọn (1)"
+        )
+
+        dialog._clear_review_selection()
+        assert dialog._selected_review_rows() == []
+        assert not dialog.btn_confirm_selected.isEnabled()
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_xac_nhan_chon_loc_luu_sua_va_giu_nguyen_dong_khac(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.review_table.item(0, 4).setText("教室")
+        dialog.review_table.item(0, 5).setText("jiàoshì")
+        dialog.review_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog._confirm_selected_rows()
+
+        lessons = db.get_lessons(book_id)
+        first = db.get_lesson_words(lessons[0]["id"])
+        second = db.get_lesson_words(lessons[1]["id"])
+        assert first[0]["word"] == "教室"
+        assert first[0]["pinyin_src"] == "jiàoshì"
+        assert first[0]["needs_review"] == 0
+        assert first[1]["needs_review"] == 1
+        assert second[0]["needs_review"] == 1
+        assert dialog.review_table.rowCount() == 2
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_xac_nhan_cac_dong_thuoc_nhieu_bai(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.review_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog.review_table.item(2, 0).setCheckState(Qt.CheckState.Checked)
+        dialog._confirm_selected_rows()
+
+        lessons = db.get_lessons(book_id)
+        first = db.get_lesson_words(lessons[0]["id"])
+        second = db.get_lesson_words(lessons[1]["id"])
+        assert [row["needs_review"] for row in first] == [0, 1, 0]
+        assert [row["needs_review"] for row in second] == [0]
+        assert _visible_review_words(dialog) == ["老师"]
     finally:
         if dialog is not None:
             dialog.deleteLater()

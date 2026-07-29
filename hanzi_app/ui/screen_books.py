@@ -217,6 +217,27 @@ class DialogReviewBook(QDialog):
         review_lay.addWidget(self.review_table, 1)
         self.review_filter.currentIndexChanged.connect(self._apply_review_filter)
         self.review_search.textChanged.connect(self._apply_review_filter)
+        self.review_table.itemChanged.connect(self._update_review_actions)
+
+        review_actions = QHBoxLayout()
+        self.btn_select_visible = QPushButton("Chọn tất cả đang hiển thị")
+        self.btn_select_visible.clicked.connect(self._select_visible_rows)
+        review_actions.addWidget(self.btn_select_visible)
+        self.btn_clear_selection = QPushButton("Bỏ chọn")
+        self.btn_clear_selection.clicked.connect(self._clear_review_selection)
+        review_actions.addWidget(self.btn_clear_selection)
+        review_actions.addStretch(1)
+        self.btn_confirm_selected = QPushButton(
+            "Xác nhận các dòng đã chọn (0)"
+        )
+        self.btn_confirm_selected.setMinimumHeight(42)
+        self.btn_confirm_selected.setStyleSheet(
+            f"background: {PALETTE['accent']}; color: white; padding: 8px 18px;"
+        )
+        self.btn_confirm_selected.setEnabled(False)
+        self.btn_confirm_selected.clicked.connect(self._confirm_selected_rows)
+        review_actions.addWidget(self.btn_confirm_selected)
+        review_lay.addLayout(review_actions)
 
         split = QSplitter(Qt.Orientation.Horizontal)
         self.list_lessons = QListWidget()
@@ -309,49 +330,57 @@ class DialogReviewBook(QDialog):
             )
         )
 
-        self.review_table.setRowCount(len(queue))
-        lesson_ids: set[int] = set()
-        for row, (lesson, word) in enumerate(queue):
-            lesson_ids.add(lesson["id"])
-            metadata = {
-                "lesson_id": lesson["id"],
-                "lesson_index": lesson["index_no"],
-                "page_start": lesson["page_start"],
-                "page_end": lesson["page_end"],
-                "word_id": word["id"],
-            }
-            check_item = QTableWidgetItem()
-            check_item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            check_item.setCheckState(Qt.CheckState.Unchecked)
-            check_item.setData(Qt.ItemDataRole.UserRole, metadata)
-            self.review_table.setItem(row, 0, check_item)
+        self.review_table.blockSignals(True)
+        try:
+            self.review_table.setRowCount(len(queue))
+            lesson_ids: set[int] = set()
+            for row, (lesson, word) in enumerate(queue):
+                lesson_ids.add(lesson["id"])
+                metadata = {
+                    "lesson_id": lesson["id"],
+                    "lesson_index": lesson["index_no"],
+                    "page_start": lesson["page_start"],
+                    "page_end": lesson["page_end"],
+                    "word_id": word["id"],
+                }
+                check_item = QTableWidgetItem()
+                check_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                check_item.setCheckState(Qt.CheckState.Unchecked)
+                check_item.setData(Qt.ItemDataRole.UserRole, metadata)
+                self.review_table.setItem(row, 0, check_item)
 
-            values = (
-                f"Bài {lesson['index_no']}",
-                word.get("source_page"),
-                word.get("order_no"),
-                word.get("word"),
-                word.get("pinyin_src"),
-                word.get("pos"),
-                word.get("hanviet_src"),
-                word.get("meaning_src"),
-            )
-            for column, value in enumerate(values, start=1):
-                item = QTableWidgetItem("" if value is None else str(value))
-                if column <= 3:
-                    item.setFlags(
-                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                values = (
+                    f"Bài {lesson['index_no']}",
+                    word.get("source_page"),
+                    word.get("order_no"),
+                    word.get("word"),
+                    word.get("pinyin_src"),
+                    word.get("pos"),
+                    word.get("hanviet_src"),
+                    word.get("meaning_src"),
+                )
+                for column, value in enumerate(values, start=1):
+                    item = QTableWidgetItem(
+                        "" if value is None else str(value)
                     )
-                self.review_table.setItem(row, column, item)
+                    if column <= 3:
+                        item.setFlags(
+                            Qt.ItemFlag.ItemIsEnabled
+                            | Qt.ItemFlag.ItemIsSelectable
+                        )
+                    self.review_table.setItem(row, column, item)
+        finally:
+            self.review_table.blockSignals(False)
 
         self.lbl_review_count.setText(
             f"{len(queue)} từ cần xác nhận · thuộc {len(lesson_ids)} bài"
         )
         self._apply_review_filter()
+        self._update_review_actions()
 
     def _apply_review_filter(self) -> None:
         lesson_id = self.review_filter.currentData()
@@ -369,6 +398,137 @@ class DialogReviewBook(QDialog):
             self.review_table.setRowHidden(
                 row, not (matches_lesson and query in searchable)
             )
+
+    def _selected_review_rows(self) -> list[int]:
+        return [
+            row
+            for row in range(self.review_table.rowCount())
+            if self.review_table.item(row, 0) is not None
+            and self.review_table.item(row, 0).checkState()
+            == Qt.CheckState.Checked
+        ]
+
+    def _update_review_actions(self, _item=None) -> None:
+        selected_count = len(self._selected_review_rows())
+        self.btn_confirm_selected.setText(
+            f"Xác nhận các dòng đã chọn ({selected_count})"
+        )
+        self.btn_confirm_selected.setEnabled(selected_count > 0)
+
+    def _select_visible_rows(self) -> None:
+        self.review_table.blockSignals(True)
+        try:
+            for row in range(self.review_table.rowCount()):
+                if not self.review_table.isRowHidden(row):
+                    self.review_table.item(row, 0).setCheckState(
+                        Qt.CheckState.Checked
+                    )
+        finally:
+            self.review_table.blockSignals(False)
+        self._update_review_actions()
+
+    def _confirm_selected_rows(self) -> None:
+        selected_rows = self._selected_review_rows()
+        if not selected_rows:
+            return
+
+        selected_by_lesson: dict[int, dict[int, int]] = {}
+        for row in selected_rows:
+            word = self.review_table.item(row, 4).text().strip()
+            if not word:
+                QMessageBox.warning(
+                    self,
+                    "Thiếu chữ Hán",
+                    "Chữ Hán không được để trống trước khi xác nhận.",
+                )
+                self.review_table.setCurrentCell(row, 4)
+                return
+            metadata = self.review_table.item(row, 0).data(
+                Qt.ItemDataRole.UserRole
+            )
+            selected_by_lesson.setdefault(
+                metadata["lesson_id"], {}
+            )[metadata["word_id"]] = row
+
+        answer = QMessageBox.question(
+            self,
+            "Xác nhận các từ đã chọn",
+            f"Xác nhận {len(selected_rows)} từ thuộc "
+            f"{len(selected_by_lesson)} bài?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            for lesson_id, selected_words in selected_by_lesson.items():
+                saved_rows: list[VocabRow] = []
+                for word in self.user_db.get_lesson_words(lesson_id):
+                    table_row = selected_words.get(word["id"])
+                    if table_row is None:
+                        saved_rows.append(
+                            VocabRow(
+                                order_no=word.get("order_no"),
+                                word=word["word"],
+                                pinyin_src=word.get("pinyin_src"),
+                                pos=word.get("pos"),
+                                hanviet_src=word.get("hanviet_src"),
+                                meaning_src=word.get("meaning_src"),
+                                source_page=word.get("source_page"),
+                                extract_by=word.get("extract_by") or "manual",
+                                needs_review=bool(word.get("needs_review")),
+                                review_reason=None,
+                            )
+                        )
+                        continue
+
+                    def value(column: int) -> str:
+                        item = self.review_table.item(table_row, column)
+                        return "" if item is None else item.text().strip()
+
+                    order_text = value(3)
+                    page_text = value(2)
+                    saved_rows.append(
+                        VocabRow(
+                            order_no=(
+                                int(order_text)
+                                if order_text.isdigit()
+                                else word.get("order_no")
+                            ),
+                            word=value(4),
+                            pinyin_src=value(5) or None,
+                            pos=value(6) or None,
+                            hanviet_src=value(7) or None,
+                            meaning_src=value(8) or None,
+                            source_page=(
+                                int(page_text)
+                                if page_text.isdigit()
+                                else word.get("source_page")
+                            ),
+                            extract_by="manual",
+                            needs_review=False,
+                            review_reason=None,
+                        )
+                    )
+                self.user_db.replace_vocab(lesson_id, saved_rows)
+        except Exception as exc:
+            self._reload_review_queue()
+            QMessageBox.warning(
+                self, "Không lưu được", f"Không thể xác nhận các từ: {exc}"
+            )
+            return
+
+        self._reload_review_queue()
+
+    def _clear_review_selection(self) -> None:
+        self.review_table.blockSignals(True)
+        try:
+            for row in range(self.review_table.rowCount()):
+                self.review_table.item(row, 0).setCheckState(
+                    Qt.CheckState.Unchecked
+                )
+        finally:
+            self.review_table.blockSignals(False)
+        self._update_review_actions()
 
     def _load_selected(self, current, _previous=None) -> None:
         if current is None:
