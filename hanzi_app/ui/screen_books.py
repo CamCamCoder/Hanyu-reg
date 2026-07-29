@@ -172,16 +172,16 @@ class DialogReviewBook(QDialog):
         self.resize(1180, 760)
 
         root = QVBoxLayout(self)
-        note = QLabel(
-            "Kiểm tra khoảng trang và các dòng màu vàng. "
-            "Sách chỉ sẵn sàng sau khi bấm “Xác nhận toàn bộ”."
+        self.review_note = QLabel(
+            "Chọn một dòng để xem ảnh nguồn, sửa nếu cần rồi tích ô. "
+            "Bấm “Xác nhận các dòng đã chọn” để lưu phần đã kiểm tra."
         )
-        note.setWordWrap(True)
-        note.setStyleSheet(
+        self.review_note.setWordWrap(True)
+        self.review_note.setStyleSheet(
             f"background: {PALETTE['warn_bg']}; color: {PALETTE['warn_ink']}; "
             f"padding: 9px; border: 1px solid {PALETTE['warn']};"
         )
-        root.addWidget(note)
+        root.addWidget(self.review_note)
 
         self.tabs = QTabWidget()
         self.review_tab = QWidget()

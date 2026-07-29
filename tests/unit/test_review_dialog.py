@@ -118,6 +118,23 @@ def test_hang_doi_hien_ro_bai_trang_va_khong_tich_san(tmp_path):
         db.close()
 
 
+def test_huong_dan_mo_ta_dung_luong_xac_nhan_chon_loc(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        text = dialog.review_note.text()
+        assert "tích ô" in text
+        assert "Xác nhận các dòng đã chọn" in text
+        assert "dòng màu vàng" not in text
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
 def test_loc_bai_va_tim_kiem_chi_an_hien_dong(tmp_path):
     app = QApplication.instance() or QApplication([])
     db, book_id = _make_review_queue_book(tmp_path)
