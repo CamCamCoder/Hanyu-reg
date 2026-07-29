@@ -6,7 +6,7 @@ import fitz
 
 from hanzi_app.adapter.ocr import OcrAdapter
 from hanzi_app.adapter.pdfsource import PdfSource
-from hanzi_app.data.models import TextSpan
+from hanzi_app.data.models import PageEvidence, TextSpan
 
 
 @pytest.fixture
@@ -80,3 +80,48 @@ def test_pdfsource_stacks_images_with_bounded_width(temp_pdf_path: Path):
     image = fitz.Pixmap(combined)
     assert image.width == 400
     assert image.height > image.width
+
+
+def test_page_census_classifies_pages_and_reads_toc(monkeypatch, temp_pdf_path):
+    """Census uses inexpensive page bands and limits full-page OCR to the TOC."""
+    full_ocr_calls: list[int] = []
+
+    with PdfSource(temp_pdf_path) as pdf:
+        monkeypatch.setattr(
+            pdf,
+            "_band_text",
+            lambda page, band: {
+                (0, "top"): "Contents",
+                (0, "bottom"): "1",
+                (1, "top"): "Lesson 1 Hello",
+                (1, "bottom"): "5",
+            }[(page, band)],
+        )
+
+        def full_ocr(page: int) -> str:
+            full_ocr_calls.append(page)
+            return "Lesson 1 005"
+
+        monkeypatch.setattr(pdf, "_full_ocr_text", full_ocr)
+        evidence = pdf.page_census()
+
+    assert evidence[0].is_toc_candidate is True
+    assert evidence[0].toc_text == "Lesson 1 005"
+    assert evidence[1].heading_lesson_no == 1
+    assert evidence[1].printed_page == 5
+    assert evidence[0].page_kind in {"native", "scan", "mixed"}
+    assert full_ocr_calls == [0, 1]
+
+
+def test_boundary_contact_sheet_is_bounded(temp_pdf_path):
+    with PdfSource(temp_pdf_path) as pdf:
+        evidence = [
+            PageEvidence(0, "native", "Contents", "1", "Lesson 1 005",
+                         1, None, None, True),
+            PageEvidence(1, "native", "Lesson 1", "5", None,
+                         5, 1, "Lesson 1", False),
+        ]
+        image = pdf.boundary_contact_sheet(evidence)
+    pix = fitz.Pixmap(image)
+    assert pix.width <= 1200
+    assert pix.height > 0

@@ -136,6 +136,7 @@ class VocabRow:
     needs_review: bool
     review_reason: str | None   # lý do gắn cờ, hiện lên giao diện sửa tay
     hanviet_src: str | None = None
+    source_block_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -154,3 +155,87 @@ class TextSpan:
     bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1)
     font_size: float
     is_ocr: bool = False
+
+
+@dataclass(frozen=True)
+class PageEvidence:
+    pdf_page: int
+    page_kind: str
+    top_text: str
+    bottom_text: str
+    toc_text: str | None
+    printed_page: int | None
+    heading_lesson_no: int | None
+    heading_title: str | None
+    is_toc_candidate: bool
+    layout_fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class BoundaryEvidence:
+    source: str
+    page_index: int
+    lesson_no: int | None
+    title: str | None
+    confidence: float
+    detail: str
+
+
+@dataclass(frozen=True)
+class BoundaryIssue:
+    code: str
+    severity: str
+    lesson_no: int | None
+    page_index: int | None
+    message: str
+
+
+@dataclass(frozen=True)
+class BoundaryReport:
+    valid: bool
+    issues: tuple[BoundaryIssue, ...]
+    missing_lesson_nos: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SplitResult:
+    boundaries: tuple[LessonBoundary, ...]
+    evidence: tuple[BoundaryEvidence, ...]
+    report: BoundaryReport
+    needs_review: bool
+
+
+@dataclass(frozen=True)
+class VocabBlock:
+    id: int | None
+    lesson_id: int | None
+    block_no: int
+    page_index: int
+    bbox: tuple[float, float, float, float]
+    crop_path: str | None
+    expected_rows: int | None
+    first_order: int | None
+    last_order: int | None
+    status: str = "pending"
+    ai_attempts: int = 0
+
+
+@dataclass(frozen=True)
+class BlockCoverage:
+    block_id: int | None
+    expected_rows: int | None
+    local_rows: int
+    ai_rows: int
+    final_rows: int
+    missing_orders: tuple[int, ...]
+    issues: tuple[str, ...]
+    passed: bool
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    rows: tuple[VocabRow, ...]
+    coverage: tuple[BlockCoverage, ...]
+    blocks: tuple[VocabBlock, ...]
+    ai_attempts: int
+    complete: bool
