@@ -312,6 +312,12 @@ Thêm `lesson_word.source_block_id` nullable, FK tới `import_block(id)` với
 `ON DELETE SET NULL`. `VocabRow` nhận trường mặc định
 `source_block_id: int | None = None`.
 
+Lược đồ cũ có `UNIQUE (lesson_id, word)`, mâu thuẫn với yêu cầu giữ một từ xuất
+hiện thật ở hai block khác nhau. Migration bậc 3 dựng lại `lesson_word` mà không
+có UNIQUE này, giữ nguyên toàn bộ `id`, dữ liệu và `progress.source_lw_id`, rồi
+tạo chỉ mục không-unique `(lesson_id, word)`. Test migration phải chứng minh một
+từ lặp ở hai block được lưu thành hai dòng và liên kết tiến độ cũ không bị mất.
+
 ### 13.3 Quan hệ với đặc tả crop cũ
 
 Đặc tả `2026-07-29-persisted-vocab-crops-design.md` chưa được triển khai và bị
@@ -326,7 +332,11 @@ Các kiểu dưới đây là dataclass đông cứng trong `data/models.py`. T�
 đồng giữa adapter, service và UI; tầng dưới không truyền dict tự do:
 
 - `PageEvidence`: `pdf_page`, `page_kind`, `top_text`, `bottom_text`,
-  `printed_page`, `heading_lesson_no`, `heading_title`, `is_toc_candidate`.
+  `toc_text`, `printed_page`, `heading_lesson_no`, `heading_title`,
+  `is_toc_candidate`, `layout_fingerprint`. `toc_text` chỉ có dữ liệu với trang
+  mục lục được OCR toàn trang; các trang khác dùng `None`.
+  `layout_fingerprint` là hash của hình học OCR dải đầu trang sau khi lượng tử
+  hóa, không chứa nội dung chữ và dùng để nhận bố cục mở bài lặp lại.
 - `BoundaryEvidence`: `source`, `page_index`, `lesson_no`, `title`,
   `confidence`, `detail`.
 - `BoundaryIssue`: `code`, `severity`, `lesson_no`, `page_index`, `message`.
@@ -337,7 +347,7 @@ Các kiểu dưới đây là dataclass đông cứng trong `data/models.py`. T�
   `ai_attempts`. `id` là `None` trước khi manifest được lưu.
 - `BlockCoverage`: `block_id`, `expected_rows`, `local_rows`, `ai_rows`,
   `final_rows`, `missing_orders`, `issues`, `passed`.
-- `ExtractionResult`: `rows`, `coverage`, `ai_attempts`, `complete`.
+- `ExtractionResult`: `rows`, `coverage`, `blocks`, `ai_attempts`, `complete`.
 
 Các tập hợp trong dataclass dùng tuple. `bbox` dùng tọa độ PDF
 `(x0, y0, x1, y1)`; khi lưu SQLite mới mã hóa thành `bbox_json`. `severity` chỉ
@@ -348,12 +358,16 @@ có `warning` hoặc `error`; còn bất kỳ `error` nào thì `valid=False`.
 Các interface dự kiến:
 
 - `PdfSource.page_census() -> list[PageEvidence]`
-- `Splitter.propose(summaries, evidence, ai_client=None) -> SplitResult`
+- `PdfSource.boundary_contact_sheet(evidence) -> bytes`
+- `Splitter.propose(summaries, evidence, ai_client=None, evidence_image=None) -> SplitResult`
 - `Splitter.validate(boundaries, evidence) -> BoundaryReport`
 - `VocabExtractor.locate_blocks(pdf, lesson) -> list[VocabBlock]`
 - `VocabExtractor.extract_blocks(pdf, blocks, ai_client=None) -> ExtractionResult`
+- `AiClient.split_lessons_from_image(image_bytes, evidence_text, issue_context=None) -> list[dict]`
+- `AiClient.extract_vocab_from_image(image_bytes, issue_context=None) -> list[dict]`
 - `UserDb.replace_import_blocks(lesson_id, blocks) -> None`
 - `UserDb.update_import_block(...) -> None`
+- `UserDb.replace_vocab_block(block_id, rows) -> None`
 
 Giữ wrapper `Splitter.split()` trong giai đoạn chuyển tiếp để test và người gọi
 cũ không vỡ đột ngột; importer mới dùng `propose()`.
