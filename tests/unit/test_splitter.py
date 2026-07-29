@@ -1,6 +1,6 @@
 """Kiểm thử unit cho service/splitter.py."""
 
-from hanzi_app.data.models import PageSummary
+from hanzi_app.data.models import LessonBoundary, PageEvidence, PageSummary
 from hanzi_app.service.splitter import Splitter
 
 
@@ -54,3 +54,68 @@ def test_boya_preset_matches_verified_opening_pages():
     assert len(boundaries) == 30
     assert [b.page_start for b in boundaries[:5]] == [36, 41, 48, 54, 61]
     assert boundaries[-1].page_start == 234
+
+
+def test_boundary_validator_rejects_missing_lessons_and_overlap():
+    boundaries = [
+        LessonBoundary(1, "Bài 1", 15, 25, 0.7, "lesson"),
+        LessonBoundary(3, "Bài 3", 24, 35, 0.7, "lesson"),
+    ]
+    report = Splitter().validate(boundaries, (), total_pages=144)
+    assert report.valid is False
+    assert report.missing_lesson_nos == (2,)
+    assert {issue.code for issue in report.issues} >= {
+        "missing_lesson", "overlap"
+    }
+
+
+def test_local_toc_and_heading_fuse_into_complete_boundaries():
+    evidence = [
+        PageEvidence(
+            0,
+            "scan",
+            "Contents",
+            "i",
+            "1 One 001\n2 Two 005\n3 Three 010",
+            None,
+            None,
+            None,
+            True,
+        ),
+        PageEvidence(15, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False),
+        PageEvidence(19, "scan", "Lesson 2 Two", "5", None, 5, 2, "Lesson 2 Two", False),
+        PageEvidence(24, "scan", "Lesson 3 Three", "10", None, 10, 3, "Lesson 3 Three", False),
+    ]
+    result = Splitter().propose([], evidence)
+    assert [boundary.index_no for boundary in result.boundaries] == [1, 2, 3]
+    assert [boundary.page_start for boundary in result.boundaries] == [15, 19, 24]
+    assert result.report.valid is True
+    assert all(boundary.confidence < 1.0 for boundary in result.boundaries)
+
+
+def test_fusion_marks_conflicting_toc_and_heading_pages_invalid():
+    evidence = [
+        PageEvidence(0, "scan", "Contents", "i", "1 One 002", None, None, None, True),
+        PageEvidence(15, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False),
+        PageEvidence(19, "scan", "Lesson 2 Two", "5", None, 5, 2, "Lesson 2 Two", False),
+        PageEvidence(24, "scan", "Lesson 3 Three", "10", None, 10, 3, "Lesson 3 Three", False),
+    ]
+
+    result = Splitter().propose([], evidence)
+
+    assert result.report.valid is False
+    assert "toc_heading_conflict" in {issue.code for issue in result.report.issues}
+
+
+def test_layout_evidence_only_strengthens_existing_heading_candidates():
+    evidence = [
+        PageEvidence(5, "scan", "Lesson 1 One", "", None, None, 1, "Lesson 1 One", False, "open"),
+        PageEvidence(10, "scan", "Lesson 2 Two", "", None, None, 2, "Lesson 2 Two", False, "open"),
+        PageEvidence(15, "scan", "Vocabulary", "", None, None, None, None, False, "open"),
+    ]
+
+    result = Splitter().propose([], evidence)
+
+    assert [boundary.index_no for boundary in result.boundaries] == [1, 2]
+    assert all(boundary.confidence > 0.65 for boundary in result.boundaries)
+    assert all(item.lesson_no is not None for item in result.evidence if item.source == "layout")
