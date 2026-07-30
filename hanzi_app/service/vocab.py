@@ -11,10 +11,17 @@ import time
 import unicodedata
 from dataclasses import replace
 from itertools import product
+from math import ceil
 from typing import TYPE_CHECKING
 
 from hanzi_app.adapter.aiclient import AiRateLimitError
-from hanzi_app.data.models import TextSpan, VocabBlock, VocabRow
+from hanzi_app.data.models import (
+    BlockCoverage,
+    ExtractionResult,
+    TextSpan,
+    VocabBlock,
+    VocabRow,
+)
 
 if TYPE_CHECKING:
     from hanzi_app.adapter.aiclient import AiClient
@@ -719,6 +726,70 @@ class VocabExtractor:
         if width <= 0 or not body:
             return []
 
+        aliases = {
+            "order": {"stt", "no.", "序号", "编号"},
+            "word": {"chữhán", "hanzi", "汉字", "chữtrung"},
+            "pinyin": {"pinyin", "拼音"},
+            "pos": {"từloại", "词性", "pos"},
+            "hanviet": {"hán-việt", "hánviệt", "han-viet"},
+            "meaning_en": {"english", "nghĩaanh", "英语"},
+            "meaning_vi": {"nghĩaviệt", "nghĩa", "vietnamese", "越南语"},
+        }
+        header_roles: dict[str, float] = {}
+        for span in spans:
+            if abs(span.bbox[1] - header_y) > 16:
+                continue
+            label = re.sub(r"\s+", "", span.text.strip().lower())
+            for role, labels in aliases.items():
+                if label in labels:
+                    header_roles[role] = (
+                        span.bbox[0] + span.bbox[2]
+                    ) / 2
+                    break
+
+        if "word" in header_roles and len(header_roles) >= 2:
+            columns = sorted(header_roles.items(), key=lambda item: item[1])
+            cuts = [
+                (left[1] + right[1]) / 2
+                for left, right in zip(columns, columns[1:])
+            ]
+            roles = [role for role, _center in columns]
+            rows: list[VocabRow] = []
+            for line in _line_groups(body):
+                cells = {role: [] for role in roles}
+                for span in line:
+                    center = (span.bbox[0] + span.bbox[2]) / 2
+                    cells[roles[sum(center >= cut for cut in cuts)]].append(
+                        span
+                    )
+                word = "".join(
+                    ch
+                    for span in sorted(
+                        cells.get("word", []), key=lambda item: item.bbox[0]
+                    )
+                    for ch in span.text
+                    if RE_CJK_ONLY.match(ch)
+                )
+                if not word:
+                    continue
+                raw_order = self._join_cell(cells.get("order", [])) or ""
+                match = re.search(r"\d+", raw_order)
+                pinyin = self._join_cell(cells.get("pinyin", []))
+                rows.append(VocabRow(
+                    int(match.group()) if match else len(rows) + 1,
+                    word,
+                    pinyin,
+                    self._join_cell(cells.get("pos", [])),
+                    self._join_cell(cells.get("meaning_vi", []))
+                    or self._join_cell(cells.get("meaning_en", [])),
+                    source_page,
+                    "regex",
+                    pinyin is None,
+                    "không đọc được pinyin" if pinyin is None else None,
+                    self._join_cell(cells.get("hanviet", [])),
+                ))
+            return rows
+
         lines: list[list[TextSpan]] = []
         for span in sorted(body, key=lambda s: ((s.bbox[1] + s.bbox[3]) / 2, s.bbox[0])):
             cy = (span.bbox[1] + span.bbox[3]) / 2
@@ -835,6 +906,192 @@ class VocabExtractor:
             )
         return rows
 
+    @staticmethod
+    def _row_key(
+        row: VocabRow,
+    ) -> tuple[str, str | None, int | None, int | None]:
+        return (
+            row.word,
+            row.pinyin_src,
+            row.source_block_id,
+            row.order_no,
+        )
+
+    def merge_block_rows(
+        self,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+    ) -> list[VocabRow]:
+        """Merge evidence without collapsing repeated words in other blocks."""
+        merged: list[VocabRow] = []
+        seen: set[tuple[str, str | None, int | None, int | None]] = set()
+        for row in [*local_rows, *ai_rows]:
+            key = self._row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        return sorted(
+            merged,
+            key=lambda row: (
+                row.source_page,
+                row.source_block_id if row.source_block_id is not None else -1,
+                row.order_no if row.order_no is not None else 10**9,
+            ),
+        )
+
+    def validate_block_coverage(
+        self,
+        block: VocabBlock,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+        final_rows: list[VocabRow],
+    ) -> BlockCoverage:
+        """Reject a non-empty block when its row evidence is still incomplete."""
+        issues: list[str] = []
+        keys = [self._row_key(row) for row in final_rows]
+        if len(keys) != len(set(keys)):
+            issues.append("abnormal_exact_duplicates")
+        if not final_rows:
+            issues.append("zero_rows")
+
+        missing_orders: tuple[int, ...] = ()
+        if block.first_order is not None and block.last_order is not None:
+            observed = {
+                row.order_no for row in final_rows if row.order_no is not None
+            }
+            missing_orders = tuple(
+                order
+                for order in range(block.first_order, block.last_order + 1)
+                if order not in observed
+            )
+            if missing_orders:
+                issues.append("missing_orders")
+
+        if block.expected_rows is None:
+            sources_agree = (
+                len(local_rows) > 0
+                and len(ai_rows) > 0
+                and len(local_rows) == len(ai_rows)
+            )
+            if not sources_agree:
+                issues.append("expected_rows_unknown_needs_review")
+        else:
+            if len(final_rows) != block.expected_rows:
+                issues.append("expected_row_mismatch")
+            if len(final_rows) < ceil(block.expected_rows * 0.8):
+                issues.append("coverage_below_80_percent")
+
+        blocking = {
+            "abnormal_exact_duplicates",
+            "zero_rows",
+            "missing_orders",
+            "coverage_below_80_percent",
+            "expected_rows_unknown_needs_review",
+        }
+        return BlockCoverage(
+            block.id,
+            block.expected_rows,
+            len(local_rows),
+            len(ai_rows),
+            len(final_rows),
+            missing_orders,
+            tuple(dict.fromkeys(issues)),
+            not any(issue in blocking for issue in issues),
+        )
+
+    @staticmethod
+    def _spans_in_block(
+        spans: list[TextSpan], block: VocabBlock
+    ) -> list[TextSpan]:
+        x0, y0, x1, y1 = block.bbox
+        return [
+            span
+            for span in spans
+            if x0 <= (span.bbox[0] + span.bbox[2]) / 2 <= x1
+            and y0 <= (span.bbox[1] + span.bbox[3]) / 2 <= y1
+        ]
+
+    def extract_blocks(
+        self,
+        pdf: PdfSource,
+        blocks: list[VocabBlock],
+        ai_client: AiClient | None = None,
+    ) -> ExtractionResult:
+        """Extract and validate each persisted vocabulary block independently."""
+        all_rows: list[VocabRow] = []
+        reports: list[BlockCoverage] = []
+        updated: list[VocabBlock] = []
+        attempts = 0
+        for block in blocks:
+            chinese = self._spans_in_block(
+                list(pdf.spans(block.page_index)), block
+            )
+            latin = (
+                self._spans_in_block(
+                    list(pdf.ocr_spans(
+                        block.page_index, language="en-US", dpi=250
+                    )),
+                    block,
+                )
+                if hasattr(pdf, "ocr_spans")
+                else []
+            )
+            merged = self.merge_bilingual_spans(chinese, latin)
+            unique_spans = list({
+                (span.text, span.bbox, span.font_size, span.is_ocr): span
+                for span in merged
+            }.values())
+            local_rows = [
+                replace(row, source_block_id=block.id)
+                for row in self.extract_table_spans(
+                    unique_spans, source_page=block.page_index + 1
+                )
+            ]
+            final_rows = self.merge_block_rows(local_rows, [])
+            report = self.validate_block_coverage(
+                block, local_rows, [], final_rows
+            )
+            ai_rows: list[VocabRow] = []
+            if (
+                not report.passed
+                and ai_client is not None
+                and ai_client.is_configured()
+            ):
+                image = render_block_crop(pdf, block)
+                if image:
+                    attempts += 1
+                    ai_rows = [
+                        replace(row, source_block_id=block.id)
+                        for row in self.extract_by_llm_image(
+                            image, ai_client, block.page_index + 1
+                        )
+                    ]
+                    final_rows = self.merge_block_rows(local_rows, ai_rows)
+                    report = self.validate_block_coverage(
+                        block, local_rows, ai_rows, final_rows
+                    )
+            status = (
+                "ai_ok" if report.passed and ai_rows
+                else "local_ok" if report.passed
+                else "incomplete"
+            )
+            all_rows.extend(final_rows)
+            reports.append(report)
+            updated.append(replace(
+                block,
+                status=status,
+                ai_attempts=block.ai_attempts + (1 if ai_rows else 0),
+            ))
+
+        return ExtractionResult(
+            tuple(self.merge_block_rows(all_rows, [])),
+            tuple(reports),
+            tuple(updated),
+            attempts,
+            bool(blocks) and all(report.passed for report in reports),
+        )
+
     def validate_rows(self, rows: list[VocabRow]) -> list[VocabRow]:
         """Kiểm chứng đầu ra OCR/Vision bằng từ điển và âm đọc từng chữ."""
         validated: list[VocabRow] = []
@@ -880,6 +1137,7 @@ class VocabExtractor:
                     needs_review=bool(reasons),
                     review_reason="; ".join(reasons) or None,
                     hanviet_src=row.hanviet_src,
+                    source_block_id=row.source_block_id,
                 )
             )
         return validated

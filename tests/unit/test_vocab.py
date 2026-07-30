@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from hanzi_app.data.models import LessonBoundary, TextSpan, VocabBlock
+from hanzi_app.data.models import LessonBoundary, TextSpan, VocabBlock, VocabRow
 from hanzi_app.service.vocab import VocabExtractor, render_block_crop
 
 
@@ -373,3 +373,113 @@ def test_locator_rejects_china_change_three_column_bilingual_prose():
     )
 
     assert blocks == []
+
+
+def _block_row(word, order_no, block_id, pinyin="cí"):
+    return VocabRow(
+        order_no,
+        word,
+        pinyin,
+        None,
+        None,
+        1,
+        "regex",
+        False,
+        None,
+        source_block_id=block_id,
+    )
+
+
+def test_coverage_rejects_four_of_twelve_rows():
+    block = VocabBlock(
+        7, 2, 1, 10, (0, 0, 100, 200), "crop.png", 12, 1, 12
+    )
+    rows = [_block_row(f"词{i}", i, 7) for i in range(1, 5)]
+
+    report = VocabExtractor().validate_block_coverage(block, rows, [], rows)
+
+    assert report.passed is False
+    assert report.missing_orders == tuple(range(5, 13))
+    assert "expected_row_mismatch" in report.issues
+
+
+def test_unknown_expected_rows_requires_two_equal_nonzero_sources():
+    block = VocabBlock(
+        8, 2, 2, 11, (0, 0, 100, 200), "crop.png", None, None, None
+    )
+    local = [_block_row("你", 1, 8), _block_row("好", 2, 8)]
+    ai = [
+        _block_row("你", 1, 8, pinyin="nǐ"),
+        _block_row("好", 2, 8, pinyin="hǎo"),
+    ]
+
+    local_only = VocabExtractor().validate_block_coverage(
+        block, local, [], local
+    )
+    agreed = VocabExtractor().validate_block_coverage(
+        block, local, ai, local
+    )
+
+    assert local_only.passed is False
+    assert "expected_rows_unknown_needs_review" in local_only.issues
+    assert agreed.passed is True
+
+
+def test_merge_keeps_same_word_from_different_blocks_and_deduplicates_exact_key():
+    first = _block_row("行", 1, 11)
+    exact_duplicate = _block_row("行", 1, 11)
+    second = _block_row("行", 9, 12)
+
+    result = VocabExtractor().merge_block_rows(
+        [first, exact_duplicate], [second]
+    )
+
+    assert [(row.word, row.source_block_id) for row in result] == [
+        ("行", 11),
+        ("行", 12),
+    ]
+
+
+def test_three_column_block_keeps_word_when_meaning_is_absent():
+    spans = [
+        _span("STT", 10, 50),
+        _span("Chữ Hán", 80, 50),
+        _span("Pinyin", 180, 50),
+        _span("1", 10, 100),
+        _span("你好", 80, 100),
+        _span("nǐhǎo", 180, 100),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=1)
+
+    assert len(rows) == 1
+    assert rows[0].word == "你好"
+    assert rows[0].pinyin_src == "nǐhǎo"
+    assert rows[0].meaning_src is None
+
+
+def test_extract_blocks_crops_to_manifest_and_attaches_source_block():
+    block = VocabBlock(
+        31, 4, 1, 0, (0, 40, 260, 130), "crop.png", 1, 1, 1
+    )
+    page_spans = [
+        _span("STT", 10, 50),
+        _span("Chữ Hán", 80, 50),
+        _span("Pinyin", 180, 50),
+        _span("1", 10, 100),
+        _span("你好", 80, 100),
+        _span("nǐhǎo", 180, 100),
+        _span("课文", 400, 100),
+    ]
+    pdf = MagicMock()
+    pdf.spans.return_value = page_spans
+    pdf.ocr_spans.return_value = page_spans
+
+    result = VocabExtractor().extract_blocks(pdf, [block])
+
+    assert result.complete is True
+    assert [(row.word, row.source_block_id) for row in result.rows] == [
+        ("你好", 31)
+    ]
+    assert result.coverage[0].passed is True
+    assert result.blocks[0].status == "local_ok"
