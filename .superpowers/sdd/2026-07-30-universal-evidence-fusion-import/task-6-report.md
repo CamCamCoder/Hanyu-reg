@@ -152,3 +152,56 @@ Result: `278 passed, 1 skipped in 5.57s`.
 - Without sequential STT, aligned structure requires a third repeated column in addition to Hanzi and pinyin, so a two-column dialogue cannot manufacture two signals from the same pair.
 - Added `新词` and `Vocabulary` to the generic heading vocabulary; no textbook-specific page or title constants were introduced.
 - Text-only legacy spans remain supported by heading detection without entering the geometric locator path.
+## Fix round 2/5 — numbered pinyin and English ambiguity
+
+### RED
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "numbered_pinyin or english_women or preserves_tone_marked" -v --basetemp .pytest-tmp-task6-fix2-red
+```
+
+Result: `2 failed, 1 passed, 13 deselected`.
+
+- A vertically disjoint continuation using `ni3 hao3`, `zhong1guo2`, and `wo3` was not located because digits were outside the accepted pinyin alphabet.
+- English `women` segmented as `wo` + `men`, so a three-column bilingual dialogue was incorrectly accepted as a block.
+- Tone-marked `nǐhǎo` and distinctive plain `zhongguo` already passed and became the preservation test.
+
+### GREEN
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "numbered_pinyin or english_women or preserves_tone_marked" -v --basetemp .pytest-tmp-task6-fix2-green
+```
+
+Result: `3 passed, 13 deselected`.
+
+### Required regression
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py tests/unit/test_universal_engine.py -v --basetemp .pytest-tmp-task6-fix2-regression
+```
+
+Result: `43 passed`.
+
+### Full unit regression
+
+Command:
+
+```powershell
+pytest tests/unit -q --basetemp .pytest-tmp-task6-fix2-all-unit
+```
+
+Result: `281 passed, 1 skipped in 5.50s`.
+
+### Fix decisions
+
+- Numbered pinyin accepts optional tone digits `0`–`5` after each syllable, including joined forms such as `zhong1guo2` and spaced forms such as `ni3 hao3`.
+- Tone-marked pinyin remains strong evidence.
+- Plain unspaced Latin must contain at least one pinyin-distinctive initial/final; this keeps `nihao`, `zhongguo`, and `ci`-style orthography while rejecting the English ambiguity `women`.
+- Plain whitespace-separated input counts as a boundary signal only when every token is exactly one valid pinyin syllable, preventing a phrase such as `women men` from gaining confidence merely from spaces.
+- No textbook-specific or English-word exception list was added.

@@ -261,3 +261,68 @@ def test_locator_accepts_new_generic_heading_markers():
             pdf, LessonBoundary(11, "Bài 11", 0, 0, 1.0, "lesson")
         )
         assert len(blocks) == 1
+
+
+def test_locator_finds_disjoint_continuation_with_numbered_pinyin():
+    page = _vocab_region("New Words", (1, 2), 40) + [
+        _span("3", 20, 420, 20),
+        _span("你好", 80, 420, 45),
+        _span("ni3 hao3", 160, 420, 80),
+        _span("4", 20, 450, 20),
+        _span("中国", 80, 450, 45),
+        _span("zhong1guo2", 160, 450, 90),
+        _span("5", 20, 480, 20),
+        _span("我", 80, 480, 45),
+        _span("wo3", 160, 480, 45),
+    ]
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(12, "Bài 12", 0, 0, 1.0, "lesson")
+    )
+
+    assert [
+        (block.expected_rows, block.first_order, block.last_order)
+        for block in blocks
+    ] == [(2, 1, 2), (3, 3, 5)]
+
+
+def test_locator_rejects_english_women_in_three_column_dialogue():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("我们", 20, 100, 45),
+        _span("women", 100, 100, 70),
+        _span("chúng tôi", 220, 100, 90),
+        _span("女人", 20, 140, 45),
+        _span("women", 100, 140, 70),
+        _span("phụ nữ", 220, 140, 90),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(13, "Bài 13", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+
+def test_locator_preserves_tone_marked_and_distinctive_plain_pinyin():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("你好", 20, 100, 45),
+        _span("nǐhǎo", 100, 100, 70),
+        _span("greeting", 220, 100, 90),
+        _span("中国", 20, 140, 45),
+        _span("zhongguo", 100, 140, 80),
+        _span("country", 220, 140, 90),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(14, "Bài 14", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 2

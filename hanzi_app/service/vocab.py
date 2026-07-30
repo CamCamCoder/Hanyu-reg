@@ -120,29 +120,94 @@ def _has_vocab_heading(spans: list[TextSpan]) -> bool:
     return any(_line_has_vocab_heading(line) for line in _line_groups(spans))
 
 
-def _can_segment_pinyin(value: str) -> bool:
-    reachable = {0}
+def _segment_plain_pinyin(value: str) -> tuple[str, ...] | None:
+    paths: dict[int, tuple[str, ...]] = {0: ()}
     for start in range(len(value)):
-        if start not in reachable:
+        if start not in paths:
             continue
         for end in range(start + 1, min(len(value), start + 6) + 1):
-            if value[start:end] in _PINYIN_SYLLABLES:
-                reachable.add(end)
-    return len(value) in reachable or (
-        value.endswith("r") and len(value) - 1 in reachable
+            syllable = value[start:end]
+            if syllable in _PINYIN_SYLLABLES and end not in paths:
+                paths[end] = paths[start] + (syllable,)
+    if len(value) in paths:
+        return paths[len(value)]
+    if value.endswith("r") and len(value) - 1 in paths:
+        return paths[len(value) - 1]
+    return None
+
+
+def _can_segment_numbered_pinyin(value: str) -> bool:
+    reachable = {0}
+    for start in range(len(value)):
+        if start not in reachable or value[start].isdigit():
+            continue
+        for end in range(start + 1, min(len(value), start + 6) + 1):
+            if value[end - 1].isdigit():
+                break
+            syllable = _plain_pinyin(value[start:end])
+            if syllable not in _PINYIN_SYLLABLES:
+                continue
+            next_index = end
+            if next_index < len(value) and value[next_index] in "012345":
+                next_index += 1
+            reachable.add(next_index)
+    return len(value) in reachable
+
+
+def _is_distinctive_plain_syllable(syllable: str) -> bool:
+    distinctive_initials = {"zh", "ch", "sh", "q", "x", "z", "c"}
+    distinctive_finals = {
+        "ai", "ao", "ang", "eng", "ong", "ian", "iang", "iao",
+        "iong", "iu", "ua", "uai", "uan", "uang", "ui", "uo",
+        "v", "ve", "van", "vn",
+    }
+    initial = max(
+        (
+            candidate
+            for candidate in _PINYIN_INITIALS
+            if syllable.startswith(candidate)
+            and syllable[len(candidate):] in _PINYIN_FINALS
+        ),
+        key=len,
+        default="",
     )
+    final = syllable[len(initial):]
+    return initial in distinctive_initials or final in distinctive_finals
 
 
 def _is_pinyin_text(text: str) -> bool:
     value = text.strip()
-    if not value or not RE_PINYIN_TEXT.fullmatch(value):
+    if not value or not re.fullmatch(
+        r"[A-Za-züÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ0-5'’ -]+",
+        value,
+    ):
         return False
-    tokens = [
-        _plain_pinyin(token)
-        for token in re.split(r"[\s'’-]+", value)
-        if token
+    raw_tokens = [
+        token for token in re.split(r"[\s'’-]+", value) if token
     ]
-    return bool(tokens) and all(_can_segment_pinyin(token) for token in tokens)
+    segmentations: list[tuple[str, ...]] = []
+    has_number = any(character.isdigit() for character in value)
+    for token in raw_tokens:
+        if any(character.isdigit() for character in token):
+            if not _can_segment_numbered_pinyin(token):
+                return False
+            continue
+        segmentation = _segment_plain_pinyin(_plain_pinyin(token))
+        if segmentation is None:
+            return False
+        segmentations.append(segmentation)
+
+    has_tone_mark = any(character in PINYIN_VOWELS for character in value)
+    boundary_is_syllabic = (
+        len(raw_tokens) >= 2
+        and all(len(segmentation) == 1 for segmentation in segmentations)
+    )
+    distinctive_plain = any(
+        _is_distinctive_plain_syllable(syllable)
+        for segmentation in segmentations
+        for syllable in segmentation
+    )
+    return has_number or has_tone_mark or boundary_is_syllabic or distinctive_plain
 
 
 def _numeric_column_clusters(
