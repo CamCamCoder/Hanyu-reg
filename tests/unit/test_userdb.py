@@ -12,7 +12,7 @@ import pytest
 
 from hanzi_app.data import migrate
 from hanzi_app.data.migrate import SCHEMA_VERSION
-from hanzi_app.data.models import LessonBoundary, ReviewOutcome, VocabRow
+from hanzi_app.data.models import LessonBoundary, ReviewOutcome, VocabBlock, VocabRow
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.scheduler import apply_review
 
@@ -23,6 +23,7 @@ BANG_5_3 = {
     "book",
     "lesson",
     "lesson_word",
+    "import_block",
     "progress",
     "review_log",
     "explain_cache",
@@ -33,6 +34,7 @@ CHI_MUC_5_3 = {
     "idx_lesson_book",
     "idx_lw_lesson",
     "idx_lw_word",
+    "idx_lw_lesson_word",
     "idx_progress_due",
     "idx_log_word",
 }
@@ -176,7 +178,7 @@ def test_02_schema_version_co_dung_mot_dong_version_hien_tai(db, duong_dan):
     # 06b thêm bậc 2, nên con số chốt ở đây đổi theo; bảng vẫn phải đúng một dòng.
     dong = doc_schema_version(duong_dan)
     assert len(dong) == 1
-    assert dong[0][0] == 2 == SCHEMA_VERSION
+    assert dong[0][0] == 3 == SCHEMA_VERSION
     assert dong[0][1]          # applied_at không rỗng
 
 
@@ -706,7 +708,103 @@ def test_06b_e_schema_version_sau_khi_nang_cap_dung_mot_dong_bang_2(duong_dan):
 
     dong = doc_schema_version(duong_dan)
     assert len(dong) == 1
-    assert dong[0][0] == 2 == SCHEMA_VERSION
+    assert dong[0][0] == 3 == SCHEMA_VERSION
+
+
+# ----------------------------------------- 06c: manifest block nhập từ mới
+def create_version_2_database_with_source_word(tmp_path):
+    """Tạo tệp bậc 2 có progress trỏ tới lesson_word cũ.
+
+    Nếu bậc 3 không lưu và khôi phục source_lw_id khi dựng lại lesson_word,
+    kiểm thử dưới sẽ bắt lỗi tham chiếu bị mất.
+    """
+    path = tmp_path / "v2.sqlite"
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(migrate._TAO_BANG_VERSION)
+        migrate._len_bac_1(conn)
+        migrate._ghi_version(conn, 1)
+        migrate._len_bac_2(conn)
+        migrate._ghi_version(conn, 2)
+        conn.execute(
+            "INSERT INTO book(id,title,file_path,file_hash,import_state) "
+            "VALUES(1,'Sách cũ','old.pdf','old-hash','ready')"
+        )
+        conn.execute(
+            "INSERT INTO lesson(id,book_id,index_no,page_start,page_end) "
+            "VALUES(1,1,1,0,9)"
+        )
+        conn.execute(
+            "INSERT INTO lesson_word(id,lesson_id,order_no,word) "
+            "VALUES(7,1,1,'你好')"
+        )
+        conn.execute(
+            "INSERT INTO progress(word,status,source_lw_id) "
+            "VALUES('你好','new',7)"
+        )
+    finally:
+        conn.close()
+    return path
+
+
+def test_migration_3_preserves_progress_source_and_allows_repeated_word(tmp_path):
+    path = create_version_2_database_with_source_word(tmp_path)
+    db = UserDb(str(path))
+    try:
+        lesson_id = db.get_lessons(1)[0]["id"]
+        blocks = db.replace_import_blocks(lesson_id, [
+            VocabBlock(None, lesson_id, 1, 3, (0, 10, 100, 200),
+                       "a.png", 1, 1, 1),
+            VocabBlock(None, lesson_id, 2, 5, (0, 10, 100, 200),
+                       "b.png", 1, 2, 2),
+        ])
+        db.replace_vocab_block(blocks[0]["id"], [vocab("你好", 1)])
+        db.replace_vocab_block(blocks[1]["id"], [vocab("你好", 2)])
+
+        assert migrate.current_version(db._conn) == 3
+        assert [row["id"] for row in db.get_lesson_words(lesson_id)] == [7, 8, 9]
+        assert db._conn.execute(
+            "SELECT source_lw_id FROM progress WHERE word='你好'"
+        ).fetchone()[0] == 7
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+def test_replace_import_blocks_is_atomic(db):
+    book_id = them_sach(db, "Sách manifest", "manifest-atomic")
+    db.replace_lessons(book_id, [bound(1, 0, 9)])
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.replace_import_blocks(lesson_id, [
+            VocabBlock(None, lesson_id, 1, 3, (0, 0, 100, 200),
+                       None, 2, 1, 2),
+            VocabBlock(None, lesson_id, 1, 4, (0, 0, 100, 200),
+                       None, 2, 3, 4),
+        ])
+
+    assert db.get_import_blocks(lesson_id) == []
+
+
+def test_book_import_complete_requires_a_passed_block_for_every_lesson(db):
+    book_id = them_sach(db, "Sách đủ bài", "manifest-complete")
+    db.replace_lessons(book_id, [bound(1, 0, 4), bound(2, 5, 9)])
+    first, second = db.get_lessons(book_id)
+    db.replace_import_blocks(first["id"], [
+        VocabBlock(None, first["id"], 1, 1, (0, 0, 100, 200),
+                   "one.png", 1, 1, 1, "local_ok")
+    ])
+
+    assert db.book_import_complete(book_id) is False
+
+    db.replace_import_blocks(second["id"], [
+        VocabBlock(None, second["id"], 1, 6, (0, 0, 100, 200),
+                   "two.png", 1, 1, 1, "manual")
+    ])
+
+    assert db.book_import_complete(book_id) is True
 
 
 # ------------------------------- 08a: hoàn tác lần tự đánh giá gần nhất
