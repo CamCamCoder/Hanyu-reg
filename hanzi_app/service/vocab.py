@@ -175,13 +175,13 @@ def _is_distinctive_plain_syllable(syllable: str) -> bool:
     return initial in distinctive_initials or final in distinctive_finals
 
 
-def _is_pinyin_text(text: str) -> bool:
+def _pinyin_evidence_strength(text: str) -> int:
     value = text.strip()
     if not value or not re.fullmatch(
-        r"[A-Za-züÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ0-5'’ -]+",
+        r"[A-Za-züÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ0-5:'’ -]+",
         value,
     ):
-        return False
+        return 0
     raw_tokens = [
         token for token in re.split(r"[\s'’-]+", value) if token
     ]
@@ -190,25 +190,31 @@ def _is_pinyin_text(text: str) -> bool:
     for token in raw_tokens:
         if any(character.isdigit() for character in token):
             if not _can_segment_numbered_pinyin(token):
-                return False
+                return 0
             continue
         segmentation = _segment_plain_pinyin(_plain_pinyin(token))
         if segmentation is None:
-            return False
+            return 0
         segmentations.append(segmentation)
 
     has_tone_mark = any(character in PINYIN_VOWELS for character in value)
+    has_u_colon = "u:" in value.lower()
     boundary_is_syllabic = (
         len(raw_tokens) >= 2
         and all(len(segmentation) == 1 for segmentation in segmentations)
     )
+    if has_number or has_tone_mark or has_u_colon or boundary_is_syllabic:
+        return 2
     distinctive_plain = any(
         _is_distinctive_plain_syllable(syllable)
         for segmentation in segmentations
         for syllable in segmentation
     )
-    return has_number or has_tone_mark or boundary_is_syllabic or distinctive_plain
+    return 1 if distinctive_plain else 0
 
+
+def _is_pinyin_text(text: str) -> bool:
+    return _pinyin_evidence_strength(text) > 0
 
 def _numeric_column_clusters(
     spans: list[TextSpan],
@@ -243,20 +249,35 @@ def _numeric_column_clusters(
 
 def _region_evidence(
     spans: list[TextSpan],
-) -> tuple[list[list[TextSpan]], list[list[TextSpan]], list[int], bool]:
+) -> tuple[
+    list[list[TextSpan]],
+    list[list[TextSpan]],
+    list[int],
+    bool,
+    bool,
+    int,
+]:
     row_lines: list[list[TextSpan]] = []
     cjk_centers: list[float] = []
     pinyin_centers: list[float] = []
     third_centers: list[float] = []
+    strong_pinyin_rows = 0
     for line in _line_groups(spans):
         numeric = [
             span for span in line
             if re.fullmatch(r"\d{1,3}", span.text.strip())
         ]
         cjk = [span for span in line if RE_CJK_WORD.search(span.text)]
-        pinyin = [span for span in line if _is_pinyin_text(span.text)]
+        pinyin_evidence = [
+            (span, _pinyin_evidence_strength(span.text))
+            for span in line
+            if _pinyin_evidence_strength(span.text) > 0
+        ]
+        pinyin = [span for span, _strength in pinyin_evidence]
         if cjk and pinyin:
             row_lines.append(line)
+            if any(strength >= 2 for _span, strength in pinyin_evidence):
+                strong_pinyin_rows += 1
             cjk_centers.append((cjk[0].bbox[0] + cjk[0].bbox[2]) / 2)
             pinyin_centers.append((pinyin[0].bbox[0] + pinyin[0].bbox[2]) / 2)
             other = [
@@ -288,8 +309,14 @@ def _region_evidence(
         and max(pinyin_centers) - min(pinyin_centers) <= 35
         and max(third_centers) - min(third_centers) <= 35
     )
-    return row_lines, order_lines, unique_orders, sequential or aligned
-
+    return (
+        row_lines,
+        order_lines,
+        unique_orders,
+        sequential,
+        aligned,
+        strong_pinyin_rows,
+    )
 
 def _signal_line(line: list[TextSpan]) -> bool:
     if _line_has_vocab_heading(line):
@@ -389,13 +416,24 @@ class VocabExtractor:
         for page_index in range(start, end + 1):
             spans = list(pdf.spans(page_index))
             for region in _split_page_regions(spans):
-                row_lines, order_lines, orders, has_structure = _region_evidence(
-                    region
+                (
+                    row_lines,
+                    order_lines,
+                    orders,
+                    sequential_orders,
+                    aligned_columns,
+                    strong_pinyin_rows,
+                ) = _region_evidence(region)
+                has_heading = _has_vocab_heading(region)
+                has_rows = len(row_lines) >= 2 and (
+                    strong_pinyin_rows >= 1
+                    or has_heading
+                    or sequential_orders
                 )
                 signals = (
-                    _has_vocab_heading(region),
-                    len(row_lines) >= 2,
-                    has_structure,
+                    has_heading,
+                    has_rows,
+                    sequential_orders or aligned_columns,
                 )
                 if sum(signals) < 2:
                     continue

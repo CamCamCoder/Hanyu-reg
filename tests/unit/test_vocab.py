@@ -326,3 +326,50 @@ def test_locator_preserves_tone_marked_and_distinctive_plain_pinyin():
 
     assert len(blocks) == 1
     assert blocks[0].expected_rows == 2
+
+def test_locator_accepts_u_colon_numbered_pinyin_in_continuation_block():
+    page = _vocab_region("New Words", (1, 2), 40) + [
+        _span("3", 20, 420, 20),
+        _span("女", 80, 420, 45),
+        _span("nu:3", 160, 420, 55),
+        _span("4", 20, 450, 20),
+        _span("绿", 80, 450, 45),
+        _span("lu:4", 160, 450, 55),
+        _span("5", 20, 480, 20),
+        _span("女绿", 80, 480, 45),
+        _span("nu:3 lu:4", 160, 480, 90),
+        _span("6", 20, 510, 20),
+        _span("绿女", 80, 510, 45),
+        _span("lu:4nu:3", 160, 510, 90),
+    ]
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(15, "Bài 15", 0, 0, 1.0, "lesson")
+    )
+
+    assert [
+        (block.expected_rows, block.first_order, block.last_order)
+        for block in blocks
+    ] == [(2, 1, 2), (4, 3, 6)]
+
+
+def test_locator_rejects_china_change_three_column_bilingual_prose():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("中国", 20, 100, 45),
+        _span("China", 100, 100, 70),
+        _span("Trung Quốc", 220, 100, 90),
+        _span("改变", 20, 140, 45),
+        _span("change", 100, 140, 70),
+        _span("thay đổi", 220, 140, 90),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(16, "Bài 16", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []

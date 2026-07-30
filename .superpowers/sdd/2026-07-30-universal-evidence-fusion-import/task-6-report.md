@@ -205,3 +205,60 @@ Result: `281 passed, 1 skipped in 5.50s`.
 - Plain unspaced Latin must contain at least one pinyin-distinctive initial/final; this keeps `nihao`, `zhongguo`, and `ci`-style orthography while rejecting the English ambiguity `women`.
 - Plain whitespace-separated input counts as a boundary signal only when every token is exactly one valid pinyin syllable, preventing a phrase such as `women men` from gaining confidence merely from spaces.
 - No textbook-specific or English-word exception list was added.
+
+## Fix round 3/5 — `u:` pinyin and independent block signals
+
+### RED
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "u_colon or china_change" -v --basetemp .pytest-tmp-task6-fix3-red
+```
+
+Result: `2 failed, 16 deselected`.
+
+- Numbered `u:` forms (`nu:3`, `lu:4`, spaced and compact) were rejected before
+  segmentation because `:` was outside the accepted pinyin alphabet.
+- `China` and `change` could both be segmented as plausible plain pinyin, so two
+  CJK/Latin/Vietnamese prose rows manufactured both row and alignment signals.
+
+### GREEN
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "u_colon or china_change" -v --basetemp .pytest-tmp-task6-fix3-green
+```
+
+Result: `2 passed, 16 deselected`.
+
+### Required regression
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py tests/unit/test_universal_engine.py -v --basetemp .pytest-tmp-task6-fix3-regression
+```
+
+Result: `45 passed in 0.63s`.
+
+### Full unit regression
+
+Command:
+
+```powershell
+pytest tests/unit -q --basetemp .pytest-tmp-task6-fix3-all-unit
+```
+Result: `283 passed, 1 skipped in 4.06s`.
+
+### Fix decisions
+
+- `u:` is accepted and normalized through the existing `u:` → `v` path before
+  syllable segmentation, matching the project's pinyin service convention.
+- Digit, tone mark, `u:`, and explicit valid syllable boundaries are strong
+  pinyin evidence; distinctive unmarked plain pinyin is ambiguous evidence.
+- Ambiguous Latin text alone no longer creates the row signal. It needs an
+  independent vocabulary heading or sequential order column.
+- Strong pinyin plus a genuine aligned third column still preserves legitimate
+  no-heading/no-STT vocabulary tables.
