@@ -10,7 +10,13 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 import hanzi_app.service.importer as importer_module
 import hanzi_app.ui.screen_books as screen_books_module
-from hanzi_app.data.models import LessonBoundary, VocabRow
+from hanzi_app.data.models import (
+    BoundaryEvidence,
+    BoundaryReport,
+    LessonBoundary,
+    SplitResult,
+    VocabRow,
+)
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.ui.dialog_import import DialogReviewBoundaries
 from hanzi_app.ui.screen_books import DialogReviewBook
@@ -583,4 +589,89 @@ def test_boundary_dialog_luu_truoc_khi_ocr(tmp_path):
         dialog.deleteLater()
         app.processEvents()
     finally:
+        db.close()
+
+
+def test_boundary_dialog_can_add_sort_and_blocks_missing_lesson(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-crud", 40)
+    db.replace_lessons(book_id, [
+        LessonBoundary(1, "Một", 0, 9, 0.7, "lesson"),
+        LessonBoundary(3, "Ba", 20, 29, 0.7, "lesson"),
+    ])
+    dialog = DialogReviewBoundaries(db, book_id, 40)
+    try:
+        assert dialog.btn_confirm.isEnabled() is False
+
+        dialog._add_row()
+        row = dialog.table.rowCount() - 1
+        for column, text in ((0, "2"), (1, "Hai"), (2, "11"), (3, "20")):
+            dialog.table.item(row, column).setText(text)
+        dialog._sort_rows()
+
+        assert [int(dialog.table.item(row, 0).text())
+                for row in range(dialog.table.rowCount())] == [1, 2, 3]
+        assert dialog.btn_confirm.isEnabled() is True
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_boundary_dialog_shows_evidence_source(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-source", 40)
+    boundary = LessonBoundary(1, "Một", 5, 39, 0.9, "lesson")
+    db.replace_lessons(book_id, [boundary])
+    source = BoundaryEvidence("toc", 5, 1, "Một", 0.8, "mục lục")
+    result = SplitResult(
+        (boundary,), (source,), BoundaryReport(True, (), ()), False
+    )
+    dialog = DialogReviewBoundaries(db, book_id, 40, result)
+    try:
+        assert "mục lục" in dialog.table.item(0, 5).text().lower()
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_boundary_dialog_blocks_reversed_page_range(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-range", 40)
+    db.replace_lessons(book_id, [
+        LessonBoundary(1, "Một", 0, 9, 0.7, "lesson"),
+    ])
+    dialog = DialogReviewBoundaries(db, book_id, 40)
+    try:
+        dialog.table.item(0, 2).setText("10")
+        dialog.table.item(0, 3).setText("5")
+
+        assert dialog.btn_confirm.isEnabled() is False
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_boundary_dialog_blocks_deleting_every_lesson(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-delete", 40)
+    db.replace_lessons(book_id, [
+        LessonBoundary(1, "Một", 0, 39, 0.7, "lesson"),
+    ])
+    dialog = DialogReviewBoundaries(db, book_id, 40)
+    try:
+        dialog.table.setCurrentCell(0, 0)
+        dialog._delete_row()
+
+        assert dialog.table.rowCount() == 0
+        assert dialog.btn_confirm.isEnabled() is False
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
         db.close()

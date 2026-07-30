@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -23,21 +24,42 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from hanzi_app.data.models import LessonBoundary
+from hanzi_app.data.models import LessonBoundary, SplitResult
 from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
+from hanzi_app.service.splitter import Splitter
 from hanzi_app.ui.theme import PALETTE, ui_font
 
 
 class DialogReviewBoundaries(QDialog):
     """Cho sửa và xác nhận ranh giới toàn bộ bài trước khi chạy OCR."""
 
-    _HEADERS = ("Bài", "Tiêu đề", "Trang đầu", "Trang cuối", "Độ tin cậy")
+    _HEADERS = (
+        "Bài", "Tiêu đề", "Trang đầu", "Trang cuối", "Độ tin cậy", "Nguồn",
+    )
+    ISSUE_TEXT = {
+        "duplicate_lesson": "Trùng số bài",
+        "missing_lesson": "Thiếu bài",
+        "start_not_increasing": "Trang đầu chưa tăng",
+        "overlap": "Khoảng trang chồng nhau",
+        "page_out_of_range": "Trang nằm ngoài PDF",
+        "toc_heading_conflict": "Mục lục và trang mở bài mâu thuẫn",
+    }
+    _ERROR_COLOR = QColor("#ffe1e1")
 
-    def __init__(self, user_db, book_id: int, page_count: int, parent=None) -> None:
+    def __init__(
+        self,
+        user_db,
+        book_id: int,
+        page_count: int,
+        split_result: SplitResult | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.user_db = user_db
         self.book_id = book_id
         self.page_count = page_count
+        self.evidence = tuple(split_result.evidence) if split_result else ()
+        self._updating_table = False
         self.setWindowTitle("Xác nhận ranh giới bài trước khi OCR")
         self.resize(820, 560)
 
@@ -53,6 +75,11 @@ class DialogReviewBoundaries(QDialog):
         )
         root.addWidget(note)
 
+        self.lbl_errors = QLabel()
+        self.lbl_errors.setWordWrap(True)
+        self.lbl_errors.setStyleSheet(f"color: {PALETTE['warn_ink']};")
+        root.addWidget(self.lbl_errors)
+
         lessons = user_db.get_lessons(book_id)
         self.table = QTableWidget(len(lessons), len(self._HEADERS))
         self.table.setHorizontalHeaderLabels(self._HEADERS)
@@ -67,26 +94,168 @@ class DialogReviewBoundaries(QDialog):
                 lesson["page_start"] + 1,
                 lesson["page_end"] + 1,
                 f"{float(lesson.get('confidence', 0.0)):.0%}",
+                self._evidence_text(lesson["index_no"]),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if column in (0, 4):
+                if column in (4, 5):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table.setItem(row, column, item)
+        self.table.itemChanged.connect(self._validate_rows)
         root.addWidget(self.table, 1)
+
+        edit_actions = QHBoxLayout()
+        self.btn_add = QPushButton("Thêm bài")
+        self.btn_add.clicked.connect(self._add_row)
+        edit_actions.addWidget(self.btn_add)
+        self.btn_duplicate = QPushButton("Nhân bản")
+        self.btn_duplicate.clicked.connect(self._duplicate_row)
+        edit_actions.addWidget(self.btn_duplicate)
+        self.btn_delete = QPushButton("Xóa")
+        self.btn_delete.clicked.connect(self._delete_row)
+        edit_actions.addWidget(self.btn_delete)
+        self.btn_sort = QPushButton("Sắp xếp")
+        self.btn_sort.clicked.connect(self._sort_rows)
+        edit_actions.addWidget(self.btn_sort)
+        edit_actions.addStretch(1)
+        root.addLayout(edit_actions)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
         cancel = QPushButton("Để sau")
         cancel.clicked.connect(self.reject)
         actions.addWidget(cancel)
-        confirm = QPushButton("Xác nhận và bắt đầu OCR")
-        confirm.setStyleSheet(
+        self.btn_confirm = QPushButton("Xác nhận và bắt đầu OCR")
+        self.btn_confirm.setStyleSheet(
             f"background: {PALETTE['accent']}; color: white; padding: 7px 14px;"
         )
-        confirm.clicked.connect(self._confirm)
-        actions.addWidget(confirm)
+        self.btn_confirm.clicked.connect(self._confirm)
+        actions.addWidget(self.btn_confirm)
         root.addLayout(actions)
+        self._validate_rows()
+
+    def _evidence_text(self, lesson_no: int) -> str:
+        entries = [
+            f"{item.source}: {item.detail}"
+            for item in self.evidence
+            if item.lesson_no == lesson_no
+        ]
+        return " · ".join(entries)
+
+    def _set_row_values(self, row: int, values: tuple[object, ...]) -> None:
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            if column in (4, 5):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, column, item)
+
+    def _add_row(self) -> None:
+        self._updating_table = True
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._set_row_values(row, ("", "", "", "", "0%", ""))
+        self._updating_table = False
+        self._validate_rows()
+
+    def _duplicate_row(self) -> None:
+        source_row = self.table.currentRow()
+        if source_row < 0:
+            source_row = self.table.rowCount() - 1
+        if source_row < 0:
+            self._add_row()
+            return
+        values = tuple(
+            self.table.item(source_row, column).text()
+            for column in range(len(self._HEADERS))
+        )
+        self._updating_table = True
+        row = source_row + 1
+        self.table.insertRow(row)
+        self._set_row_values(row, values)
+        self._updating_table = False
+        self.table.setCurrentCell(row, 0)
+        self._validate_rows()
+
+    def _delete_row(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+        self._validate_rows()
+
+    def _sort_rows(self) -> None:
+        rows = [
+            tuple(self.table.item(row, column).text() for column in range(len(self._HEADERS)))
+            for row in range(self.table.rowCount())
+        ]
+
+        def sort_key(values: tuple[str, ...]) -> tuple[int, int]:
+            try:
+                lesson_no = int(values[0])
+            except ValueError:
+                lesson_no = 10**9
+            try:
+                page_start = int(values[2])
+            except ValueError:
+                page_start = 10**9
+            return lesson_no, page_start
+
+        self._updating_table = True
+        rows.sort(key=sort_key)
+        self.table.setRowCount(0)
+        for values in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self._set_row_values(row, values)
+        self._updating_table = False
+        self._validate_rows()
+
+    def _clear_error_colors(self) -> None:
+        for row in range(self.table.rowCount()):
+            for column in range(4):
+                self.table.item(row, column).setBackground(QColor("transparent"))
+
+    def _color_issue(self, lesson_no: int | None, code: str) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if lesson_no is None or item.text() == str(lesson_no):
+                columns = (5,) if code == "toc_heading_conflict" else (0, 2, 3)
+                for column in columns:
+                    self.table.item(row, column).setBackground(self._ERROR_COLOR)
+
+    def _validate_rows(self) -> None:
+        if self._updating_table:
+            return
+        self._updating_table = True
+        try:
+            self._clear_error_colors()
+            try:
+                bounds = self.boundaries()
+            except (AttributeError, TypeError, ValueError):
+                self.lbl_errors.setText("Dữ liệu bài và trang phải là số hợp lệ.")
+                self.btn_confirm.setEnabled(False)
+                return
+
+            report = Splitter().validate(bounds, self.evidence, self.page_count)
+            self._last_report = report
+            local_messages = []
+            if not bounds:
+                local_messages.append("Cần ít nhất một bài trước khi OCR.")
+            for boundary in bounds:
+                if boundary.page_start > boundary.page_end:
+                    self._color_issue(boundary.index_no, "page_out_of_range")
+                    local_messages.append("Trang đầu không được sau Trang cuối.")
+            for issue in report.issues:
+                self._color_issue(issue.lesson_no, issue.code)
+            messages = [
+                self.ISSUE_TEXT.get(issue.code, issue.message)
+                for issue in report.issues
+            ]
+            self.lbl_errors.setText(
+                " · ".join(dict.fromkeys((*local_messages, *messages)))
+            )
+            self.btn_confirm.setEnabled(report.valid and not local_messages)
+        finally:
+            self._updating_table = False
 
     def boundaries(self) -> list[LessonBoundary]:
         result = []
@@ -109,30 +278,10 @@ class DialogReviewBoundaries(QDialog):
         return result
 
     def _confirm(self) -> None:
-        try:
-            bounds = self.boundaries()
-        except (AttributeError, TypeError, ValueError):
-            QMessageBox.warning(self, "Dữ liệu chưa hợp lệ", "Trang đầu/cuối phải là số.")
+        self._validate_rows()
+        if not self.btn_confirm.isEnabled():
             return
-        for boundary in bounds:
-            if not (
-                0 <= boundary.page_start <= boundary.page_end < self.page_count
-            ):
-                QMessageBox.warning(
-                    self,
-                    "Khoảng trang chưa hợp lệ",
-                    f"Bài {boundary.index_no} phải nằm trong trang 1–{self.page_count}.",
-                )
-                return
-        ordered = sorted(bounds, key=lambda item: item.page_start)
-        for previous, current in zip(ordered, ordered[1:]):
-            if current.page_start <= previous.page_end:
-                QMessageBox.warning(
-                    self,
-                    "Các bài đang chồng trang",
-                    f"Bài {previous.index_no} và Bài {current.index_no} đang chồng nhau.",
-                )
-                return
+        bounds = self.boundaries()
         self.user_db.replace_lessons(self.book_id, bounds)
         self.accept()
 
@@ -234,13 +383,15 @@ class DialogImport(QDialog):
         self.worker.failed_import.connect(self._on_failed)
         self.worker.start()
 
-    def _on_boundaries_ready(self, book_id: int, title: str) -> None:
+    def _on_boundaries_ready(
+        self, book_id: int, title: str, split_result: SplitResult
+    ) -> None:
         book = self.user_db.get_book(book_id)
         if book is None:
             self._on_failed("Không đọc lại được thông tin sách")
             return
         review = DialogReviewBoundaries(
-            self.user_db, book_id, int(book["page_count"]), self
+            self.user_db, book_id, int(book["page_count"]), split_result, self
         )
         if review.exec() != QDialog.DialogCode.Accepted:
             self.imported_book_id = book_id
