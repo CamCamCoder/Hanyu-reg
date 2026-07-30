@@ -3,10 +3,18 @@
 from unittest.mock import MagicMock
 import pytest
 
-from hanzi_app.data.models import LessonBoundary, PageSummary, VocabRow
+from hanzi_app.data.models import (
+    BoundaryIssue,
+    BoundaryReport,
+    LessonBoundary,
+    PageEvidence,
+    PageSummary,
+    SplitResult,
+    VocabRow,
+)
 from hanzi_app.data.userdb import UserDb
 import hanzi_app.service.importer as importer_module
-from hanzi_app.service.importer import VocabImporterWorker
+from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
 from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
 
@@ -20,6 +28,82 @@ def test_parse_cn_num_composite():
     assert _parse_cn_num("十二") == 12
     assert _parse_cn_num("二十") == 20
     assert _parse_cn_num("二十一") == 21
+
+
+def test_splitter_calls_ai_only_for_invalid_local_result():
+    """A single-source local split is repaired with one bounded Vision request."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.return_value = [
+        {"index_no": 1, "title": "One", "page_start": 0},
+        {"index_no": 2, "title": "Two", "page_start": 5},
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert client.split_lessons_from_image.call_count == 1
+
+
+def test_splitter_skips_ai_for_valid_two_source_local_result():
+    """Validated TOC plus heading evidence must not consume an AI request."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    evidence = [
+        PageEvidence(0, "scan", "Contents", "i", "1 One 001\n2 Two 005", None, None, None, True),
+        PageEvidence(5, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False),
+        PageEvidence(9, "scan", "Lesson 2 Two", "5", None, 5, 2, "Lesson 2 Two", False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert client.split_lessons_from_image.call_count == 0
+
+
+def test_splitter_keeps_local_boundaries_that_ai_omits():
+    """A partial AI reply cannot erase a locally detected later lesson."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.return_value = [
+        {"index_no": 1, "title": "One", "page_start": 0},
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(5, "scan", "Lesson 2", "5", None, 5, 2, "Lesson 2", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert [boundary.index_no for boundary in result.boundaries] == [1, 2]
+
+
+def test_book_worker_does_not_persist_invalid_boundaries(tmp_path):
+    """An invalid boundary report must abort before the destructive replace."""
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Test book", "book.pdf", "split-invalid", 40)
+    issue = BoundaryIssue("missing_lesson", "error", 2, None, "Lesson 2 missing")
+    fake_result = SplitResult(
+        (), (), BoundaryReport(False, (issue,), (2,)), True
+    )
+    worker = BookImporterWorker("book.pdf", db.path)
+
+    with pytest.raises(RuntimeError, match="Lesson 2 missing"):
+        worker._store_boundaries_or_raise(db, book_id, fake_result)
+    assert db.get_lessons(book_id) == []
+    db.close()
 
 
 def test_splitter_top_20_percent_header():

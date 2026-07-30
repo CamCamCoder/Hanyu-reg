@@ -213,7 +213,6 @@ class Splitter:
         evidence_image: bytes | None = None,
     ) -> SplitResult:
         """Fuse local TOC, heading and layout evidence into lesson boundaries."""
-        del ai_client, evidence_image
         page_evidence = list(evidence)
         boundary_evidence: list[BoundaryEvidence] = []
         offset = self._page_offset(page_evidence)
@@ -306,8 +305,152 @@ class Splitter:
             boundaries = self.split_by_regex(summaries) or self.split_by_heuristics(summaries)
 
         report = self.validate(boundaries, boundary_evidence, total_pages)
-        return SplitResult(
+        local = SplitResult(
             tuple(boundaries), tuple(boundary_evidence), report, not report.valid
+        )
+        if local.report.valid and self._has_two_source_support(local):
+            return local
+        if not evidence_image or not ai_client or not ai_client.is_configured():
+            return local
+
+        raw = ai_client.split_lessons_from_image(
+            evidence_image, self._format_evidence(page_evidence)
+        )
+        merged = self._merge_ai_candidates(local, raw, total_pages)
+        if merged.report.valid and merged.boundaries:
+            return merged
+
+        raw_retry = ai_client.split_lessons_from_image(
+            evidence_image,
+            self._format_evidence(page_evidence),
+            issue_context=self._format_issues(merged.report),
+        )
+        return self._merge_ai_candidates(merged, raw_retry, total_pages)
+
+    @staticmethod
+    def _format_evidence(evidence: list[PageEvidence]) -> str:
+        """Render local signals as compact prompt context for a bounded Vision repair."""
+        return "\n".join(
+            "page {page}: top={top!r}; bottom={bottom!r}; heading={heading!r}; "
+            "printed={printed!r}; toc={toc!r}".format(
+                page=item.pdf_page,
+                top=item.top_text,
+                bottom=item.bottom_text,
+                heading=item.heading_lesson_no,
+                printed=item.printed_page,
+                toc=item.toc_text,
+            )
+            for item in evidence
+        )
+
+    @staticmethod
+    def _format_issues(report: BoundaryReport) -> str:
+        return "; ".join(issue.message for issue in report.issues) or "No boundaries returned."
+
+    @staticmethod
+    def _has_two_source_support(result: SplitResult) -> bool:
+        """Only trust a local result automatically when every start has two sources."""
+        sources_by_lesson: dict[int, set[str]] = defaultdict(set)
+        starts = {boundary.index_no: boundary.page_start for boundary in result.boundaries}
+        for item in result.evidence:
+            if (
+                item.lesson_no in starts
+                and item.page_index == starts[item.lesson_no]
+            ):
+                sources_by_lesson[item.lesson_no].add(item.source)
+        return bool(starts) and all(
+            len(sources_by_lesson[lesson_no]) >= 2 for lesson_no in starts
+        )
+
+    def _merge_ai_candidates(
+        self,
+        previous: SplitResult,
+        raw: list[dict],
+        total_pages: int,
+    ) -> SplitResult:
+        """Normalize Vision JSON and validate it before it can replace local bounds."""
+        previous_titles = {
+            boundary.index_no: boundary.title for boundary in previous.boundaries
+        }
+        candidates: list[tuple[int, int, str | None, str]] = []
+        conversion_issues: list[BoundaryIssue] = []
+        if not isinstance(raw, list) or not raw:
+            conversion_issues.append(
+                BoundaryIssue(
+                    "empty_ai_result", "error", None, None,
+                    "Vision returned no lesson boundaries.",
+                )
+            )
+        else:
+            for item in raw:
+                try:
+                    if not isinstance(item, dict):
+                        raise TypeError
+                    lesson_no = int(item["index_no"])
+                    page_start = int(item["page_start"])
+                    title_value = item.get("title")
+                    title = (
+                        str(title_value).strip()
+                        if title_value is not None and str(title_value).strip()
+                        else previous_titles.get(lesson_no)
+                    )
+                    if lesson_no <= 0:
+                        raise ValueError
+                    candidates.append((lesson_no, page_start, title, "ai"))
+                except (KeyError, TypeError, ValueError):
+                    conversion_issues.append(
+                        BoundaryIssue(
+                            "invalid_ai_candidate", "error", None, None,
+                            "Vision returned an invalid lesson boundary.",
+                        )
+                    )
+
+        ai_lesson_nos = {lesson_no for lesson_no, _page, _title, source in candidates if source == "ai"}
+        for boundary in previous.boundaries:
+            if boundary.index_no not in ai_lesson_nos:
+                candidates.append(
+                    (
+                        boundary.index_no,
+                        boundary.page_start,
+                        boundary.title,
+                        "local",
+                    )
+                )
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        boundaries = [
+            LessonBoundary(
+                lesson_no,
+                title,
+                page_start,
+                candidates[position + 1][1] - 1
+                if position + 1 < len(candidates)
+                else total_pages - 1,
+                0.85,
+                "lesson",
+            )
+            for position, (lesson_no, page_start, title, _source) in enumerate(candidates)
+        ]
+        evidence = [
+            BoundaryEvidence(
+                source, boundary.page_start, boundary.index_no, boundary.title,
+                boundary.confidence,
+                "Vision contact sheet" if source == "ai" else "Local candidate",
+            )
+            for boundary, (_lesson_no, _page_start, _title, source) in zip(
+                boundaries, candidates
+            )
+        ]
+        report = self.validate(boundaries, evidence, total_pages)
+        issues = tuple((*report.issues, *conversion_issues))
+        validated_report = BoundaryReport(
+            valid=not issues,
+            issues=issues,
+            missing_lesson_nos=report.missing_lesson_nos,
+        )
+        return SplitResult(
+            tuple(boundaries), tuple(evidence), validated_report,
+            not validated_report.valid,
         )
 
     def split_by_boya1_preset(self, total_pages: int) -> list[LessonBoundary]:

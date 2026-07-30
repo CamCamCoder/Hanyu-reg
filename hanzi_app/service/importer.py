@@ -16,7 +16,7 @@ from PySide6.QtCore import QThread, Signal
 from hanzi_app.adapter.aiclient import AiClient
 from hanzi_app.adapter.pdfsource import PdfSource
 from hanzi_app.data.dictdb import DictDb
-from hanzi_app.data.models import LessonBoundary
+from hanzi_app.data.models import LessonBoundary, SplitResult
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.service.vocab import VocabExtractor
@@ -26,7 +26,7 @@ class BookImporterWorker(QThread):
     """Pha 1: nhận diện bài học, dừng lại để người dùng duyệt ranh giới."""
 
     progress = Signal(int, str)  # (phần trăm 0..100, thông điệp)
-    boundaries_ready = Signal(int, str)  # (book_id, book_title)
+    boundaries_ready = Signal(int, str, object)  # (book_id, book_title, SplitResult)
     failed_import = Signal(str)  # (lý do lỗi)
 
     def __init__(
@@ -74,24 +74,39 @@ class BookImporterWorker(QThread):
                     )
 
                 self.progress.emit(40, "Phân tích bản tóm lược các trang...")
-                summaries = pdf.summarize_pages()
+                evidence = pdf.page_census()
+                evidence_image = pdf.boundary_contact_sheet(evidence)
 
                 mode_str = "Lớp 2 (Cloud AI)" if self.ai_client.is_configured() else "Lớp 1 (Local Engine)"
                 self.progress.emit(60, f"Phân tách bài học [{mode_str}]...")
                 splitter = Splitter()
-                boundaries = splitter.split(summaries, ai_client=self.ai_client)
+                result = splitter.propose(
+                    [], evidence, ai_client=self.ai_client, evidence_image=evidence_image
+                )
 
                 # Nạp danh sách bài học vào DB
-                thread_db.replace_lessons(book_id, boundaries)
+                self._store_boundaries_or_raise(thread_db, book_id, result)
                 thread_db.set_import_state(book_id, "review_bounds")
                 self.progress.emit(65, "Đã tìm ranh giới bài — hãy kiểm tra trước khi OCR.")
-                self.boundaries_ready.emit(book_id, book_title)
+                self.boundaries_ready.emit(book_id, book_title, result)
 
         except Exception as err:
             self.failed_import.emit(str(err))
         finally:
             if thread_db:
                 thread_db.close()
+
+    @staticmethod
+    def _store_boundaries_or_raise(
+        db: UserDb, book_id: int, result: SplitResult
+    ) -> None:
+        """Persist a complete, validated split or leave the current lessons untouched."""
+        if not result.report.valid:
+            messages = "; ".join(issue.message for issue in result.report.issues)
+            raise RuntimeError(messages)
+        if not result.boundaries:
+            raise RuntimeError("No valid lesson boundaries found.")
+        db.replace_lessons(book_id, list(result.boundaries))
 
 
 class VocabImporterWorker(QThread):

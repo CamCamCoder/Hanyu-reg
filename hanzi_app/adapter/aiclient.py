@@ -71,6 +71,19 @@ Không kèm theo lời giải thích nào khác ngoài JSON.
 """
 
 
+PROMPT_SPLIT_LESSONS_IMAGE = """You identify lesson boundaries in a Chinese-language textbook.
+Read the supplied contact-sheet image and reconcile it with the local evidence below.
+Return only a JSON list. Every item must contain a positive integer `index_no`,
+an optional `title`, and a zero-based integer `page_start`. Do not invent pages.
+
+Local evidence:
+{evidence_text}
+
+Validator issues from the preceding attempt:
+{issue_context}
+"""
+
+
 class AiClient:
     """Client kết nối API LLM ép đầu ra dạng JSON."""
 
@@ -88,6 +101,23 @@ class AiClient:
         prompt = PROMPT_SPLIT_LESSONS.format(summaries_text=summaries_text)
         response_text = self._call_llm_text(prompt)
         return self._parse_json_list(response_text)
+
+    def split_lessons_from_image(
+        self,
+        image_bytes: bytes,
+        evidence_text: str,
+        issue_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ask Vision to resolve only lesson boundaries local evidence cannot prove."""
+        if not self.api_key or not image_bytes:
+            return []
+
+        prompt = PROMPT_SPLIT_LESSONS_IMAGE.format(
+            evidence_text=evidence_text,
+            issue_context=issue_context or "None.",
+        )
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return self._parse_json_list(self._call_llm_vision(prompt, image_b64))
 
     def extract_vocab(self, page_text: str) -> list[dict[str, Any]]:
         """Gửi văn bản trang cho LLM để bóc tách từ vựng."""
