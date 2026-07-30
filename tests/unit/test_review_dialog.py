@@ -769,3 +769,37 @@ def test_boundary_dialog_ignores_missing_source_cell_while_coloring_error(tmp_pa
         dialog.deleteLater()
         app.processEvents()
         db.close()
+
+
+def test_manual_override_keeps_other_lessons_evidence_on_same_page(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-shared-page", 40)
+    first = LessonBoundary(1, "Một", 5, 5, 0.9, "lesson")
+    second = LessonBoundary(2, "Hai", 6, 39, 0.9, "lesson")
+    result = SplitResult(
+        (first, second),
+        (
+            BoundaryEvidence("toc", 5, 1, "Một", 0.8, "một mục lục"),
+            BoundaryEvidence("heading", 8, 1, "Một", 0.8, "một mở bài"),
+            BoundaryEvidence("toc", 5, 2, "Hai", 0.8, "hai mục lục"),
+            BoundaryEvidence("heading", 6, 2, "Hai", 0.8, "hai mở bài"),
+        ),
+        BoundaryReport(False, (), ()),
+        True,
+    )
+    dialog = DialogReviewBoundaries(db, book_id, 40, result)
+    try:
+        dialog.table.setCurrentCell(0, 0)
+        dialog._use_manual_boundaries()
+
+        effective = dialog._effective_evidence(dialog.boundaries())
+        assert any(
+            item.lesson_no == 2 and item.page_index == 5
+            for item in effective
+        )
+        assert dialog.btn_confirm.isEnabled() is False
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()

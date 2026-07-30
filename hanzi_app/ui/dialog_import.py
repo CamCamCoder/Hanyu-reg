@@ -360,7 +360,6 @@ class DialogReviewBoundaries(QDialog):
                     item
                     for item in evidence
                     if item.lesson_no != boundary.index_no
-                    and item.page_index != boundary.page_start
                 ]
                 evidence.append(
                     BoundaryEvidence(
