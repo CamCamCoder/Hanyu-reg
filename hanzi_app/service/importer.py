@@ -45,6 +45,11 @@ class BookImporterWorker(QThread):
 
     def run(self) -> None:
         thread_db: UserDb | None = None
+        book_id: int | None = None
+        previous_state: str | None = None
+        created_book = False
+        boundaries_persisted = False
+        splitter: Splitter | None = None
         try:
             thread_db = UserDb(self.db_path)
 
@@ -64,6 +69,8 @@ class BookImporterWorker(QThread):
                 existing_id = thread_db.find_book_by_hash(file_hash)
                 if existing_id:
                     book_id = existing_id
+                    existing_book = thread_db.get_book(book_id)
+                    previous_state = existing_book["import_state"] if existing_book else None
                     thread_db.set_import_state(book_id, "importing")
                 else:
                     book_id = thread_db.add_book(
@@ -72,6 +79,7 @@ class BookImporterWorker(QThread):
                         file_hash=file_hash,
                         page_count=page_count,
                     )
+                    created_book = True
 
                 self.progress.emit(40, "Phân tích bản tóm lược các trang...")
                 evidence = pdf.page_census()
@@ -80,17 +88,33 @@ class BookImporterWorker(QThread):
                 mode_str = "Lớp 2 (Cloud AI)" if self.ai_client.is_configured() else "Lớp 1 (Local Engine)"
                 self.progress.emit(60, f"Phân tách bài học [{mode_str}]...")
                 splitter = Splitter()
-                result = splitter.propose(
-                    [], evidence, ai_client=self.ai_client, evidence_image=evidence_image
-                )
+                remaining_ai_calls = self._remaining_ai_calls(thread_db, book_id)
+                try:
+                    result = splitter.propose(
+                        [],
+                        evidence,
+                        ai_client=self.ai_client,
+                        evidence_image=evidence_image,
+                        remaining_ai_calls=remaining_ai_calls,
+                    )
+                finally:
+                    self._record_ai_calls(thread_db, book_id, splitter.ai_calls_used)
 
                 # Nạp danh sách bài học vào DB
                 self._store_boundaries_or_raise(thread_db, book_id, result)
+                boundaries_persisted = True
                 thread_db.set_import_state(book_id, "review_bounds")
                 self.progress.emit(65, "Đã tìm ranh giới bài — hãy kiểm tra trước khi OCR.")
                 self.boundaries_ready.emit(book_id, book_title, result)
 
         except Exception as err:
+            if thread_db is not None and book_id is not None:
+                if boundaries_persisted:
+                    thread_db.set_import_state(book_id, "review_bounds")
+                elif created_book:
+                    thread_db.delete_book(book_id)
+                elif previous_state is not None:
+                    thread_db.set_import_state(book_id, previous_state)
             self.failed_import.emit(str(err))
         finally:
             if thread_db:
@@ -107,6 +131,31 @@ class BookImporterWorker(QThread):
         if not result.boundaries:
             raise RuntimeError("No valid lesson boundaries found.")
         db.replace_lessons(book_id, list(result.boundaries))
+
+    @staticmethod
+    def _ai_budget_key(book_id: int) -> str:
+        return f"import.split_ai_calls.{book_id}"
+
+    @classmethod
+    def _remaining_ai_calls(cls, db: UserDb, book_id: int) -> int:
+        raw_calls = db.get_setting(cls._ai_budget_key(book_id))
+        try:
+            calls_used = int(raw_calls) if raw_calls is not None else 0
+        except ValueError:
+            calls_used = 0
+        return max(0, 2 - calls_used)
+
+    @classmethod
+    def _record_ai_calls(cls, db: UserDb, book_id: int, calls_used: int) -> None:
+        if calls_used <= 0:
+            return
+        key = cls._ai_budget_key(book_id)
+        raw_calls = db.get_setting(key)
+        try:
+            previous_calls = int(raw_calls) if raw_calls is not None else 0
+        except ValueError:
+            previous_calls = 0
+        db.set_setting(key, str(min(2, previous_calls + calls_used)))
 
 
 class VocabImporterWorker(QThread):

@@ -1,10 +1,12 @@
 """Unit test kiểm thử Bộ Xử Lý Tổng Quát 2 Lớp (Universal 2-Layer Engine)."""
 
+import hashlib
 from unittest.mock import MagicMock
 import pytest
 
 from hanzi_app.data.models import (
     BoundaryIssue,
+    BoundaryEvidence,
     BoundaryReport,
     LessonBoundary,
     PageEvidence,
@@ -104,6 +106,267 @@ def test_book_worker_does_not_persist_invalid_boundaries(tmp_path):
         worker._store_boundaries_or_raise(db, book_id, fake_result)
     assert db.get_lessons(book_id) == []
     db.close()
+
+
+def test_ai_merge_preserves_prior_evidence_for_review():
+    """Vision evidence augments the detailed local audit trail instead of replacing it."""
+    original = (
+        BoundaryEvidence("toc", 0, 1, "One", 0.75, "printed page 1"),
+        BoundaryEvidence("heading", 0, 1, "One", 0.8, "Lesson 1 One"),
+        BoundaryEvidence("layout", 0, 1, "One", 0.7, "opening-grid"),
+    )
+    previous = SplitResult(
+        (LessonBoundary(1, "One", 0, 9, 0.8, "lesson"),),
+        original,
+        BoundaryReport(True, (), ()),
+        False,
+    )
+
+    result = Splitter()._merge_ai_candidates(
+        previous, [{"index_no": 1, "title": "One", "page_start": 0}], 10
+    )
+
+    assert result.evidence[:3] == original
+    assert result.evidence[-1].source == "ai"
+
+
+def test_splitter_retry_receives_validator_issues():
+    """The retry prompt must name the actual validator failure from the first reply."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.side_effect = [
+        [],
+        [{"index_no": 1, "title": "One", "page_start": 0}],
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    Splitter().propose([], evidence, ai_client=client, evidence_image=b"sheet")
+
+    assert client.split_lessons_from_image.call_args_list[1].kwargs["issue_context"] == (
+        "Vision returned no lesson boundaries."
+    )
+
+
+def test_worker_persists_ai_budget_across_two_failed_runs(tmp_path, monkeypatch):
+    """Two failed runs of one existing book can spend only its lifetime budget of two."""
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"same-book")
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book(
+        "Book", str(pdf_path), hashlib.md5(b"same-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class EmptyAi:
+        calls = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            type(self).calls += 1
+            return []
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", EmptyAi)
+
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+
+    checked = UserDb(str(tmp_path / "user.sqlite"))
+    assert EmptyAi.calls == 2
+    assert checked.get_setting(f"import.split_ai_calls.{book_id}") == "2"
+    checked.close()
+
+
+def test_worker_counts_an_ai_call_that_raises(tmp_path, monkeypatch):
+    """A request that raises still consumes one of the book's two AI calls."""
+    pdf_path = tmp_path / "raises.pdf"
+    pdf_path.write_bytes(b"raising-book")
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book(
+        "Book", str(pdf_path), hashlib.md5(b"raising-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class RaisingAi:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            raise RuntimeError("AI failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", RaisingAi)
+    BookImporterWorker(pdf_path, db_path).run()
+
+    checked = UserDb(db_path)
+    assert checked.get_setting(f"import.split_ai_calls.{book_id}") == "1"
+    assert checked.get_book(book_id)["import_state"] == "review_bounds"
+    checked.close()
+
+
+def test_worker_restores_existing_book_state_when_census_fails(tmp_path, monkeypatch):
+    """A failed retry restores its previous state instead of leaving an importing book."""
+    pdf_path = tmp_path / "existing.pdf"
+    pdf_path.write_bytes(b"existing-book")
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book(
+        "Existing", str(pdf_path), hashlib.md5(b"existing-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FailingPdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            raise RuntimeError("census failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FailingPdfSource)
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+
+    checked = UserDb(str(tmp_path / "user.sqlite"))
+    assert checked.get_book(book_id)["import_state"] == "review_bounds"
+    checked.close()
+
+
+def test_worker_deletes_new_book_when_census_fails(tmp_path, monkeypatch):
+    """A book created during a failed split is removed rather than stranded importing."""
+    pdf_path = tmp_path / "new.pdf"
+    pdf_path.write_bytes(b"new-book")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FailingPdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            raise RuntimeError("census failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FailingPdfSource)
+    BookImporterWorker(pdf_path, db_path).run()
+
+    checked = UserDb(db_path)
+    assert checked.get_books() == []
+    checked.close()
+
+
+def test_worker_emits_the_split_result(tmp_path, monkeypatch):
+    """The phase-one signal exposes the reviewed result, including its evidence."""
+    pdf_path = tmp_path / "signal.pdf"
+    pdf_path.write_bytes(b"signal-book")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b""
+
+    received = []
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    worker = BookImporterWorker(pdf_path, db_path)
+    worker.boundaries_ready.connect(
+        lambda book_id, title, result: received.append((book_id, title, result))
+    )
+    worker.run()
+
+    assert len(received) == 1
+    assert isinstance(received[0][2], SplitResult)
+    assert received[0][2].evidence[0].source == "heading"
 
 
 def test_splitter_top_20_percent_header():

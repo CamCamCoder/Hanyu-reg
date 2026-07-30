@@ -68,6 +68,9 @@ def _parse_cn_num(num_str: str) -> int:
 class Splitter:
     """Điều phối phân tách bài học trong sách."""
 
+    def __init__(self) -> None:
+        self.ai_calls_used = 0
+
     @staticmethod
     def accepts(summaries: list[PageSummary]) -> tuple[bool, str]:
         """Kiểm tra điều kiện chấp nhận sách."""
@@ -211,8 +214,10 @@ class Splitter:
         evidence: list[PageEvidence] | tuple[PageEvidence, ...],
         ai_client: AiClient | None = None,
         evidence_image: bytes | None = None,
+        remaining_ai_calls: int = 2,
     ) -> SplitResult:
         """Fuse local TOC, heading and layout evidence into lesson boundaries."""
+        self.ai_calls_used = 0
         page_evidence = list(evidence)
         boundary_evidence: list[BoundaryEvidence] = []
         offset = self._page_offset(page_evidence)
@@ -310,16 +315,26 @@ class Splitter:
         )
         if local.report.valid and self._has_two_source_support(local):
             return local
-        if not evidence_image or not ai_client or not ai_client.is_configured():
+        if (
+            remaining_ai_calls <= 0
+            or not evidence_image
+            or not ai_client
+            or not ai_client.is_configured()
+        ):
             return local
 
+        self.ai_calls_used += 1
         raw = ai_client.split_lessons_from_image(
             evidence_image, self._format_evidence(page_evidence)
         )
         merged = self._merge_ai_candidates(local, raw, total_pages)
-        if merged.report.valid and merged.boundaries:
+        if (
+            (merged.report.valid and merged.boundaries)
+            or remaining_ai_calls <= self.ai_calls_used
+        ):
             return merged
 
+        self.ai_calls_used += 1
         raw_retry = ai_client.split_lessons_from_image(
             evidence_image,
             self._format_evidence(page_evidence),
@@ -431,7 +446,7 @@ class Splitter:
             )
             for position, (lesson_no, page_start, title, _source) in enumerate(candidates)
         ]
-        evidence = [
+        ai_evidence = [
             BoundaryEvidence(
                 source, boundary.page_start, boundary.index_no, boundary.title,
                 boundary.confidence,
@@ -440,7 +455,9 @@ class Splitter:
             for boundary, (_lesson_no, _page_start, _title, source) in zip(
                 boundaries, candidates
             )
+            if source == "ai"
         ]
+        evidence = tuple((*previous.evidence, *ai_evidence))
         report = self.validate(boundaries, evidence, total_pages)
         issues = tuple((*report.issues, *conversion_issues))
         validated_report = BoundaryReport(
