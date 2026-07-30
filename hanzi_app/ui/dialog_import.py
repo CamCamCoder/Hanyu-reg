@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from hanzi_app.data.models import LessonBoundary, SplitResult
+from hanzi_app.data.models import BoundaryEvidence, LessonBoundary, SplitResult
 from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.ui.theme import PALETTE, ui_font
@@ -81,26 +81,38 @@ class DialogReviewBoundaries(QDialog):
         root.addWidget(self.lbl_errors)
 
         lessons = user_db.get_lessons(book_id)
-        self.table = QTableWidget(len(lessons), len(self._HEADERS))
+        initial_bounds = (
+            split_result.boundaries if not lessons and split_result is not None else ()
+        )
+        row_count = len(lessons) if lessons else len(initial_bounds)
+        self.table = QTableWidget(row_count, len(self._HEADERS))
         self.table.setHorizontalHeaderLabels(self._HEADERS)
         self.table.setAlternatingRowColors(True)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for row, lesson in enumerate(lessons):
-            values = (
-                lesson["index_no"],
-                lesson.get("title") or "",
-                lesson["page_start"] + 1,
-                lesson["page_end"] + 1,
-                f"{float(lesson.get('confidence', 0.0)):.0%}",
-                self._evidence_text(lesson["index_no"]),
+            self._set_row_values(
+                row,
+                (
+                    lesson["index_no"],
+                    lesson.get("title") or "",
+                    lesson["page_start"] + 1,
+                    lesson["page_end"] + 1,
+                    f"{float(lesson.get('confidence', 0.0)):.0%}",
+                ),
             )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                if column in (4, 5):
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(row, column, item)
+        for row, boundary in enumerate(initial_bounds):
+            self._set_row_values(
+                row,
+                (
+                    boundary.index_no,
+                    boundary.title or "",
+                    boundary.page_start + 1,
+                    boundary.page_end + 1,
+                    f"{boundary.confidence:.0%}",
+                ),
+            )
         self.table.itemChanged.connect(self._validate_rows)
         root.addWidget(self.table, 1)
 
@@ -114,6 +126,9 @@ class DialogReviewBoundaries(QDialog):
         self.btn_delete = QPushButton("Xóa")
         self.btn_delete.clicked.connect(self._delete_row)
         edit_actions.addWidget(self.btn_delete)
+        self.btn_manual = QPushButton("Dùng ranh giới đang nhập")
+        self.btn_manual.clicked.connect(self._use_manual_boundaries)
+        edit_actions.addWidget(self.btn_manual)
         self.btn_sort = QPushButton("Sắp xếp")
         self.btn_sort.clicked.connect(self._sort_rows)
         edit_actions.addWidget(self.btn_sort)
@@ -142,18 +157,51 @@ class DialogReviewBoundaries(QDialog):
         ]
         return " · ".join(entries)
 
-    def _set_row_values(self, row: int, values: tuple[object, ...]) -> None:
+    def _set_row_values(
+        self, row: int, values: tuple[object, ...], manual: bool = False
+    ) -> None:
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
-            if column in (4, 5):
+            if column == 4:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, column, item)
+        source = QTableWidgetItem()
+        source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        source.setData(Qt.ItemDataRole.UserRole, manual)
+        self.table.setItem(row, 5, source)
+        self._refresh_source(row)
+
+    def _is_manual(self, row: int) -> bool:
+        source = self.table.item(row, 5)
+        return bool(source and source.data(Qt.ItemDataRole.UserRole))
+
+    def _refresh_source(self, row: int) -> None:
+        source = self.table.item(row, 5)
+        if source is None:
+            source = QTableWidgetItem()
+            source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 5, source)
+        if self._is_manual(row):
+            source.setText("Thủ công")
+            confidence = self.table.item(row, 4)
+            if confidence is not None:
+                confidence.setText("100%")
+            return
+        try:
+            lesson_no = int(self.table.item(row, 0).text())
+        except (AttributeError, TypeError, ValueError):
+            lesson_no = 0
+        source.setText(self._evidence_text(lesson_no))
+
+    def _refresh_sources(self) -> None:
+        for row in range(self.table.rowCount()):
+            self._refresh_source(row)
 
     def _add_row(self) -> None:
         self._updating_table = True
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self._set_row_values(row, ("", "", "", "", "0%", ""))
+        self._set_row_values(row, ("", "", "", "", "100%"), manual=True)
         self._updating_table = False
         self._validate_rows()
 
@@ -166,12 +214,14 @@ class DialogReviewBoundaries(QDialog):
             return
         values = tuple(
             self.table.item(source_row, column).text()
-            for column in range(len(self._HEADERS))
+            if self.table.item(source_row, column) is not None
+            else ""
+            for column in range(5)
         )
         self._updating_table = True
         row = source_row + 1
         self.table.insertRow(row)
-        self._set_row_values(row, values)
+        self._set_row_values(row, values, manual=True)
         self._updating_table = False
         self.table.setCurrentCell(row, 0)
         self._validate_rows()
@@ -182,13 +232,44 @@ class DialogReviewBoundaries(QDialog):
             self.table.removeRow(row)
         self._validate_rows()
 
+    def _selected_rows(self) -> list[int]:
+        rows = {index.row() for index in self.table.selectedIndexes()}
+        if not rows and self.table.currentRow() >= 0:
+            rows.add(self.table.currentRow())
+        return sorted(rows)
+
+    def _use_manual_boundaries(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        self._updating_table = True
+        for row in rows:
+            source = self.table.item(row, 5)
+            if source is None:
+                source = QTableWidgetItem()
+                source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, 5, source)
+            source.setData(Qt.ItemDataRole.UserRole, True)
+            self._refresh_source(row)
+        self._updating_table = False
+        self._validate_rows()
+
     def _sort_rows(self) -> None:
         rows = [
-            tuple(self.table.item(row, column).text() for column in range(len(self._HEADERS)))
+            (
+                tuple(
+                    self.table.item(row, column).text()
+                    if self.table.item(row, column) is not None
+                    else ""
+                    for column in range(5)
+                ),
+                self._is_manual(row),
+            )
             for row in range(self.table.rowCount())
         ]
 
-        def sort_key(values: tuple[str, ...]) -> tuple[int, int]:
+        def sort_key(item: tuple[tuple[str, ...], bool]) -> tuple[int, int]:
+            values = item[0]
             try:
                 lesson_no = int(values[0])
             except ValueError:
@@ -202,31 +283,36 @@ class DialogReviewBoundaries(QDialog):
         self._updating_table = True
         rows.sort(key=sort_key)
         self.table.setRowCount(0)
-        for values in rows:
+        for values, manual in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self._set_row_values(row, values)
+            self._set_row_values(row, values, manual=manual)
         self._updating_table = False
         self._validate_rows()
 
     def _clear_error_colors(self) -> None:
         for row in range(self.table.rowCount()):
             for column in range(4):
-                self.table.item(row, column).setBackground(QColor("transparent"))
+                item = self.table.item(row, column)
+                if item is not None:
+                    item.setBackground(QColor("transparent"))
 
     def _color_issue(self, lesson_no: int | None, code: str) -> None:
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
-            if lesson_no is None or item.text() == str(lesson_no):
+            if item is not None and (lesson_no is None or item.text() == str(lesson_no)):
                 columns = (5,) if code == "toc_heading_conflict" else (0, 2, 3)
                 for column in columns:
-                    self.table.item(row, column).setBackground(self._ERROR_COLOR)
+                    cell = self.table.item(row, column)
+                    if cell is not None:
+                        cell.setBackground(self._ERROR_COLOR)
 
     def _validate_rows(self) -> None:
         if self._updating_table:
             return
         self._updating_table = True
         try:
+            self._refresh_sources()
             self._clear_error_colors()
             try:
                 bounds = self.boundaries()
@@ -235,7 +321,9 @@ class DialogReviewBoundaries(QDialog):
                 self.btn_confirm.setEnabled(False)
                 return
 
-            report = Splitter().validate(bounds, self.evidence, self.page_count)
+            report = Splitter().validate(
+                bounds, self._effective_evidence(bounds), self.page_count
+            )
             self._last_report = report
             local_messages = []
             if not bounds:
@@ -256,6 +344,35 @@ class DialogReviewBoundaries(QDialog):
             self.btn_confirm.setEnabled(report.valid and not local_messages)
         finally:
             self._updating_table = False
+
+    def _effective_evidence(
+        self, bounds: list[LessonBoundary]
+    ) -> tuple[BoundaryEvidence, ...]:
+        lesson_nos = {boundary.index_no for boundary in bounds}
+        evidence = [
+            item
+            for item in self.evidence
+            if item.lesson_no is None or item.lesson_no in lesson_nos
+        ]
+        for row, boundary in enumerate(bounds):
+            if self._is_manual(row):
+                evidence = [
+                    item
+                    for item in evidence
+                    if item.lesson_no != boundary.index_no
+                    and item.page_index != boundary.page_start
+                ]
+                evidence.append(
+                    BoundaryEvidence(
+                        "manual",
+                        boundary.page_start,
+                        boundary.index_no,
+                        boundary.title,
+                        1.0,
+                        "Người dùng xác nhận",
+                    )
+                )
+        return tuple(evidence)
 
     def boundaries(self) -> list[LessonBoundary]:
         result = []

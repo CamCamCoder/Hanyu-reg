@@ -100,6 +100,15 @@ class BookImporterWorker(QThread):
                 finally:
                     self._record_ai_calls(thread_db, file_hash, splitter.ai_calls_used)
 
+                if result.boundaries and not result.report.valid:
+                    thread_db.set_import_state(book_id, "review_bounds")
+                    self.progress.emit(
+                        65,
+                        "Ranh giới cần sửa — hãy kiểm tra trước khi OCR.",
+                    )
+                    self.boundaries_ready.emit(book_id, book_title, result)
+                    return
+
                 # Nạp danh sách bài học vào DB
                 self._store_boundaries_or_raise(thread_db, book_id, result)
                 boundaries_persisted = True

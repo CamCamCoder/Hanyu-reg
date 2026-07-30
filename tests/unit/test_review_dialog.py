@@ -12,6 +12,7 @@ import hanzi_app.service.importer as importer_module
 import hanzi_app.ui.screen_books as screen_books_module
 from hanzi_app.data.models import (
     BoundaryEvidence,
+    BoundaryIssue,
     BoundaryReport,
     LessonBoundary,
     SplitResult,
@@ -670,6 +671,99 @@ def test_boundary_dialog_blocks_deleting_every_lesson(tmp_path):
         dialog._delete_row()
 
         assert dialog.table.rowCount() == 0
+        assert dialog.btn_confirm.isEnabled() is False
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def _conflicting_boundary_result():
+    boundary = LessonBoundary(1, "Một", 5, 39, 0.9, "lesson")
+    evidence = (
+        BoundaryEvidence("toc", 5, 1, "Một", 0.8, "mục lục"),
+        BoundaryEvidence("heading", 8, 1, "Một", 0.8, "trang mở bài"),
+    )
+    issue = BoundaryIssue(
+        "toc_heading_conflict", "error", 1, None, "conflicting evidence"
+    )
+    return SplitResult(
+        (boundary,), evidence, BoundaryReport(False, (issue,), ()), True
+    )
+
+
+def test_boundary_dialog_loads_invalid_result_and_manual_override_confirms(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-manual", 40)
+    dialog = DialogReviewBoundaries(db, book_id, 40, _conflicting_boundary_result())
+    try:
+        assert dialog.table.rowCount() == 1
+        assert dialog.btn_confirm.isEnabled() is False
+
+        dialog.table.setCurrentCell(0, 0)
+        dialog._use_manual_boundaries()
+
+        assert dialog.table.item(0, 5).text() == "Thủ công"
+        assert dialog.btn_confirm.isEnabled() is True
+        dialog._confirm()
+        assert db.get_lessons(book_id)[0]["page_start"] == 5
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_boundary_dialog_refreshes_evidence_after_edit_duplicate_and_sort(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-alignment", 40)
+    first = LessonBoundary(1, "Một", 0, 9, 0.9, "lesson")
+    second = LessonBoundary(2, "Hai", 10, 39, 0.9, "lesson")
+    result = SplitResult(
+        (first, second),
+        (
+            BoundaryEvidence("toc", 0, 1, "Một", 0.8, "nguồn một"),
+            BoundaryEvidence("heading", 10, 2, "Hai", 0.8, "nguồn hai"),
+        ),
+        BoundaryReport(True, (), ()),
+        False,
+    )
+    dialog = DialogReviewBoundaries(db, book_id, 40, result)
+    try:
+        dialog.table.item(0, 0).setText("2")
+        assert "nguồn hai" in dialog.table.item(0, 5).text()
+        assert "nguồn một" not in dialog.table.item(0, 5).text()
+
+        dialog.table.setCurrentCell(0, 0)
+        dialog._duplicate_row()
+        dialog._sort_rows()
+
+        assert any(
+            dialog.table.item(row, 5).text() == "Thủ công"
+            for row in range(dialog.table.rowCount())
+        )
+        assert all(
+            "nguồn một" not in dialog.table.item(row, 5).text()
+            for row in range(dialog.table.rowCount())
+        )
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_boundary_dialog_ignores_missing_source_cell_while_coloring_error(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "bounds-partial", 40)
+    dialog = DialogReviewBoundaries(db, book_id, 40, _conflicting_boundary_result())
+    try:
+        assert dialog.table.rowCount() == 1
+        dialog.table.takeItem(0, 5)
+        dialog._color_issue(1, "toc_heading_conflict")
+        dialog._validate_rows()
+
         assert dialog.btn_confirm.isEnabled() is False
     finally:
         dialog.deleteLater()

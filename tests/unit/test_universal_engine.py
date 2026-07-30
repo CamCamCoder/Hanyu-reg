@@ -435,6 +435,71 @@ def test_worker_emits_the_split_result(tmp_path, monkeypatch):
     assert received[0][2].evidence[0].source == "heading"
 
 
+def test_worker_emits_invalid_conflict_for_manual_repair_without_db_lessons(
+    tmp_path, monkeypatch
+):
+    pdf_path = tmp_path / "conflict.pdf"
+    pdf_path.write_bytes(b"conflicting-boundaries")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+    boundary = LessonBoundary(1, "One", 2, 9, 0.9, "lesson")
+    issue = BoundaryIssue(
+        "toc_heading_conflict", "error", 1, None, "sources conflict"
+    )
+    result = SplitResult(
+        (boundary,),
+        (
+            BoundaryEvidence("toc", 2, 1, "One", 0.8, "toc"),
+            BoundaryEvidence("heading", 4, 1, "One", 0.8, "heading"),
+        ),
+        BoundaryReport(False, (issue,), ()),
+        True,
+    )
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return []
+
+        def boundary_contact_sheet(self, _evidence):
+            return b""
+
+    class ConflictingSplitter:
+        ai_calls_used = 0
+
+        def propose(self, *_args, **_kwargs):
+            return result
+
+    received = []
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "Splitter", ConflictingSplitter)
+    worker = BookImporterWorker(pdf_path, db_path)
+    worker.boundaries_ready.connect(
+        lambda book_id, title, split_result: received.append(
+            (book_id, title, split_result)
+        )
+    )
+    worker.run()
+
+    assert len(received) == 1
+    assert received[0][2] == result
+    checked = UserDb(db_path)
+    assert checked.get_lessons(received[0][0]) == []
+    assert checked.get_book(received[0][0])["import_state"] == "review_bounds"
+    checked.close()
+
+
 def test_splitter_top_20_percent_header():
     """Kiểm tra nhận diện tiêu đề 第X课 ở phần 20% trên cùng của trang."""
     summaries = [
