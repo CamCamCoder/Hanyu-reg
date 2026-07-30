@@ -14,7 +14,7 @@ from itertools import product
 from typing import TYPE_CHECKING
 
 from hanzi_app.adapter.aiclient import AiRateLimitError
-from hanzi_app.data.models import TextSpan, VocabRow
+from hanzi_app.data.models import TextSpan, VocabBlock, VocabRow
 
 if TYPE_CHECKING:
     from hanzi_app.adapter.aiclient import AiClient
@@ -56,12 +56,226 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
+def _line_groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
+    """Group spans into visual rows without relying on a textbook template."""
+    lines: list[list[TextSpan]] = []
+    for span in sorted(
+        spans, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0])
+    ):
+        center_y = (span.bbox[1] + span.bbox[3]) / 2
+        if not lines:
+            lines.append([span])
+            continue
+        previous_y = sum(
+            (item.bbox[1] + item.bbox[3]) / 2 for item in lines[-1]
+        ) / len(lines[-1])
+        if abs(center_y - previous_y) <= 12:
+            lines[-1].append(span)
+        else:
+            lines.append([span])
+    return lines
+
+
+def _compact_line(spans: list[TextSpan]) -> str:
+    return re.sub(
+        r"\s+", "", " ".join(span.text for span in spans)
+    ).lower()
+
+
+def _has_vocab_heading(spans: list[TextSpan]) -> bool:
+    compact = _compact_line(spans)
+    return any(
+        marker in compact
+        for marker in ("newwords", "词语表", "生词", "từmới")
+    )
+
+
+def _is_pinyin_text(text: str) -> bool:
+    value = text.strip()
+    return bool(
+        value
+        and RE_PINYIN_TEXT.fullmatch(value)
+        and any(character.isalpha() for character in value)
+        and any(
+            character.lower() in "aeiouvüāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ"
+            for character in value
+        )
+    )
+
+
+def _region_evidence(
+    spans: list[TextSpan],
+) -> tuple[list[list[TextSpan]], list[list[TextSpan]], list[int], bool]:
+    row_lines: list[list[TextSpan]] = []
+    numeric_candidates: list[tuple[int, float, list[TextSpan]]] = []
+    cjk_centers: list[float] = []
+    pinyin_centers: list[float] = []
+    for line in _line_groups(spans):
+        numeric_spans = [
+            span
+            for span in line
+            if re.fullmatch(r"\d{1,3}", span.text.strip())
+        ]
+        for span in numeric_spans:
+            numeric_candidates.append(
+                (
+                    int(span.text.strip()),
+                    (span.bbox[0] + span.bbox[2]) / 2,
+                    line,
+                )
+            )
+        cjk = [span for span in line if RE_CJK_WORD.search(span.text)]
+        pinyin = [span for span in line if _is_pinyin_text(span.text)]
+        if cjk and pinyin:
+            row_lines.append(line)
+            cjk_centers.append((cjk[0].bbox[0] + cjk[0].bbox[2]) / 2)
+            pinyin_centers.append((pinyin[0].bbox[0] + pinyin[0].bbox[2]) / 2)
+
+    aligned_orders: list[tuple[int, float, list[TextSpan]]] = []
+    if numeric_candidates:
+        clusters = [
+            [
+                candidate
+                for candidate in numeric_candidates
+                if abs(candidate[1] - center) <= 35
+            ]
+            for _value, center, _line in numeric_candidates
+        ]
+        aligned_orders = max(
+            clusters,
+            key=lambda cluster: (
+                len(cluster),
+                -min(candidate[1] for candidate in cluster),
+            ),
+        )
+    unique_orders = sorted({candidate[0] for candidate in aligned_orders})
+    order_lines: list[list[TextSpan]] = []
+    for _value, _center, line in aligned_orders:
+        if line not in order_lines:
+            order_lines.append(line)
+    sequential = any(
+        right == left + 1
+        for left, right in zip(unique_orders, unique_orders[1:])
+    )
+    aligned = (
+        len(row_lines) >= 2
+        and max(cjk_centers) - min(cjk_centers) <= 35
+        and max(pinyin_centers) - min(pinyin_centers) <= 35
+    )
+    return row_lines, order_lines, unique_orders, sequential or aligned
+
+def render_block_crop(pdf: PdfSource, block: VocabBlock, dpi: int = 250) -> bytes:
+    """Render exactly the persisted page and rectangle of one vocabulary block."""
+    return pdf.get_page_crop_image_bytes(
+        block.page_index, block.bbox, dpi=dpi
+    )
+
 class VocabExtractor:
     """Bóc tách từ vựng từ bài học theo kiến trúc 2 Lớp sạch sẽ, minh bạch."""
 
     def __init__(self, dict_db=None) -> None:
         self.dict_db = dict_db
 
+    def locate_blocks(
+        self, pdf: PdfSource, lesson: LessonBoundary
+    ) -> list[VocabBlock]:
+        """Locate every independent vocabulary table region inside a lesson."""
+        candidates: list[tuple[int, float, tuple[float, float, float, float], int | None, int | None, int | None]] = []
+        page_count = pdf.page_count()
+        start = max(0, lesson.page_start)
+        end = min(lesson.page_end, page_count - 1)
+        for page_index in range(start, end + 1):
+            spans = list(pdf.spans(page_index))
+            if not spans:
+                continue
+            lines = _line_groups(spans)
+            heading_lines = [line for line in lines if _has_vocab_heading(line)]
+            heading_starts = sorted(
+                min(span.bbox[1] for span in line) for line in heading_lines
+            )
+            regions: list[tuple[float, float | None]]
+            if heading_starts:
+                regions = [
+                    (
+                        y_start,
+                        heading_starts[index + 1]
+                        if index + 1 < len(heading_starts)
+                        else None,
+                    )
+                    for index, y_start in enumerate(heading_starts)
+                ]
+            else:
+                regions = [(min(span.bbox[1] for span in spans), None)]
+
+            for y_start, y_end in regions:
+                region = [
+                    span
+                    for span in spans
+                    if (span.bbox[1] + span.bbox[3]) / 2 >= y_start
+                    and (
+                        y_end is None
+                        or (span.bbox[1] + span.bbox[3]) / 2 < y_end
+                    )
+                ]
+                if not region:
+                    continue
+                row_lines, order_lines, orders, has_structure = _region_evidence(region)
+                signals = (
+                    _has_vocab_heading(region),
+                    len(row_lines) >= 2,
+                    has_structure,
+                )
+                if sum(signals) < 2:
+                    continue
+
+                relevant_lines = list(row_lines)
+                relevant_lines.extend(order_lines)
+                relevant_lines.extend(
+                    line for line in _line_groups(region) if _has_vocab_heading(line)
+                )
+                if not relevant_lines:
+                    relevant_lines = _line_groups(region)
+                relevant = [span for line in relevant_lines for span in line]
+                bbox = (
+                    max(0.0, min(span.bbox[0] for span in relevant) - 8.0),
+                    max(0.0, min(span.bbox[1] for span in relevant) - 8.0),
+                    max(span.bbox[2] for span in relevant) + 8.0,
+                    max(span.bbox[3] for span in relevant) + 8.0,
+                )
+                expected_rows = max(len(orders), len(row_lines))
+                candidates.append(
+                    (
+                        page_index,
+                        bbox[1],
+                        bbox,
+                        expected_rows or None,
+                        orders[0] if orders else None,
+                        orders[-1] if orders else None,
+                    )
+                )
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return [
+            VocabBlock(
+                id=None,
+                lesson_id=None,
+                block_no=block_no,
+                page_index=page_index,
+                bbox=bbox,
+                crop_path=None,
+                expected_rows=expected_rows,
+                first_order=first_order,
+                last_order=last_order,
+            )
+            for block_no, (
+                page_index,
+                _y_start,
+                bbox,
+                expected_rows,
+                first_order,
+                last_order,
+            ) in enumerate(candidates, start=1)
+        ]
     def extract_by_llm(
         self, text_content: str, ai_client: AiClient, source_page: int
     ) -> list[VocabRow]:

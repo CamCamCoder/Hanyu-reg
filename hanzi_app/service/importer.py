@@ -22,6 +22,30 @@ from hanzi_app.service.splitter import Splitter
 from hanzi_app.service.vocab import VocabExtractor
 
 
+def _write_crop_atomic(
+    root: str | Path,
+    book_id: int,
+    lesson_id: int,
+    block_no: int,
+    data: bytes,
+) -> str:
+    """Persist a crop by replacing the final path only after a complete write."""
+    target = (
+        Path(root)
+        / f"book-{book_id}"
+        / f"lesson-{lesson_id}"
+        / f"block-{block_no}.png"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return str(target)
+
 class BookImporterWorker(QThread):
     """Pha 1: nhận diện bài học, dừng lại để người dùng duyệt ranh giới."""
 

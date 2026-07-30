@@ -1,6 +1,7 @@
 """Unit test kiểm thử Bộ Xử Lý Tổng Quát 2 Lớp (Universal 2-Layer Engine)."""
 
 import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 
@@ -16,7 +17,11 @@ from hanzi_app.data.models import (
 )
 from hanzi_app.data.userdb import UserDb
 import hanzi_app.service.importer as importer_module
-from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
+from hanzi_app.service.importer import (
+    BookImporterWorker,
+    VocabImporterWorker,
+    _write_crop_atomic,
+)
 from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
 
@@ -903,3 +908,33 @@ def test_vocab_locator_nhan_header_sinh_tu_bi_tach_span():
             self.text = text
 
     assert VocabExtractor.is_vocab_page([Span("生"), Span("词")])
+
+def test_crop_writer_is_atomic_and_uses_block_path(tmp_path):
+    data = b"png-with-stable-content"
+
+    path = _write_crop_atomic(tmp_path, 4, 9, 2, data)
+
+    stored = Path(path).read_bytes()
+    assert stored == data
+    assert hashlib.sha256(stored).hexdigest() == hashlib.sha256(data).hexdigest()
+    assert Path(path).as_posix().endswith("book-4/lesson-9/block-2.png")
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_crop_writer_cleans_temp_and_preserves_previous_crop_on_replace_failure(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "book-4" / "lesson-9" / "block-2.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"previous")
+
+    def fail_replace(_self, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _write_crop_atomic(tmp_path, 4, 9, 2, b"new")
+
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.rglob("*.tmp"))

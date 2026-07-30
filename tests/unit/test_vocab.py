@@ -1,7 +1,9 @@
 """Kiểm thử unit cho service/vocab.py."""
 
-from hanzi_app.data.models import TextSpan
-from hanzi_app.service.vocab import VocabExtractor
+from unittest.mock import MagicMock
+
+from hanzi_app.data.models import LessonBoundary, TextSpan, VocabBlock
+from hanzi_app.service.vocab import VocabExtractor, render_block_crop
 
 
 def test_vocab_extractor_spans():
@@ -84,3 +86,88 @@ def test_table_bbox_dung_truoc_language_points():
     assert bbox is not None
     assert bbox[1] == 55
     assert bbox[3] == 485
+
+def _span(text, x, y, width=50, height=14):
+    return TextSpan(text, (x, y, x + width, y + height), float(height), True)
+
+
+def _vocab_region(title, orders, y0):
+    spans = [_span(title, 20, y0, 100, 18)]
+    for offset, order in enumerate(orders, start=1):
+        y = y0 + 30 * offset
+        spans.extend([
+            _span(str(order), 20, y, 20),
+            _span(f"词{order}", 80, y, 45),
+            _span("cí", 160, y, 45),
+        ])
+    return spans
+
+
+def test_locator_finds_disjoint_blocks_and_ignores_prose():
+    pages = {
+        0: [_span("Trong bài này 生词 nghĩa là từ mới", 20, 100, 300)],
+        1: _vocab_region("New Words", (1, 2, 3), 100),
+        2: [_span("A: 你好", 20, 100), _span("B: 你好", 20, 140)],
+        3: _vocab_region("生词", (4, 5), 300),
+    }
+    pdf = MagicMock()
+    pdf.page_count.return_value = 4
+    pdf.spans.side_effect = lambda page: pages[page]
+    lesson = LessonBoundary(1, "Bài 1", 0, 3, 1.0, "lesson")
+
+    blocks = VocabExtractor().locate_blocks(pdf, lesson)
+
+    assert [(block.block_no, block.page_index) for block in blocks] == [(1, 1), (2, 3)]
+    assert [block.expected_rows for block in blocks] == [3, 2]
+    assert [(block.first_order, block.last_order) for block in blocks] == [(1, 3), (4, 5)]
+    assert all(block.bbox[1] < block.bbox[3] for block in blocks)
+
+
+def test_locator_splits_two_blocks_on_one_page_in_deterministic_order():
+    page = (
+        _vocab_region("生词", (8, 9), 300)
+        + _vocab_region("New Words", (1, 2), 50)
+        + [_span("99", 900, 600, 20)]
+    )
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+    lesson = LessonBoundary(7, "Bài 7", 0, 0, 1.0, "lesson")
+
+    first = VocabExtractor().locate_blocks(pdf, lesson)
+    second = VocabExtractor().locate_blocks(pdf, lesson)
+
+    assert [
+        (b.id, b.lesson_id, b.block_no, b.expected_rows, b.first_order, b.last_order)
+        for b in first
+    ] == [
+        (None, None, 1, 2, 1, 2),
+        (None, None, 2, 2, 8, 9),
+    ]
+    assert first == second
+
+
+def test_locator_returns_no_block_when_signals_do_not_reach_two_of_three():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 2
+    pdf.spans.side_effect = [
+        [_span("生词 chỉ là một thuật ngữ trong đoạn văn", 20, 100, 300)],
+        [_span("1", 20, 100), _span("2", 20, 140),
+         _span("không có chữ Hán hay pinyin", 80, 100, 250)],
+    ]
+    lesson = LessonBoundary(2, "Bài 2", 0, 1, 1.0, "lesson")
+
+    assert VocabExtractor().locate_blocks(pdf, lesson) == []
+
+
+def test_render_block_crop_uses_exact_page_bbox_and_dpi():
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop-png"
+    block = VocabBlock(None, None, 2, 5, (10.0, 20.0, 300.0, 450.0), None, 4, 7, 10)
+
+    data = render_block_crop(pdf, block)
+
+    assert data == b"crop-png"
+    pdf.get_page_crop_image_bytes.assert_called_once_with(
+        5, (10.0, 20.0, 300.0, 450.0), dpi=250
+    )
