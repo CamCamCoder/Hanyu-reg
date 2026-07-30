@@ -88,7 +88,7 @@ class BookImporterWorker(QThread):
                 mode_str = "Lớp 2 (Cloud AI)" if self.ai_client.is_configured() else "Lớp 1 (Local Engine)"
                 self.progress.emit(60, f"Phân tách bài học [{mode_str}]...")
                 splitter = Splitter()
-                remaining_ai_calls = self._remaining_ai_calls(thread_db, book_id)
+                remaining_ai_calls = self._remaining_ai_calls(thread_db, file_hash)
                 try:
                     result = splitter.propose(
                         [],
@@ -98,7 +98,7 @@ class BookImporterWorker(QThread):
                         remaining_ai_calls=remaining_ai_calls,
                     )
                 finally:
-                    self._record_ai_calls(thread_db, book_id, splitter.ai_calls_used)
+                    self._record_ai_calls(thread_db, file_hash, splitter.ai_calls_used)
 
                 # Nạp danh sách bài học vào DB
                 self._store_boundaries_or_raise(thread_db, book_id, result)
@@ -133,12 +133,12 @@ class BookImporterWorker(QThread):
         db.replace_lessons(book_id, list(result.boundaries))
 
     @staticmethod
-    def _ai_budget_key(book_id: int) -> str:
-        return f"import.split_ai_calls.{book_id}"
+    def _ai_budget_key(file_hash: str) -> str:
+        return f"import.split_ai_calls.{file_hash}"
 
     @classmethod
-    def _remaining_ai_calls(cls, db: UserDb, book_id: int) -> int:
-        raw_calls = db.get_setting(cls._ai_budget_key(book_id))
+    def _remaining_ai_calls(cls, db: UserDb, file_hash: str) -> int:
+        raw_calls = db.get_setting(cls._ai_budget_key(file_hash))
         try:
             calls_used = int(raw_calls) if raw_calls is not None else 0
         except ValueError:
@@ -146,10 +146,10 @@ class BookImporterWorker(QThread):
         return max(0, 2 - calls_used)
 
     @classmethod
-    def _record_ai_calls(cls, db: UserDb, book_id: int, calls_used: int) -> None:
+    def _record_ai_calls(cls, db: UserDb, file_hash: str, calls_used: int) -> None:
         if calls_used <= 0:
             return
-        key = cls._ai_budget_key(book_id)
+        key = cls._ai_budget_key(file_hash)
         raw_calls = db.get_setting(key)
         try:
             previous_calls = int(raw_calls) if raw_calls is not None else 0

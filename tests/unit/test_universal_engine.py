@@ -204,7 +204,71 @@ def test_worker_persists_ai_budget_across_two_failed_runs(tmp_path, monkeypatch)
 
     checked = UserDb(str(tmp_path / "user.sqlite"))
     assert EmptyAi.calls == 2
-    assert checked.get_setting(f"import.split_ai_calls.{book_id}") == "2"
+    assert checked.get_setting(
+        f"import.split_ai_calls.{hashlib.md5(b'same-book').hexdigest()}"
+    ) == "2"
+    checked.close()
+
+
+def test_worker_scopes_ai_budget_to_file_hash_after_new_book_deletion(
+    tmp_path, monkeypatch
+):
+    """Deleted-book IDs must neither reset one PDF nor exhaust a different PDF."""
+    pdf_a = tmp_path / "a.pdf"
+    pdf_b = tmp_path / "b.pdf"
+    pdf_a.write_bytes(b"pdf-a")
+    pdf_b.write_bytes(b"pdf-b")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class EmptyAi:
+        calls = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            type(self).calls += 1
+            return []
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", EmptyAi)
+
+    BookImporterWorker(pdf_a, db_path).run()
+    BookImporterWorker(pdf_b, db_path).run()
+    BookImporterWorker(pdf_a, db_path).run()
+
+    hash_a = hashlib.md5(b"pdf-a").hexdigest()
+    hash_b = hashlib.md5(b"pdf-b").hexdigest()
+    checked = UserDb(db_path)
+    assert EmptyAi.calls == 4
+    assert checked.get_setting(f"import.split_ai_calls.{hash_a}") == "2"
+    assert checked.get_setting(f"import.split_ai_calls.{hash_b}") == "2"
     checked.close()
 
 
@@ -257,7 +321,9 @@ def test_worker_counts_an_ai_call_that_raises(tmp_path, monkeypatch):
     BookImporterWorker(pdf_path, db_path).run()
 
     checked = UserDb(db_path)
-    assert checked.get_setting(f"import.split_ai_calls.{book_id}") == "1"
+    assert checked.get_setting(
+        f"import.split_ai_calls.{hashlib.md5(b'raising-book').hexdigest()}"
+    ) == "1"
     assert checked.get_book(book_id)["import_state"] == "review_bounds"
     checked.close()
 
