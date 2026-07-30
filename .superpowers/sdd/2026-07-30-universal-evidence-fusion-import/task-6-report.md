@@ -84,3 +84,71 @@ Result: `274 passed, 1 skipped in 4.58s`.
 ## Environment note
 
 The Windows deny-read ACL blocked the normal `apply_patch` helper even after narrow escalation. File changes were therefore applied only inside the authorized Task 6 worktree under narrow escalated filesystem access. No paths outside the worktree were written.
+## Fix round 1/5 — reviewer findings
+
+### Root causes
+
+1. Same-page segmentation used only heading Y coordinates, so one heading plus a later table and two side-by-side titled tables were collapsed into one manifest block.
+2. `_is_pinyin_text()` accepted arbitrary Latin prose, while the row and aligned-column signals reused the same two spans and were not independent.
+3. Generic heading markers `新词` and `Vocabulary` were absent.
+
+### RED — all findings reproduced with real UTF-8 fixtures
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "vertically_separated or side_by_side or two_column_dialogue or generic_heading" -v --basetemp .pytest-tmp-task6-fix1-red-utf8
+```
+
+Result: `4 failed, 9 deselected`. The test source was inspected before the run and contained real UTF-8 `词`, `cí`, `新词`, `我`, `wǒ`, `门`, `mén`, `你好`, `再见`, and `Bài` strings.
+
+### GREEN — focused reviewer cases
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py -k "vertically_separated or side_by_side or two_column_dialogue or generic_heading" -v --basetemp .pytest-tmp-task6-fix1-green
+```
+
+Result: `4 passed, 9 deselected`.
+
+### Compatibility RED/GREEN
+
+The first required regression run produced `39 passed, 1 failed`: the existing split `生` + `词` test uses text-only spans without `bbox`. This identified a compatibility assumption, not a locator geometry failure.
+
+Command after the text-only fallback:
+
+```powershell
+pytest tests/unit/test_universal_engine.py -k "header_sinh_tu" -v --basetemp .pytest-tmp-task6-fix1-compat-green
+```
+
+Result: `1 passed, 26 deselected`.
+
+### Final required regression
+
+Command:
+
+```powershell
+pytest tests/unit/test_vocab.py tests/unit/test_universal_engine.py -v --basetemp .pytest-tmp-task6-fix1-regression2
+```
+
+Result: `40 passed`.
+
+### Full unit regression
+
+Command:
+
+```powershell
+pytest tests/unit -q --basetemp .pytest-tmp-task6-fix1-all-unit
+```
+
+Result: `278 passed, 1 skipped in 5.57s`.
+
+### Fix decisions
+
+- Candidate regions are split first by a generic vertical whitespace threshold derived from line height, then by repeated numeric-column centers on X; multiple independent title centers provide the X fallback.
+- Candidate order is deterministic by `(page_index, bbox_y, bbox_x)`.
+- Latin evidence must be segmentable into Mandarin pinyin syllables; `hello` and `goodbye` no longer qualify.
+- Without sequential STT, aligned structure requires a third repeated column in addition to Hanzi and pinyin, so a two-column dialogue cannot manufacture two signals from the same pair.
+- Added `新词` and `Vocabulary` to the generic heading vocabulary; no textbook-specific page or title constants were introduced.
+- Text-only legacy spans remain supported by heading detection without entering the geometric locator path.

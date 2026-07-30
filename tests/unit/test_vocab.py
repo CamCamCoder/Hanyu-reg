@@ -171,3 +171,93 @@ def test_render_block_crop_uses_exact_page_bbox_and_dpi():
     pdf.get_page_crop_image_bytes.assert_called_once_with(
         5, (10.0, 20.0, 300.0, 450.0), dpi=250
     )
+
+
+def test_locator_splits_vertically_separated_tables_with_one_heading():
+    page = (
+        _vocab_region("Vocabulary", (1, 2), 40)
+        + [
+            _span("3", 20, 420, 20),
+            _span("词3", 80, 420, 45),
+            _span("cí", 160, 420, 45),
+            _span("4", 20, 450, 20),
+            _span("词4", 80, 450, 45),
+            _span("cí", 160, 450, 45),
+        ]
+    )
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(8, "Bài 8", 0, 0, 1.0, "lesson")
+    )
+
+    assert [
+        (block.block_no, block.expected_rows, block.first_order, block.last_order)
+        for block in blocks
+    ] == [(1, 2, 1, 2), (2, 2, 3, 4)]
+    assert blocks[0].bbox[3] < blocks[1].bbox[1]
+
+
+def test_locator_splits_side_by_side_titled_tables():
+    left = _vocab_region("新词", (1, 2), 40)
+    right = [
+        _span(
+            span.text,
+            span.bbox[0] + 400,
+            span.bbox[1],
+            span.bbox[2] - span.bbox[0],
+            span.bbox[3] - span.bbox[1],
+        )
+        for span in _vocab_region("Vocabulary", (3, 4), 40)
+    ]
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = left + right
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(9, "Bài 9", 0, 0, 1.0, "lesson")
+    )
+
+    assert [(block.first_order, block.last_order) for block in blocks] == [
+        (1, 2),
+        (3, 4),
+    ]
+    assert blocks[0].bbox[2] < blocks[1].bbox[0]
+
+
+def test_locator_rejects_two_column_dialogue_even_with_valid_pinyin_words():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("我", 20, 100, 30),
+        _span("wǒ", 100, 100, 40),
+        _span("门", 20, 140, 30),
+        _span("mén", 100, 140, 40),
+        _span("你好", 20, 180, 40),
+        _span("hello", 100, 180, 60),
+        _span("再见", 20, 220, 40),
+        _span("goodbye", 100, 220, 70),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(10, "Bài 10", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+
+def test_locator_accepts_new_generic_heading_markers():
+    extractor = VocabExtractor()
+    assert extractor.is_vocab_page([_span("新词", 20, 20, 80)]) is True
+    assert extractor.is_vocab_page([_span("Vocabulary", 20, 20, 120)]) is True
+
+    for heading in ("新词", "Vocabulary"):
+        pdf = MagicMock()
+        pdf.page_count.return_value = 1
+        pdf.spans.return_value = _vocab_region(heading, (1, 2), 40)
+        blocks = extractor.locate_blocks(
+            pdf, LessonBoundary(11, "Bài 11", 0, 0, 1.0, "lesson")
+        )
+        assert len(blocks) == 1
