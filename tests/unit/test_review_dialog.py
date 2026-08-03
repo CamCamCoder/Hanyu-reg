@@ -16,11 +16,12 @@ from hanzi_app.data.models import (
     BoundaryReport,
     LessonBoundary,
     SplitResult,
+    VocabBlock,
     VocabRow,
 )
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.ui.dialog_import import DialogReviewBoundaries
-from hanzi_app.ui.screen_books import DialogReviewBook
+from hanzi_app.ui.screen_books import DialogReviewBook, ScreenBooks
 
 
 class _FakePreviewWorker(QObject):
@@ -802,4 +803,145 @@ def test_manual_override_keeps_other_lessons_evidence_on_same_page(tmp_path):
     finally:
         dialog.deleteLater()
         app.processEvents()
+        db.close()
+
+
+def test_books_screen_labels_incomplete_and_offers_resume(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    screen = None
+    try:
+        db.set_import_state(book_id, "incomplete")
+        screen = ScreenBooks(db)
+        screen.show()
+        screen.load_books()
+
+        assert "ch\u01b0a \u0111\u1ee7 d\u1eef li\u1ec7u" in screen.list_books.item(0).text()
+        screen._hien_bai_hoc_cua_sach(book_id, "S\u00e1ch ki\u1ec3m th\u1eed")
+        app.processEvents()
+        assert screen.btn_resume_import.isVisible()
+    finally:
+        if screen is not None:
+            screen.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_review_preview_prefers_saved_block_crop(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        lesson = db.get_lessons(book_id)[0]
+        crop = str(tmp_path / "block-1.png")
+        block = db.replace_import_blocks(
+            lesson["id"],
+            [
+                VocabBlock(
+                    None,
+                    lesson["id"],
+                    1,
+                    4,
+                    (0, 0, 100, 200),
+                    crop,
+                    3,
+                    1,
+                    3,
+                )
+            ],
+        )[0]
+        first_word = db.get_lesson_words(lesson["id"])[0]
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE lesson_word SET source_block_id = ? WHERE id = ?",
+                (block["id"], first_word["id"]),
+            )
+
+        calls = []
+
+        class CapturePreviewWorker(_FakePreviewWorker):
+            def __init__(self, path, start=None, end=None, **kwargs):
+                super().__init__([], path, start, end, **kwargs)
+                calls.append((path, start, end, kwargs.get("crop_paths", ())))
+
+        monkeypatch.setattr(
+            screen_books_module,
+            "PreviewWorker",
+            CapturePreviewWorker,
+        )
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog._show_review_source(0, 4)
+
+        assert calls[0][3] == (crop,)
+        assert db.get_word_source_crop(first_word["id"]) == crop
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
+def test_manual_block_confirmation_unblocks_book(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    dialog = None
+    try:
+        book_id = db.add_book(
+            "S\u00e1ch th\u1ee7 c\u00f4ng",
+            str(tmp_path / "book.pdf"),
+            "manual-block",
+            10,
+        )
+        db.replace_lessons(
+            book_id,
+            [LessonBoundary(1, "M\u1ed9t", 0, 9, 1.0, "lesson")],
+        )
+        lesson = db.get_lessons(book_id)[0]
+        block = db.replace_import_blocks(
+            lesson["id"],
+            [
+                VocabBlock(
+                    None,
+                    lesson["id"],
+                    1,
+                    4,
+                    (0, 0, 100, 200),
+                    "block.png",
+                    3,
+                    1,
+                    3,
+                    "incomplete",
+                    3,
+                )
+            ],
+        )[0]
+        db.replace_vocab_block(
+            block["id"],
+            [
+                VocabRow(
+                    order_no=1,
+                    word="\u4f60\u597d",
+                    pinyin_src="n\u01d0h\u01ceo",
+                    pos=None,
+                    hanviet_src=None,
+                    meaning_src=None,
+                    source_page=5,
+                    extract_by="manual",
+                    needs_review=False,
+                    review_reason=None,
+                )
+            ],
+        )
+        db.set_import_state(book_id, "incomplete")
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.current_lesson = lesson
+        dialog.current_block_id = block["id"]
+        dialog._confirm_current_block_manual()
+
+        assert db.get_import_blocks(lesson["id"])[0]["status"] == "manual"
+        assert db.get_book(book_id)["import_state"] == "review"
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
         db.close()

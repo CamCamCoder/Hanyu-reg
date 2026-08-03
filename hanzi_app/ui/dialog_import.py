@@ -470,6 +470,44 @@ class DialogImport(QDialog):
 
         lay.addLayout(h_lay)
 
+    def resume_book(self, book: dict) -> None:
+        state = book.get("import_state")
+        if state not in {"review_bounds", "incomplete"}:
+            raise ValueError(f"Không thể tiếp tục sách ở trạng thái {state!r}")
+
+        self.imported_book_id = book["id"]
+        self._pdf_path = book["file_path"]
+        self._api_key = self.txt_api.text().strip() or None
+        self.btn_chon.setEnabled(False)
+
+        if state == "review_bounds":
+            self.lbl_status.setText("Đang phân tích lại ranh giới bài học...")
+            self.worker = BookImporterWorker(
+                self._pdf_path,
+                self.user_db.path,
+                api_key=self._api_key,
+                dict_path=getattr(self.dict_db, "path", None),
+                parent=self,
+            )
+            self.worker.progress.connect(self._on_progress)
+            self.worker.boundaries_ready.connect(self._on_boundaries_ready)
+            self.worker.failed_import.connect(self._on_failed)
+        else:
+            self.lbl_status.setText("Đang tiếp tục các block còn thiếu...")
+            self.worker = VocabImporterWorker(
+                book["id"],
+                self._pdf_path,
+                self.user_db.path,
+                api_key=self._api_key,
+                dict_path=getattr(self.dict_db, "path", None),
+                parent=self,
+            )
+            self.worker.progress.connect(self._on_progress)
+            self.worker.finished_import.connect(self._on_finished)
+            self.worker.failed_import.connect(self._on_failed)
+
+        self.worker.start()
+
     def _chon_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,

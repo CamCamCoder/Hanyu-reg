@@ -164,6 +164,15 @@ class UserDb:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_word_source_crop(self, lesson_word_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT ib.crop_path FROM lesson_word lw "
+            "JOIN import_block ib ON ib.id = lw.source_block_id "
+            "WHERE lw.id = ?",
+            (lesson_word_id,),
+        ).fetchone()
+        return None if row is None else row["crop_path"]
+
     def update_lesson_boundary(
         self,
         lesson_id: int,

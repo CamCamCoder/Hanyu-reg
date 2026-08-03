@@ -6,6 +6,7 @@ QT-02, QT-03 & QT-04 bước 2. Bổ sung ô cấu hình API Key cố định & 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -39,6 +40,14 @@ from hanzi_app.service.importer import (
 )
 from hanzi_app.ui.dialog_import import DialogImport
 from hanzi_app.ui.theme import PALETTE, han_font, mono_font, ui_font
+
+
+STATE_SUFFIX = {
+    "review_bounds": "  ·  chờ duyệt ranh giới",
+    "extracting": "  ·  đang lấy từ mới",
+    "incomplete": "  ·  chưa đủ dữ liệu",
+    "review": "  ·  cần duyệt từ mới",
+}
 
 
 def _sep() -> QFrame:
@@ -169,6 +178,8 @@ class DialogReviewBook(QDialog):
         self._pending_review_source: tuple[int, int] | None = None
         self.lessons = user_db.get_lessons(book["id"])
         self.current_lesson: dict | None = None
+        self.current_block: dict | None = None
+        self.current_block_id: int | None = None
         self.setWindowTitle(f"Duyệt kết quả nhập — {book['title']}")
         self.resize(1180, 760)
 
@@ -310,15 +321,23 @@ class DialogReviewBook(QDialog):
         self.btn_vision = QPushButton("Chạy Vision bài này")
         self.btn_vision.clicked.connect(self._run_vision)
         actions.addWidget(self.btn_vision)
-        btn_save = QPushButton("Lưu bài đang xem")
-        btn_save.clicked.connect(self._save_current)
-        actions.addWidget(btn_save)
-        btn_confirm = QPushButton("Xác nhận toàn bộ")
-        btn_confirm.setStyleSheet(
+        self.btn_confirm_block_manual = QPushButton(
+            "Xác nhận block thủ công"
+        )
+        self.btn_confirm_block_manual.clicked.connect(
+            self._confirm_current_block_manual
+        )
+        self.btn_confirm_block_manual.setVisible(False)
+        actions.addWidget(self.btn_confirm_block_manual)
+        self.btn_save_current = QPushButton("Lưu bài đang xem")
+        self.btn_save_current.clicked.connect(self._save_current)
+        actions.addWidget(self.btn_save_current)
+        self.btn_confirm_all = QPushButton("Xác nhận toàn bộ")
+        self.btn_confirm_all.setStyleSheet(
             f"background: {PALETTE['accent']}; color: white; padding: 7px 14px;"
         )
-        btn_confirm.clicked.connect(self._confirm_all)
-        actions.addWidget(btn_confirm)
+        self.btn_confirm_all.clicked.connect(self._confirm_all)
+        actions.addWidget(self.btn_confirm_all)
         right_lay.addLayout(actions)
         split.addWidget(right)
         split.setStretchFactor(1, 1)
@@ -445,7 +464,9 @@ class DialogReviewBook(QDialog):
         self.btn_confirm_selected.setEnabled(selected_count > 0)
         self.btn_select_visible.setEnabled(has_pending)
         self.btn_clear_selection.setEnabled(has_pending)
-        self.btn_finish_book.setEnabled(not has_pending)
+        self.btn_finish_book.setEnabled(
+            not has_pending and self.book.get("import_state") != "incomplete"
+        )
 
     def _select_visible_rows(self) -> None:
         self.review_table.blockSignals(True)
@@ -583,10 +604,12 @@ class DialogReviewBook(QDialog):
         self.review_preview.setText(
             f"Đang tải ảnh nguồn Bài {metadata['lesson_index']}…"
         )
+        crop_path = self.user_db.get_word_source_crop(metadata["word_id"])
         worker = PreviewWorker(
             self.book["file_path"],
             metadata["page_start"],
             metadata["page_end"],
+            crop_paths=(crop_path,) if crop_path else (),
             dpi=125,
             parent=self,
         )
@@ -672,9 +695,49 @@ class DialogReviewBook(QDialog):
         self.title_edit.setText(lesson.get("title") or "")
         self.start_spin.setValue(lesson["page_start"])
         self.end_spin.setValue(lesson["page_end"])
-        words = self.user_db.get_lesson_words(lesson_id)
+        all_words = self.user_db.get_lesson_words(lesson_id)
+        blocks = (
+            self.user_db.get_import_blocks(lesson_id)
+            if self.book.get("import_state") == "incomplete"
+            else []
+        )
+        self.current_block = next(
+            (
+                block
+                for block in blocks
+                if block["status"] not in {"local_ok", "ai_ok", "manual"}
+            ),
+            None,
+        )
+        self.current_block_id = (
+            self.current_block["id"] if self.current_block is not None else None
+        )
+        words = (
+            [
+                word
+                for word in all_words
+                if word.get("source_block_id") == self.current_block_id
+            ]
+            if self.current_block_id is not None
+            else all_words
+        )
         self._populate_rows(words)
-        self.preview.setText("Chọn một dòng để xem ảnh nguồn")
+        has_incomplete_block = self.current_block_id is not None
+        self.btn_confirm_block_manual.setVisible(has_incomplete_block)
+        self.btn_save_current.setVisible(not has_incomplete_block)
+        self.btn_confirm_all.setVisible(
+            self.book.get("import_state") != "incomplete"
+        )
+        self.preview.setText(
+            "Chọn một dòng để xem ảnh nguồn"
+        )
+        crop_path = (
+            self.current_block.get("crop_path")
+            if self.current_block is not None
+            else None
+        )
+        if crop_path and Path(crop_path).is_file():
+            self._start_source_preview((crop_path,))
 
     def _populate_rows(self, words) -> None:
         self.table.setRowCount(len(words))
@@ -694,6 +757,14 @@ class DialogReviewBook(QDialog):
             warning_count += int(warning)
             for column, value in enumerate(values):
                 item = QTableWidgetItem("" if value is None else str(value))
+                if column == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        {
+                            "word_id": get("id"),
+                            "source_block_id": get("source_block_id"),
+                        },
+                    )
                 if warning:
                     item.setBackground(QColor(PALETTE["warn_bg"]))
                     item.setToolTip("Dòng OCR cần kiểm tra lại")
@@ -798,26 +869,86 @@ class DialogReviewBook(QDialog):
         self._load_selected(current)
         return True
 
-    def _show_row_source(self, row: int, _column: int) -> None:
-        if self.current_lesson is None:
+    def _confirm_current_block_manual(self) -> None:
+        if self.current_lesson is None or self.current_block_id is None:
             return
-        if self.preview_worker is not None:
+        rows = self._rows_from_table()
+        if not rows:
+            QMessageBox.warning(
+                self,
+                "Thiếu từ mới",
+                "Block phải có ít nhất một dòng trước khi xác nhận.",
+            )
+            return
+
+        blocks = self.user_db.get_import_blocks(self.current_lesson["id"])
+        block = next(
+            (item for item in blocks if item["id"] == self.current_block_id),
+            None,
+        )
+        if block is None:
+            return
+
+        self.user_db.replace_vocab_block(self.current_block_id, rows)
+        self.user_db.update_import_block(
+            self.current_block_id,
+            status="manual",
+            ai_attempts=block["ai_attempts"],
+            crop_path=block["crop_path"],
+        )
+        state = (
+            "review"
+            if self.user_db.book_import_complete(self.book["id"])
+            else "incomplete"
+        )
+        self.user_db.set_import_state(self.book["id"], state)
+        self.book["import_state"] = state
+        self._reload_review_queue()
+        current = self.list_lessons.currentItem()
+        if current is not None:
+            self._load_selected(current)
+
+    def _start_source_preview(
+        self, crop_paths: tuple[str | Path, ...] = ()
+    ) -> None:
+        if self.current_lesson is None or self.preview_worker is not None:
             return
         self.preview.setPixmap(QPixmap())
-        self.preview.setText("Đang tải ảnh nguồn…")
+        self.preview.setText("Đang tải ảnh nguồn...")
         self.preview_worker = PreviewWorker(
             self.book["file_path"],
             self.current_lesson["page_start"],
             self.current_lesson["page_end"],
+            crop_paths=crop_paths,
             dpi=125,
             parent=self,
         )
         worker = self.preview_worker
         self._preview_workers.add(worker)
-        worker.loaded.connect(lambda data, w=worker: self._on_preview_loaded(w, data))
-        worker.failed.connect(lambda error, w=worker: self._on_preview_failed(w, error))
+        worker.loaded.connect(
+            lambda data, w=worker: self._on_preview_loaded(w, data)
+        )
+        worker.failed.connect(
+            lambda error, w=worker: self._on_preview_failed(w, error)
+        )
         worker.finished.connect(lambda w=worker: self._on_preview_finished(w))
         worker.start()
+
+    def _show_row_source(self, row: int, _column: int) -> None:
+        if self.current_lesson is None:
+            return
+        crop_path = None
+        first_item = self.table.item(row, 0)
+        metadata = (
+            first_item.data(Qt.ItemDataRole.UserRole)
+            if first_item is not None
+            else None
+        )
+        if metadata and metadata.get("word_id") is not None:
+            crop_path = self.user_db.get_word_source_crop(metadata["word_id"])
+        if crop_path is None and self.current_block is not None:
+            crop_path = self.current_block.get("crop_path")
+        self._start_source_preview((crop_path,) if crop_path else ())
 
     def _on_preview_loaded(self, worker: PreviewWorker, data: bytes) -> None:
         if worker is not self.preview_worker:
@@ -885,6 +1016,7 @@ class ScreenBooks(QWidget):
         self.user_db = user_db
         self.dict_db = dict_db
         self._current_book_id: int | None = None
+        self.btn_resume_import: QPushButton | None = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -984,14 +1116,7 @@ class ScreenBooks(QWidget):
 
         for b in books:
             state = b.get("import_state")
-            if state == "review_bounds":
-                suffix = "  ·  chờ duyệt ranh giới"
-            elif state == "extracting":
-                suffix = "  ·  đang OCR"
-            elif state == "review":
-                suffix = "  ·  cần duyệt từ mới"
-            else:
-                suffix = ""
+            suffix = STATE_SUFFIX.get(state, "")
             item = QListWidgetItem(f"📖  {b['title']}{suffix}")
             item.setData(Qt.ItemDataRole.UserRole, b["id"])
             self.list_books.addItem(item)
@@ -1020,6 +1145,7 @@ class ScreenBooks(QWidget):
 
     def _hien_bai_hoc_cua_sach(self, book_id: int, book_title: str) -> None:
         self._xoa_right()
+        self.btn_resume_import = None
         book = self.user_db.get_book(book_id)
         if book is None:
             self._hien_placeholder()
@@ -1027,7 +1153,7 @@ class ScreenBooks(QWidget):
 
         h_top = QHBoxLayout()
 
-        lbl_tieu_de = QLabel(book_title)
+        lbl_tieu_de = QLabel(book.get("title") or book_title)
         lbl_tieu_de.setFont(ui_font(20, bold=True))
         lbl_tieu_de.setStyleSheet(f"color: {PALETTE['ink']};")
         h_top.addWidget(lbl_tieu_de)
@@ -1048,20 +1174,48 @@ class ScreenBooks(QWidget):
         self._right_lay.addLayout(h_top)
         self._right_lay.addWidget(_sep())
 
-        if book.get("import_state") == "review":
+        state = book.get("import_state")
+        if state in {"review_bounds", "extracting", "incomplete", "review"}:
             review_box = QFrame()
             review_box.setStyleSheet(
                 f"background: {PALETTE['warn_bg']}; border: 1px solid {PALETTE['warn']};"
             )
             review_lay = QHBoxLayout(review_box)
-            review_text = QLabel("Kết quả OCR chưa được duyệt nên chưa thể thêm vào Ôn tập.")
-            review_text.setStyleSheet(f"color: {PALETTE['warn_ink']}; border: none;")
-            review_lay.addWidget(review_text, 1)
-            btn_review = QPushButton("Duyệt kết quả")
-            btn_review.clicked.connect(
-                lambda: self._review_book(book)
+            messages = {
+                "review_bounds": "Ranh giới bài học chưa được xác nhận.",
+                "extracting": "Đang lấy từ mới; dữ liệu chưa sẵn sàng để học.",
+                "incomplete": "Một số block chưa đủ dữ liệu. Các dòng đã lưu vẫn được giữ lại.",
+                "review": "Kết quả trích xuất chưa được duyệt nên chưa thể thêm vào Ôn tập.",
+            }
+            review_text = QLabel(messages[state])
+            review_text.setWordWrap(True)
+            review_text.setStyleSheet(
+                f"color: {PALETTE['warn_ink']}; border: none;"
             )
-            review_lay.addWidget(btn_review)
+            review_lay.addWidget(review_text, 1)
+
+            if state in {"review_bounds", "incomplete"}:
+                label = (
+                    "Phân tích lại và sửa ranh giới"
+                    if state == "review_bounds"
+                    else "Tiếp tục lấy phần còn thiếu"
+                )
+                self.btn_resume_import = QPushButton(label)
+                self.btn_resume_import.clicked.connect(
+                    lambda _checked=False, b=book: self._resume_book_import(b)
+                )
+                review_lay.addWidget(self.btn_resume_import)
+
+            if state in {"incomplete", "review"}:
+                btn_review = QPushButton(
+                    "Duyệt phần đã có"
+                    if state == "incomplete"
+                    else "Duyệt kết quả"
+                )
+                btn_review.clicked.connect(
+                    lambda _checked=False, b=book: self._review_book(b)
+                )
+                review_lay.addWidget(btn_review)
             self._right_lay.addWidget(review_box)
 
         lessons = self.user_db.get_lessons(book_id)
@@ -1248,6 +1402,17 @@ class ScreenBooks(QWidget):
                         self.list_books.setCurrentItem(item)
                         self._on_book_selected(item)
                         break
+
+    def _resume_book_import(self, book: dict) -> None:
+        if self.btn_resume_import is not None:
+            self.btn_resume_import.setEnabled(False)
+        self._luu_api_key()
+        dialog = DialogImport(self.user_db, self.dict_db, self)
+        dialog.txt_api.setText(self.txt_api_key.text().strip())
+        dialog.resume_book(book)
+        dialog.exec()
+        self.load_books()
+        self._hien_bai_hoc_cua_sach(book["id"], book["title"])
 
     def _review_book(self, book: dict) -> None:
         dialog = DialogReviewBook(

@@ -11,7 +11,8 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QThread, Qt, Signal
+from PySide6.QtGui import QImage, QPainter
 
 from hanzi_app.adapter.aiclient import AiClient
 from hanzi_app.adapter.pdfsource import PdfSource
@@ -503,8 +504,54 @@ class VisionRepairWorker(QThread):
                 thread_dict.close()
 
 
+def _load_saved_crop_preview(crop_paths: tuple[str | Path, ...]) -> bytes:
+    paths = [Path(path) for path in crop_paths if path]
+    if not paths:
+        raise ValueError("Không có crop đã lưu")
+
+    if len(paths) == 1:
+        return paths[0].read_bytes()
+
+    images: list[QImage] = []
+    for path in paths:
+        image = QImage(str(path))
+        if image.isNull():
+            raise ValueError(f"Không mở được crop: {path}")
+        images.append(image)
+
+    max_width = min(1200, max(image.width() for image in images))
+    scaled = [
+        image.scaledToWidth(
+            min(image.width(), max_width),
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        for image in images
+    ]
+    canvas = QImage(
+        max(image.width() for image in scaled),
+        sum(image.height() for image in scaled),
+        QImage.Format.Format_RGB32,
+    )
+    canvas.fill(0xFFFFFFFF)
+    painter = QPainter(canvas)
+    try:
+        top = 0
+        for image in scaled:
+            painter.drawImage(0, top, image)
+            top += image.height()
+    finally:
+        painter.end()
+
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not canvas.save(buffer, "PNG"):
+        raise ValueError("Không ghép được các crop đã lưu")
+    return bytes(data)
+
+
 class PreviewWorker(QThread):
-    """Kết xuất ảnh nguồn ở luồng nền để thao tác duyệt không khóa giao diện."""
+    """Render a persisted crop, falling back to the legacy PDF preview."""
 
     loaded = Signal(bytes)
     failed = Signal(str)
@@ -512,8 +559,9 @@ class PreviewWorker(QThread):
     def __init__(
         self,
         pdf_path: str | Path,
-        page_start: int,
-        page_end: int,
+        page_start: int | None = None,
+        page_end: int | None = None,
+        crop_paths: tuple[str | Path, ...] = (),
         dpi: int = 125,
         parent=None,
     ) -> None:
@@ -521,21 +569,25 @@ class PreviewWorker(QThread):
         self.pdf_path = pdf_path
         self.page_start = page_start
         self.page_end = page_end
+        self.crop_paths = tuple(crop_paths)
         self.dpi = dpi
 
     def run(self) -> None:
         try:
-            self.loaded.emit(
-                render_vocab_table_preview(
+            if self.crop_paths:
+                preview = _load_saved_crop_preview(self.crop_paths)
+            else:
+                if self.page_start is None or self.page_end is None:
+                    raise ValueError("Thiếu ranh giới trang cho preview cũ")
+                preview = render_vocab_table_preview(
                     self.pdf_path,
                     self.page_start,
                     self.page_end,
                     dpi=self.dpi,
                 )
-            )
+            self.loaded.emit(preview)
         except Exception as err:
             self.failed.emit(str(err))
-
 
 def render_page_preview(
     pdf_path: str | Path,
