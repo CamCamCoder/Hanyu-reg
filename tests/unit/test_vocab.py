@@ -483,3 +483,69 @@ def test_extract_blocks_crops_to_manifest_and_attaches_source_block():
     ]
     assert result.coverage[0].passed is True
     assert result.blocks[0].status == "local_ok"
+
+
+def test_shifted_four_columns_without_recognized_headers_are_inferred():
+    spans = [
+        _span("Index", 250, 50, 60),
+        _span("Term", 430, 50, 70),
+        _span("Romanisation", 700, 50, 110),
+        _span("Definition", 900, 50, 90),
+        _span("1", 250, 140, 20),
+        _span("你好", 430, 140, 50),
+        _span("nǐhǎo", 700, 140, 70),
+        _span("xin chào", 900, 140, 90),
+        _span("2", 250, 180, 20),
+        _span("老师", 430, 180, 50),
+        _span("lǎoshī", 700, 180, 70),
+        _span("giáo viên", 900, 180, 100),
+        _span("page", 1080, 20, 40),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [(row.order_no, row.word) for row in rows] == [
+        (1, "你好"),
+        (2, "老师"),
+    ]
+    assert [row.pinyin_src for row in rows] == ["nǐhǎo", "lǎoshī"]
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+
+
+def test_two_columns_without_headers_keep_hanzi_as_only_required_field():
+    spans = [
+        _span("你好", 360, 140, 50),
+        _span("xin chào", 760, 140, 90),
+        _span("老师", 360, 180, 50),
+        _span("giáo viên", 760, 180, 100),
+        _span("page", 1080, 20, 40),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [row.word for row in rows] == ["你好", "老师"]
+    assert all(row.pinyin_src is None for row in rows)
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+
+
+def test_extract_blocks_reports_raw_exact_duplicates_before_dedup(monkeypatch):
+    block = VocabBlock(
+        42, 4, 1, 0, (0, 40, 260, 130), "crop.png", 1, 1, 1
+    )
+    duplicate = _block_row("你好", 1, 42, pinyin="nǐhǎo")
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor,
+        "extract_table_spans",
+        lambda _spans, source_page: [duplicate, duplicate],
+    )
+    pdf = MagicMock()
+    pdf.spans.return_value = [_span("你好", 80, 100)]
+    pdf.ocr_spans.return_value = []
+
+    result = extractor.extract_blocks(pdf, [block])
+
+    assert len(result.rows) == 1
+    assert result.complete is False
+    assert "abnormal_exact_duplicates" in result.coverage[0].issues
+    assert result.blocks[0].status == "incomplete"

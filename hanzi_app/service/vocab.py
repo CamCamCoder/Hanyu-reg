@@ -790,6 +790,135 @@ class VocabExtractor:
                 ))
             return rows
 
+        body_lines = _line_groups(body)
+        tolerance = max(12.0, width * 0.02)
+        clusters: list[list[TextSpan]] = []
+        for span in sorted(body, key=lambda item: item.bbox[0]):
+            if not clusters:
+                clusters.append([span])
+                continue
+            center = statistics.median(
+                item.bbox[0] for item in clusters[-1]
+            )
+            if abs(span.bbox[0] - center) <= tolerance:
+                clusters[-1].append(span)
+            else:
+                clusters.append([span])
+        repeated = [
+            cluster
+            for cluster in clusters
+            if len({
+                round((span.bbox[1] + span.bbox[3]) / 2)
+                for span in cluster
+            }) >= 2
+        ]
+        if 2 <= len(repeated) <= 7:
+            centers = [
+                statistics.median(span.bbox[0] for span in cluster)
+                for cluster in repeated
+            ]
+            cjk_counts = [
+                sum(
+                    bool(RE_CJK_ONLY.fullmatch(span.text.strip()))
+                    for span in cluster
+                )
+                for cluster in repeated
+            ]
+            word_column = max(
+                range(len(repeated)), key=lambda index: cjk_counts[index]
+            )
+            if cjk_counts[word_column]:
+                digit_counts = [
+                    sum(
+                        bool(re.fullmatch(r"\d{1,3}", span.text.strip()))
+                        for span in cluster
+                    )
+                    for cluster in repeated
+                ]
+                order_column = (
+                    max(
+                        range(len(repeated)),
+                        key=lambda index: digit_counts[index],
+                    )
+                    if max(digit_counts, default=0)
+                    else None
+                )
+                pinyin_scores = [
+                    sum(_pinyin_evidence_strength(span.text) for span in cluster)
+                    if index not in {word_column, order_column}
+                    else 0
+                    for index, cluster in enumerate(repeated)
+                ]
+                pinyin_column = (
+                    max(
+                        range(len(repeated)),
+                        key=lambda index: pinyin_scores[index],
+                    )
+                    if len(repeated) >= 3 and max(pinyin_scores, default=0)
+                    else None
+                )
+                remaining = [
+                    index
+                    for index in range(len(repeated))
+                    if index not in {
+                        word_column,
+                        order_column,
+                        pinyin_column,
+                    }
+                    and centers[index] > centers[word_column]
+                ]
+                meaning_column = remaining[-1] if remaining else None
+                inferred_rows: list[VocabRow] = []
+                for line in body_lines:
+                    cells: list[list[TextSpan]] = [
+                        [] for _center in centers
+                    ]
+                    for span in line:
+                        column = min(
+                            range(len(centers)),
+                            key=lambda index: abs(
+                                span.bbox[0] - centers[index]
+                            ),
+                        )
+                        cells[column].append(span)
+                    word = "".join(
+                        ch
+                        for span in sorted(
+                            cells[word_column],
+                            key=lambda item: item.bbox[0],
+                        )
+                        for ch in span.text
+                        if RE_CJK_ONLY.match(ch)
+                    )
+                    if not word:
+                        continue
+                    raw_order = (
+                        self._join_cell(cells[order_column])
+                        if order_column is not None
+                        else None
+                    ) or ""
+                    match = re.search(r"\d+", raw_order)
+                    pinyin = (
+                        self._join_cell(cells[pinyin_column])
+                        if pinyin_column is not None
+                        else None
+                    )
+                    inferred_rows.append(VocabRow(
+                        int(match.group()) if match else len(inferred_rows) + 1,
+                        word,
+                        pinyin,
+                        None,
+                        self._join_cell(cells[meaning_column])
+                        if meaning_column is not None
+                        else None,
+                        source_page,
+                        "regex",
+                        pinyin is None,
+                        "không đọc được pinyin" if pinyin is None else None,
+                    ))
+                if inferred_rows:
+                    return inferred_rows
+
         lines: list[list[TextSpan]] = []
         for span in sorted(body, key=lambda s: ((s.bbox[1] + s.bbox[3]) / 2, s.bbox[0])):
             cy = (span.bbox[1] + span.bbox[3]) / 2
@@ -950,7 +1079,14 @@ class VocabExtractor:
         """Reject a non-empty block when its row evidence is still incomplete."""
         issues: list[str] = []
         keys = [self._row_key(row) for row in final_rows]
-        if len(keys) != len(set(keys)):
+        duplicate_in_source = any(
+            len(source_keys) != len(set(source_keys))
+            for source_keys in (
+                [self._row_key(row) for row in local_rows],
+                [self._row_key(row) for row in ai_rows],
+            )
+        )
+        if duplicate_in_source or len(keys) != len(set(keys)):
             issues.append("abnormal_exact_duplicates")
         if not final_rows:
             issues.append("zero_rows")
