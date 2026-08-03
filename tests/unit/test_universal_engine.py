@@ -31,6 +31,70 @@ from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
 
 
+def test_generic_import_never_accepts_sparse_lesson_sequence():
+    numbers = (1, 2, 3, 4, 8, 12, 13, 14)
+    boundaries = [
+        LessonBoundary(
+            number,
+            f"Lesson {number}",
+            index * 10,
+            index * 10 + 9,
+            0.6,
+            "lesson",
+        )
+        for index, number in enumerate(numbers)
+    ]
+
+    report = Splitter().validate(boundaries, (), total_pages=144)
+
+    assert report.valid is False
+    assert report.missing_lesson_nos == (5, 6, 7, 9, 10, 11)
+
+
+def test_generic_multi_block_book_is_complete_only_after_every_block(monkeypatch):
+    row_counts = (5, 4, 6, 3, 2, 7)
+    blocks = [
+        VocabBlock(
+            index,
+            1,
+            index,
+            index,
+            (0, 0, 100, 200),
+            f"block-{index}.png",
+            count,
+            1,
+            count,
+        )
+        for index, count in enumerate(row_counts, start=1)
+    ]
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor,
+        "_extract_local_block",
+        lambda _pdf, block: [
+            VocabRow(
+                order_no=order,
+                word=f"词{block.id}-{order}",
+                pinyin_src="cí",
+                pos=None,
+                hanviet_src=None,
+                meaning_src=None,
+                source_page=block.page_index + 1,
+                extract_by="regex",
+                needs_review=False,
+                review_reason=None,
+                source_block_id=block.id,
+            )
+            for order in range(1, block.expected_rows + 1)
+        ],
+    )
+
+    result = extractor.extract_blocks(MagicMock(), blocks)
+
+    assert result.complete is True
+    assert sum(coverage.final_rows for coverage in result.coverage) == 27
+
+
 def test_parse_cn_num_composite():
     """Kiểm tra giải mã chữ số Hán tự phức hợp (như 十一 = 11, 二十 = 20)."""
     assert _parse_cn_num("1") == 1

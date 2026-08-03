@@ -38,10 +38,9 @@ cột Trạng thái rồi mới sang phiên sau.
 | B7j | sửa locator preview Bài 20 | nhận tiêu đề `生词` bị tách thành nhiều span ở đầu trang, không bắt buộc hậu tố `表` | xong; +1 test, tổng 219 xanh 1 skip, 2 golden xanh; QA dialog thật Bài 20 hiển thị pixmap sau 12,65 giây, không khóa UI |
 | B7k | chặn preview cũ ghi đè bài mới | vô hiệu hóa worker khi chuyển bài, chỉ worker mới nhất được cập nhật preview, giữ và dọn các thread cũ an toàn | xong; +1 test, tổng 220 xanh 1 skip, 2 golden xanh |
 | B7l | hàng đợi duyệt từ cần xác nhận | bảng tổng hợp theo bài/trang, lọc, tìm kiếm, sửa và xác nhận chọn lọc nguyên tử, đồng bộ hai tab, preview nền tuần tự đúng bài, nút hoàn tất riêng | xong; +13 test, tổng 233 xanh 3 skip; QA Boya thật còn 16 dòng thuộc 13 bài, không ô tích sẵn, gọi preview trả sau 0,22 ms và ảnh hiện sau 6,32 giây |
+| B7m | Universal Evidence Fusion Import | evidence fusion tổng quát, bảng 2–7 cột, coverage theo block, checkpoint/resume/429, preview crop đã lưu và xác nhận block thủ công | xong phần tự động; tổng unit 307 xanh 1 skip; toàn suite an toàn 307 xanh 3 skip; 2 golden live-data được khóa bằng RUN_LIVE_GOLDEN=1 và chưa chạy theo yêu cầu không chạm PDF/SQLite thật |
 
-**Phiên tiếp theo phải làm: chờ người dùng nghiệm thu hàng đợi 16 dòng cần xác
-nhận trên app thật; sau đó mới tiếp tục xử lý crop bảng từ mới nhiều khối đã được
-khảo sát ở Bài 3, 20, 23 và 28, không tự chạy lại Vision cho toàn sách.**
+**Phiên tiếp theo phải làm: nghiệm thu thủ công trên một PDF không phải Boya, gồm duyệt ranh giới, kiểm tra trạng thái incomplete, tiếp tục phần còn thiếu và preview crop nguồn đã lưu. Chỉ khi người dùng cho phép mới chạy golden Boya hoặc discovery HSK đọc-only; không ghi SQLite thật và không chạy lại Vision toàn sách.**
 
 Phiên 08a thêm đúng ba phương thức: `UserDb.undo_review`, `DictDb.candidate_meanings`
 và `DictDb.candidate_hanviet`, không đổi lược đồ, không thêm bậc migration. Hoàn tác
