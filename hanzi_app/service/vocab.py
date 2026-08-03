@@ -708,24 +708,6 @@ class VocabExtractor:
             return []
 
         width = max((s.bbox[2] for s in spans), default=0.0)
-        header = next((s for s in spans if s.text.strip().upper() == "STT"), None)
-        header_y = header.bbox[1] if header else 80.0
-        stop_candidates = [
-            s.bbox[1]
-            for s in spans
-            if s.bbox[1] > header_y + 80
-            and s.bbox[0] > width * 0.72
-            and s.text.strip().lower() in {"proper", "language", "note", "exercise", "exercises"}
-        ]
-        table_end = min(stop_candidates) if stop_candidates else float("inf")
-        body = [
-            s
-            for s in spans
-            if header_y + 20 < s.bbox[1] < table_end - 10
-        ]
-        if width <= 0 or not body:
-            return []
-
         aliases = {
             "order": {"stt", "no.", "序号", "编号"},
             "word": {"chữhán", "hanzi", "汉字", "chữtrung"},
@@ -735,17 +717,54 @@ class VocabExtractor:
             "meaning_en": {"english", "nghĩaanh", "英语"},
             "meaning_vi": {"nghĩaviệt", "nghĩa", "vietnamese", "越南语"},
         }
-        header_roles: dict[str, float] = {}
-        for span in spans:
-            if abs(span.bbox[1] - header_y) > 16:
-                continue
+
+        def header_role(span: TextSpan) -> str | None:
             label = re.sub(r"\s+", "", span.text.strip().lower())
-            for role, labels in aliases.items():
-                if label in labels:
-                    header_roles[role] = (
-                        span.bbox[0] + span.bbox[2]
-                    ) / 2
-                    break
+            return next(
+                (
+                    role
+                    for role, labels in aliases.items()
+                    if label in labels
+                ),
+                None,
+            )
+
+        lines = _line_groups(spans)
+        header_line = max(
+            lines,
+            key=lambda line: sum(header_role(span) is not None for span in line),
+            default=[],
+        )
+        if not any(header_role(span) is not None for span in header_line):
+            header_line = []
+        header_roles = {
+            role: (span.bbox[0] + span.bbox[2]) / 2
+            for span in header_line
+            if (role := header_role(span)) is not None
+        }
+        table_end = float("inf")
+        if header_line:
+            header_y = min(span.bbox[1] for span in header_line)
+            stop_candidates = [
+                span.bbox[1]
+                for span in spans
+                if span.bbox[1] > header_y + 80
+                and span.bbox[0] > width * 0.72
+                and span.text.strip().lower()
+                in {"proper", "language", "note", "exercise", "exercises"}
+            ]
+            if stop_candidates:
+                table_end = min(stop_candidates) - 10
+        body_lines = [
+            line
+            for line in lines
+            if line is not header_line
+            and min(span.bbox[1] for span in line) < table_end
+            and any(RE_CJK_WORD.search(span.text) for span in line)
+        ]
+        body = [span for line in body_lines for span in line]
+        if width <= 0 or not body:
+            return []
 
         if "word" in header_roles and len(header_roles) >= 2:
             columns = sorted(header_roles.items(), key=lambda item: item[1])
@@ -755,7 +774,7 @@ class VocabExtractor:
             ]
             roles = [role for role, _center in columns]
             rows: list[VocabRow] = []
-            for line in _line_groups(body):
+            for line in body_lines:
                 cells = {role: [] for role in roles}
                 for span in line:
                     center = (span.bbox[0] + span.bbox[2]) / 2
@@ -790,7 +809,6 @@ class VocabExtractor:
                 ))
             return rows
 
-        body_lines = _line_groups(body)
         tolerance = max(12.0, width * 0.02)
         clusters: list[list[TextSpan]] = []
         for span in sorted(body, key=lambda item: item.bbox[0]):
@@ -828,6 +846,7 @@ class VocabExtractor:
                 range(len(repeated)), key=lambda index: cjk_counts[index]
             )
             if cjk_counts[word_column]:
+                required_rows = ceil(len(body_lines) * 0.6)
                 digit_counts = [
                     sum(
                         bool(re.fullmatch(r"\d{1,3}", span.text.strip()))
@@ -835,27 +854,60 @@ class VocabExtractor:
                     )
                     for cluster in repeated
                 ]
-                order_column = (
-                    max(
-                        range(len(repeated)),
-                        key=lambda index: digit_counts[index],
-                    )
-                    if max(digit_counts, default=0)
-                    else None
-                )
-                pinyin_scores = [
-                    sum(_pinyin_evidence_strength(span.text) for span in cluster)
-                    if index not in {word_column, order_column}
-                    else 0
-                    for index, cluster in enumerate(repeated)
+                order_candidates = [
+                    index
+                    for index, count in enumerate(digit_counts)
+                    if index != word_column and count >= required_rows
                 ]
-                pinyin_column = (
-                    max(
-                        range(len(repeated)),
-                        key=lambda index: pinyin_scores[index],
-                    )
-                    if len(repeated) >= 3 and max(pinyin_scores, default=0)
-                    else None
+                order_column = min(
+                    order_candidates,
+                    key=lambda index: (-digit_counts[index], centers[index]),
+                    default=None,
+                )
+                pos_counts = [
+                    sum(bool(RE_POS.fullmatch(span.text.strip())) for span in cluster)
+                    for cluster in repeated
+                ]
+                pos_candidates = [
+                    index
+                    for index, count in enumerate(pos_counts)
+                    if index not in {word_column, order_column}
+                    and count >= required_rows
+                ]
+                pos_column = min(
+                    pos_candidates,
+                    key=lambda index: (-pos_counts[index], centers[index]),
+                    default=None,
+                )
+
+                def is_unambiguous_pinyin(value: str) -> bool:
+                    if not _pinyin_evidence_strength(value):
+                        return False
+                    lower = value.lower()
+                    if any(
+                        character in "üāǎēěīǐōǒūǔǖǘǚǜ"
+                        for character in lower
+                    ) or "u:" in lower or any(
+                        character.isdigit() for character in lower
+                    ):
+                        return True
+                    return " " not in lower and _pinyin_evidence_strength(value) == 1
+
+                pinyin_counts = [
+                    sum(is_unambiguous_pinyin(span.text) for span in cluster)
+                    for cluster in repeated
+                ]
+                pinyin_candidates = [
+                    index
+                    for index, count in enumerate(pinyin_counts)
+                    if index not in {word_column, order_column, pos_column}
+                    and count >= required_rows
+                    and count == len(repeated[index])
+                ]
+                pinyin_column = min(
+                    pinyin_candidates,
+                    key=lambda index: (-pinyin_counts[index], centers[index]),
+                    default=None,
                 )
                 remaining = [
                     index
@@ -863,10 +915,12 @@ class VocabExtractor:
                     if index not in {
                         word_column,
                         order_column,
+                        pos_column,
                         pinyin_column,
                     }
                     and centers[index] > centers[word_column]
                 ]
+                hanviet_column = remaining[0] if len(remaining) >= 2 else None
                 meaning_column = remaining[-1] if remaining else None
                 inferred_rows: list[VocabRow] = []
                 for line in body_lines:
@@ -903,11 +957,15 @@ class VocabExtractor:
                         if pinyin_column is not None
                         else None
                     )
+                    if pinyin is not None and not is_unambiguous_pinyin(pinyin):
+                        pinyin = None
                     inferred_rows.append(VocabRow(
                         int(match.group()) if match else len(inferred_rows) + 1,
                         word,
                         pinyin,
-                        None,
+                        self._join_cell(cells[pos_column])
+                        if pos_column is not None
+                        else None,
                         self._join_cell(cells[meaning_column])
                         if meaning_column is not None
                         else None,
@@ -915,10 +973,12 @@ class VocabExtractor:
                         "regex",
                         pinyin is None,
                         "không đọc được pinyin" if pinyin is None else None,
+                        self._join_cell(cells[hanviet_column])
+                        if hanviet_column is not None
+                        else None,
                     ))
                 if inferred_rows:
                     return inferred_rows
-
         lines: list[list[TextSpan]] = []
         for span in sorted(body, key=lambda s: ((s.bbox[1] + s.bbox[3]) / 2, s.bbox[0])):
             cy = (span.bbox[1] + span.bbox[3]) / 2

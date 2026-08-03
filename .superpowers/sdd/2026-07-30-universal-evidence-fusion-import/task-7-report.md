@@ -71,3 +71,38 @@ Verification:
 - `test_vocab.py` plus `test_universal_engine.py`: 53 passed.
 - Full unit suite: 291 passed, 1 skipped.
 - All pytest runs used a `--basetemp` directory inside the worktree.
+## Fix Round 2
+
+### Root Cause (before implementation)
+
+The inferred parser began its body at the fixed fallback `header_y = 80`, so
+headerless tables whose rows appeared above that coordinate produced no body
+spans at all. For rows that did reach inference, the role assignment only kept
+order, Hanzi, pinyin, and the final remaining column: it hard-coded `pos=None`
+and never populated `hanviet_src`. It also chose the pinyin column by the sum of
+per-cell pinyin evidence. Vietnamese meanings such as `xin chào` can be
+segmentable as pinyin syllables, so a meaning-only column could win that score
+and leave no remaining column to preserve the meaning.
+
+### RED
+
+Command:
+
+`pytest tests/unit/test_vocab.py -k "headerless_two_column_table_does_not_depend_on_a_fixed_header_y or headerless_six_columns_preserve_pos_and_hanviet or headerless_meaning_column_is_not_misclassified_as_pinyin" -v --basetemp .pytest-task7-round2-red`
+
+Result: 3 failed, 26 deselected. The failures reproduced the fixed-header-Y
+empty result, omitted `pos` and `hanviet_src`, and Vietnamese meanings stored as
+`pinyin_src` with `meaning_src=None`.
+### GREEN
+
+- Six focused Task 7 regressions: 6 passed.
+- `test_vocab.py` plus `test_universal_engine.py`: 56 passed.
+- Full unit suite: 294 passed, 1 skipped.
+- All runs used a worktree-local `--basetemp` directory.
+### Final 7-column regression
+
+- RED: English meanings were returned as `hanviet_src`.
+- GREEN: the first auxiliary column is retained as Hán-Việt when both English
+  and Vietnamese meaning columns are present.
+- Focused regression: 1 passed.
+- Final unit suite after the last code change: 295 passed, 1 skipped.

@@ -549,3 +549,80 @@ def test_extract_blocks_reports_raw_exact_duplicates_before_dedup(monkeypatch):
     assert result.complete is False
     assert "abnormal_exact_duplicates" in result.coverage[0].issues
     assert result.blocks[0].status == "incomplete"
+
+
+def test_headerless_two_column_table_does_not_depend_on_a_fixed_header_y():
+    spans = [
+        _span("你好", 120, 40),
+        _span("xin chào", 420, 40, 90),
+        _span("老师", 120, 70),
+        _span("giáo viên", 420, 70, 100),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [row.word for row in rows] == ["你好", "老师"]
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+
+
+def test_headerless_six_columns_preserve_pos_and_hanviet():
+    spans = [
+        _span("1", 100, 140, 20),
+        _span("你好", 200, 140),
+        _span("nǐhǎo", 340, 140, 70),
+        _span("n.", 460, 140, 30),
+        _span("nhĩ hảo", 560, 140, 70),
+        _span("xin chào", 700, 140, 90),
+        _span("2", 100, 180, 20),
+        _span("老师", 200, 180),
+        _span("lǎoshī", 340, 180, 70),
+        _span("n.", 460, 180, 30),
+        _span("lão sư", 560, 180, 70),
+        _span("giáo viên", 700, 180, 100),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [row.pos for row in rows] == ["n.", "n."]
+    assert [row.hanviet_src for row in rows] == ["nhĩ hảo", "lão sư"]
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+
+
+def test_headerless_meaning_column_is_not_misclassified_as_pinyin():
+    spans = [
+        _span("1", 100, 140, 20),
+        _span("你好", 200, 140),
+        _span("xin chào", 420, 140, 90),
+        _span("2", 100, 180, 20),
+        _span("老师", 200, 180),
+        _span("giáo viên", 420, 180, 100),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [row.pinyin_src for row in rows] == [None, None]
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+
+
+def test_headerless_seven_columns_keep_first_auxiliary_as_hanviet():
+    spans = [
+        _span("1", 80, 140, 20),
+        _span("你好", 180, 140),
+        _span("nǐhǎo", 300, 140, 70),
+        _span("n.", 420, 140, 30),
+        _span("nhĩ hảo", 500, 140, 70),
+        _span("hello", 620, 140, 60),
+        _span("xin chào", 740, 140, 90),
+        _span("2", 80, 180, 20),
+        _span("老师", 180, 180),
+        _span("lǎoshī", 300, 180, 70),
+        _span("n.", 420, 180, 30),
+        _span("lão sư", 500, 180, 70),
+        _span("teacher", 620, 180, 70),
+        _span("giáo viên", 740, 180, 100),
+    ]
+
+    rows = VocabExtractor().extract_table_spans(spans, source_page=3)
+
+    assert [row.hanviet_src for row in rows] == ["nhĩ hảo", "lão sư"]
+    assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
