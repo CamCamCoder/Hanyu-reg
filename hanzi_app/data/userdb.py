@@ -158,7 +158,7 @@ class UserDb:
     def get_lesson_words(self, lesson_id: int) -> list[dict]:
         rows = self._conn.execute(
             "SELECT id, order_no, word, pos, pinyin_src, hanviet_src, "
-            "       meaning_src, source_page, extract_by, needs_review "
+            "       meaning_src, source_page, extract_by, needs_review, source_block_id "
             "FROM lesson_word WHERE lesson_id = ? ORDER BY order_no, id",
             (lesson_id,),
         ).fetchall()

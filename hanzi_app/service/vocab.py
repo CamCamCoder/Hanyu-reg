@@ -14,7 +14,7 @@ from itertools import product
 from math import ceil
 from typing import TYPE_CHECKING
 
-from hanzi_app.adapter.aiclient import AiRateLimitError
+from hanzi_app.adapter.aiclient import AiClientError, AiRateLimitError
 from hanzi_app.data.models import (
     BlockCoverage,
     ExtractionResult,
@@ -403,6 +403,7 @@ class VocabExtractor:
 
     def __init__(self, dict_db=None) -> None:
         self.dict_db = dict_db
+        self.lesson_ai_attempts = 0
 
     def locate_blocks(
         self, pdf: PdfSource, lesson: LessonBoundary
@@ -533,47 +534,42 @@ class VocabExtractor:
         return rows
 
     def extract_by_llm_image(
-        self, image_bytes: bytes, ai_client: AiClient, source_page: int
+        self,
+        image_bytes: bytes,
+        ai_client: AiClient,
+        source_page: int,
+        issue_context: str | None = None,
     ) -> list[VocabRow]:
-        """Sử dụng Vision AI đọc ảnh trang sách bóc tách từ vựng (kèm thử lại khi bận)."""
-        raw_list = []
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            try:
+        """Issue one Vision request; retry budgeting belongs to the orchestrator."""
+        try:
+            if issue_context is None:
                 raw_list = ai_client.extract_vocab_from_image(image_bytes)
-                if raw_list:
-                    break
-            except Exception as err:
-                last_error = err
-                if not isinstance(err, AiRateLimitError):
-                    break
-            if attempt < 3:
-                retry_after = getattr(last_error, "retry_after", None)
-                time.sleep(retry_after or 5 * attempt)
-
+            else:
+                raw_list = ai_client.extract_vocab_from_image(
+                    image_bytes, issue_context=issue_context
+                )
+        except (AiRateLimitError, AiClientError):
+            raise
+        except Exception:
+            return []
         if not raw_list:
-            if isinstance(last_error, AiRateLimitError):
-                raise last_error
-            if last_error is not None:
-                return []
             raise RuntimeError("Vision không trả về dữ liệu từ mới")
 
         rows: list[VocabRow] = []
         seen_words: set[str] = set()
         for item in raw_list:
-            w = _optional_text(item.get("word")) or ""
-            if not w or w in seen_words:
+            word = _optional_text(item.get("word")) or ""
+            if not word or word in seen_words:
                 continue
-            seen_words.add(w)
-
+            seen_words.add(word)
             rows.append(
                 VocabRow(
-                    order_no=len(rows) + 1,
-                    word=w,
+                    order_no=int(item.get("order_no") or len(rows) + 1),
+                    word=word,
                     pinyin_src=_optional_text(item.get("pinyin")),
                     pos=_optional_text(item.get("pos")),
                     meaning_src=_optional_text(
-                        item.get("meaning_vi", item.get("meaning"))
+                        item.get("meaning_vi", item.get("meaning_en", item.get("meaning")))
                     ),
                     source_page=source_page,
                     extract_by="vision",
@@ -582,6 +578,8 @@ class VocabExtractor:
                     hanviet_src=_optional_text(item.get("hanviet")),
                 )
             )
+        if not rows:
+            raise RuntimeError("Vision không trả về dữ liệu từ mới")
         return rows
 
     def extract_spans(self, spans: list[TextSpan], source_page: int) -> list[VocabRow]:
@@ -1208,78 +1206,161 @@ class VocabExtractor:
             and y0 <= (span.bbox[1] + span.bbox[3]) / 2 <= y1
         ]
 
+    def _extract_local_block(
+        self, pdf: PdfSource, block: VocabBlock
+    ) -> list[VocabRow]:
+        chinese = self._spans_in_block(
+            list(pdf.spans(block.page_index)), block
+        )
+        latin = (
+            self._spans_in_block(
+                list(pdf.ocr_spans(
+                    block.page_index, language="en-US", dpi=250
+                )),
+                block,
+            )
+            if hasattr(pdf, "ocr_spans")
+            else []
+        )
+        merged = self.merge_bilingual_spans(chinese, latin)
+        unique_spans = list({
+            (span.text, span.bbox, span.font_size, span.is_ocr): span
+            for span in merged
+        }.values())
+        return [
+            replace(row, source_block_id=block.id)
+            for row in self.extract_table_spans(
+                unique_spans, source_page=block.page_index + 1
+            )
+        ]
+
+    @staticmethod
+    def _coverage_issue(
+        report: BlockCoverage, issue: str
+    ) -> BlockCoverage:
+        return replace(
+            report,
+            issues=tuple(dict.fromkeys((*report.issues, issue))),
+            passed=False,
+        )
+
+    @staticmethod
+    def _block_issue_context(
+        block: VocabBlock, report: BlockCoverage
+    ) -> str:
+        if report.missing_orders:
+            missing = ", ".join(str(value) for value in report.missing_orders)
+            detail = f"thiếu STT {missing}"
+        else:
+            detail = ", ".join(report.issues) or "coverage chưa đạt"
+        return f"Block {block.block_no}: {detail}; chỉ chép các dòng còn thiếu"
+
     def extract_blocks(
         self,
         pdf: PdfSource,
         blocks: list[VocabBlock],
         ai_client: AiClient | None = None,
     ) -> ExtractionResult:
-        """Extract and validate each persisted vocabulary block independently."""
-        all_rows: list[VocabRow] = []
+        """Extract blocks with a three-request budget shared by one lesson."""
+        local_rows: list[list[VocabRow]] = []
+        ai_rows: list[list[VocabRow]] = []
+        final_rows: list[list[VocabRow]] = []
         reports: list[BlockCoverage] = []
-        updated: list[VocabBlock] = []
-        attempts = 0
+        attempt_counts = [0 for _block in blocks]
+
         for block in blocks:
-            chinese = self._spans_in_block(
-                list(pdf.spans(block.page_index)), block
-            )
-            latin = (
-                self._spans_in_block(
-                    list(pdf.ocr_spans(
-                        block.page_index, language="en-US", dpi=250
-                    )),
-                    block,
+            local = self._extract_local_block(pdf, block)
+            final = self.merge_block_rows(local, [])
+            report = self.validate_block_coverage(block, local, [], final)
+            local_rows.append(local)
+            ai_rows.append([])
+            final_rows.append(final)
+            reports.append(report)
+
+        prior_attempts = max(
+            self.lesson_ai_attempts,
+            sum(block.ai_attempts for block in blocks),
+        )
+        remaining = max(0, 3 - prior_attempts)
+        queue = [
+            index
+            for index, report in enumerate(reports)
+            if not report.passed
+        ]
+        attempts = 0
+        configured = ai_client is not None and ai_client.is_configured()
+
+        while configured and queue and attempts < remaining:
+            index = queue.pop(0)
+            block = blocks[index]
+            image = render_block_crop(pdf, block)
+            if not image:
+                reports[index] = self._coverage_issue(
+                    reports[index], "crop_empty"
                 )
-                if hasattr(pdf, "ocr_spans")
-                else []
-            )
-            merged = self.merge_bilingual_spans(chinese, latin)
-            unique_spans = list({
-                (span.text, span.bbox, span.font_size, span.is_ocr): span
-                for span in merged
-            }.values())
-            local_rows = [
-                replace(row, source_block_id=block.id)
-                for row in self.extract_table_spans(
-                    unique_spans, source_page=block.page_index + 1
-                )
-            ]
-            final_rows = self.merge_block_rows(local_rows, [])
-            report = self.validate_block_coverage(
-                block, local_rows, [], final_rows
-            )
-            ai_rows: list[VocabRow] = []
-            if (
-                not report.passed
-                and ai_client is not None
-                and ai_client.is_configured()
-            ):
-                image = render_block_crop(pdf, block)
-                if image:
-                    attempts += 1
-                    ai_rows = [
-                        replace(row, source_block_id=block.id)
-                        for row in self.extract_by_llm_image(
-                            image, ai_client, block.page_index + 1
-                        )
-                    ]
-                    final_rows = self.merge_block_rows(local_rows, ai_rows)
-                    report = self.validate_block_coverage(
-                        block, local_rows, ai_rows, final_rows
+                continue
+
+            attempts += 1
+            attempt_counts[index] += 1
+            context = self._block_issue_context(block, reports[index])
+            try:
+                extracted = [
+                    replace(row, source_block_id=block.id)
+                    for row in self.extract_by_llm_image(
+                        image,
+                        ai_client,
+                        block.page_index + 1,
+                        issue_context=context,
                     )
+                ]
+            except AiRateLimitError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "rate_limited"
+                )
+                break
+            except AiClientError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "ai_error"
+                )
+                break
+            except RuntimeError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "ai_empty"
+                )
+                if attempts < remaining:
+                    queue.append(index)
+                continue
+
+            ai_rows[index].extend(extracted)
+            final_rows[index] = self.merge_block_rows(
+                local_rows[index], ai_rows[index]
+            )
+            reports[index] = self.validate_block_coverage(
+                block,
+                local_rows[index],
+                ai_rows[index],
+                final_rows[index],
+            )
+            if not reports[index].passed and attempts < remaining:
+                queue.append(index)
+
+        updated: list[VocabBlock] = []
+        all_rows: list[VocabRow] = []
+        for index, block in enumerate(blocks):
+            report = reports[index]
             status = (
-                "ai_ok" if report.passed and ai_rows
+                "ai_ok" if report.passed and ai_rows[index]
                 else "local_ok" if report.passed
                 else "incomplete"
             )
-            all_rows.extend(final_rows)
-            reports.append(report)
             updated.append(replace(
                 block,
                 status=status,
-                ai_attempts=block.ai_attempts + (1 if ai_rows else 0),
+                ai_attempts=block.ai_attempts + attempt_counts[index],
             ))
+            all_rows.extend(final_rows[index])
 
+        self.lesson_ai_attempts = prior_attempts + attempts
         return ExtractionResult(
             tuple(self.merge_block_rows(all_rows, [])),
             tuple(reports),

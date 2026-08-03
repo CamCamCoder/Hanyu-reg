@@ -125,13 +125,20 @@ class AiClient:
         response_text = self._call_llm_text(prompt)
         return self._parse_json_list(response_text)
 
-    def extract_vocab_from_image(self, image_bytes: bytes) -> list[dict[str, Any]]:
-        """Sử dụng Vision AI đọc trực tiếp ảnh trang sách quét để bóc tách từ vựng."""
+    def extract_vocab_from_image(
+        self,
+        image_bytes: bytes,
+        issue_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read one vocabulary crop with optional validator guidance."""
         if not self.api_key or not image_bytes:
             return []
-        
+
+        prompt = PROMPT_EXTRACT_VOCAB
+        if issue_context:
+            prompt += f"\n\nValidator context:\n{issue_context}"
         b64_data = base64.b64encode(image_bytes).decode("utf-8")
-        response_text = self._call_llm_vision(PROMPT_EXTRACT_VOCAB, b64_data)
+        response_text = self._call_llm_vision(prompt, b64_data)
         return self._parse_json_list(response_text)
 
     def _call_llm_text(self, prompt: str) -> str:

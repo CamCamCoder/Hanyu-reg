@@ -1,11 +1,14 @@
 """Unit test kiểm thử Bộ Xử Lý Tổng Quát 2 Lớp (Universal 2-Layer Engine)."""
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 
+from hanzi_app.adapter.aiclient import AiRateLimitError
 from hanzi_app.data.models import (
+    BlockCoverage,
     BoundaryIssue,
     BoundaryEvidence,
     BoundaryReport,
@@ -13,6 +16,8 @@ from hanzi_app.data.models import (
     PageEvidence,
     PageSummary,
     SplitResult,
+    ExtractionResult,
+    VocabBlock,
     VocabRow,
 )
 from hanzi_app.data.userdb import UserDb
@@ -938,3 +943,238 @@ def test_crop_writer_cleans_temp_and_preserves_previous_crop_on_replace_failure(
 
     assert target.read_bytes() == b"previous"
     assert not list(tmp_path.rglob("*.tmp"))
+
+def test_vocab_ai_budget_is_three_per_lesson(monkeypatch):
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    blocks = [
+        VocabBlock(
+            i + 1, 2, i + 1, i, (0, 0, 100, 200),
+            f"block-{i + 1}.png", 2, i * 2 + 1, i * 2 + 2,
+        )
+        for i in range(4)
+    ]
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.return_value = []
+
+    result = extractor.extract_blocks(pdf, blocks, ai_client=client)
+
+    assert result.complete is False
+    assert result.ai_attempts == 3
+    assert client.extract_vocab_from_image.call_count == 3
+
+
+def test_429_result_carries_consumed_attempt(monkeypatch):
+    block = VocabBlock(
+        9, 2, 1, 4, (0, 0, 100, 200),
+        "block.png", 2, 1, 2,
+    )
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.side_effect = AiRateLimitError()
+
+    result = extractor.extract_blocks(MagicMock(), [block], client)
+
+    assert result.complete is False
+    assert result.ai_attempts == 1
+    assert result.blocks[0].ai_attempts == 1
+    assert result.blocks[0].status == "incomplete"
+    assert "rate_limited" in result.coverage[0].issues
+
+
+def test_429_keeps_completed_block_and_resume_skips_it(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Sách thử", "book.pdf", "resume-429", 20)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    blocks = db.replace_import_blocks(lesson_id, [
+        VocabBlock(
+            None, lesson_id, 1, 1, (0, 0, 100, 200),
+            "done.png", 1, 1, 1,
+        ),
+        VocabBlock(
+            None, lesson_id, 2, 3, (0, 0, 100, 200),
+            "pending.png", 2, 2, 3,
+        ),
+    ])
+    db.replace_vocab_block(
+        blocks[0]["id"],
+        [VocabRow(
+            1, "你好", "nǐhǎo", None, None, 2,
+            "regex", False, None,
+        )],
+    )
+    db.update_import_block(
+        blocks[0]["id"], status="local_ok", ai_attempts=0,
+        crop_path=blocks[0]["crop_path"],
+    )
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeExtractor:
+        def __init__(self, _dict_db):
+            pass
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            assert [block.block_no for block in pending] == [2]
+            try:
+                ai_client.extract_vocab_from_image(b"pending")
+            except AiRateLimitError:
+                updated = replace(
+                    pending[0], status="incomplete", ai_attempts=1
+                )
+                coverage = BlockCoverage(
+                    pending[0].id, 2, 0, 0, 0, (2, 3),
+                    ("rate_limited",), False,
+                )
+                return ExtractionResult(
+                    (), (coverage,), (updated,), 1, False
+                )
+            raise AssertionError("Expected rate limit")
+
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.side_effect = AiRateLimitError()
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    worker.ai_client = client
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    saved = reopened.get_import_blocks(lesson_id)
+    assert saved[0]["status"] == "local_ok"
+    assert saved[1]["ai_attempts"] == 1
+    assert reopened.get_lesson_words(lesson_id)[0]["word"] == "你好"
+    assert reopened.get_book(book_id)["import_state"] == "incomplete"
+    assert client.extract_vocab_from_image.call_count == 1
+    reopened.close()
+
+def test_resume_budget_counts_attempts_used_by_other_blocks(monkeypatch):
+    block = VocabBlock(
+        7, 2, 2, 4, (0, 0, 100, 200),
+        "pending.png", 2, 1, 2,
+    )
+    extractor = VocabExtractor()
+    extractor.lesson_ai_attempts = 2
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.return_value = []
+
+    result = extractor.extract_blocks(MagicMock(), [block], client)
+
+    assert client.extract_vocab_from_image.call_count == 1
+    assert result.ai_attempts == 1
+    assert result.blocks[0].ai_attempts == 1
+    assert result.complete is False
+
+
+def test_checkpoint_keeps_longer_existing_block_rows(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "checkpoint-short", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    record = db.replace_import_blocks(lesson_id, [
+        VocabBlock(
+            None, lesson_id, 1, 1, (0, 0, 100, 200),
+            "block.png", 2, 1, 2,
+        )
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(
+            1, "你好", "nǐhǎo", None, None, 2,
+            "regex", False, None,
+        ),
+        VocabRow(
+            2, "老师", "lǎoshī", None, None, 2,
+            "regex", False, None,
+        ),
+    ])
+    updated = VocabBlock(
+        record["id"], lesson_id, 1, 1, tuple(record["bbox"]),
+        record["crop_path"], 2, 1, 2, "incomplete", 2,
+    )
+    partial = VocabRow(
+        1, "你好", "nǐhǎo", None, None, 2,
+        "vision", True, "partial", source_block_id=record["id"],
+    )
+    coverage = BlockCoverage(
+        record["id"], 2, 0, 1, 1, (2,),
+        ("missing_orders",), False,
+    )
+
+    VocabImporterWorker._checkpoint_result(
+        db,
+        ExtractionResult(
+            (partial,), (coverage,), (updated,), 1, False
+        ),
+    )
+
+    assert [row["word"] for row in db.get_lesson_words(lesson_id)] == [
+        "你好", "老师"
+    ]
+    saved = db.get_import_blocks(lesson_id)[0]
+    assert saved["status"] == "incomplete"
+    assert saved["ai_attempts"] == 2
+    db.close()
+
+def test_load_or_create_blocks_reuses_persisted_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Sách thử", "book.pdf", "manifest-resume", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson = db.get_lessons(book_id)[0]
+    boundary = LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [
+        VocabBlock(
+            None, None, 1, 1, (10, 20, 110, 220),
+            None, 2, 1, 2,
+        )
+    ]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"png"
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    first = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+    second = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+
+    assert first == second
+    assert first[0].id is not None
+    assert Path(first[0].crop_path).read_bytes() == b"png"
+    assert extractor.locate_blocks.call_count == 1
+    assert pdf.get_page_crop_image_bytes.call_count == 1
+    db.close()

@@ -16,10 +16,14 @@ from PySide6.QtCore import QThread, Signal
 from hanzi_app.adapter.aiclient import AiClient
 from hanzi_app.adapter.pdfsource import PdfSource
 from hanzi_app.data.dictdb import DictDb
-from hanzi_app.data.models import LessonBoundary, SplitResult
+from hanzi_app.data.models import (
+    LessonBoundary,
+    SplitResult,
+    VocabBlock,
+)
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.splitter import Splitter
-from hanzi_app.service.vocab import VocabExtractor
+from hanzi_app.service.vocab import VocabExtractor, render_block_crop
 
 
 def _write_crop_atomic(
@@ -192,7 +196,7 @@ class BookImporterWorker(QThread):
 
 
 class VocabImporterWorker(QThread):
-    """Pha 2: OCR bảng từ mới sau khi ranh giới bài đã được xác nhận."""
+    """Pha 2: extract vocabulary with persistent per-block checkpoints."""
 
     progress = Signal(int, str)
     finished_import = Signal(int, str)
@@ -214,6 +218,101 @@ class VocabImporterWorker(QThread):
         self.dict_path = dict_path
         self.ai_client = AiClient(api_key=api_key)
 
+    @staticmethod
+    def _record_to_block(record: dict) -> VocabBlock:
+        return VocabBlock(
+            record["id"],
+            record["lesson_id"],
+            record["block_no"],
+            record["page_index"],
+            tuple(record["bbox"]),
+            record["crop_path"],
+            record["expected_rows"],
+            record["first_order"],
+            record["last_order"],
+            record["status"],
+            record["ai_attempts"],
+        )
+
+    def _load_or_create_blocks(
+        self,
+        db: UserDb,
+        pdf: PdfSource,
+        extractor: VocabExtractor,
+        lesson: dict,
+        boundary: LessonBoundary,
+    ) -> list[VocabBlock]:
+        records = db.get_import_blocks(lesson["id"])
+        if not records:
+            located = extractor.locate_blocks(pdf, boundary)
+            crop_root = Path(self.db_path).parent / "book_crops"
+            prepared: list[VocabBlock] = []
+            for block in located:
+                crop = render_block_crop(pdf, block)
+                crop_path = (
+                    _write_crop_atomic(
+                        crop_root,
+                        self.book_id,
+                        lesson["id"],
+                        block.block_no,
+                        crop,
+                    )
+                    if crop
+                    else None
+                )
+                prepared.append(replace(
+                    block,
+                    lesson_id=lesson["id"],
+                    crop_path=crop_path,
+                ))
+            records = db.replace_import_blocks(lesson["id"], prepared)
+        return [self._record_to_block(record) for record in records]
+
+    @staticmethod
+    def _checkpoint_result(db: UserDb, result) -> None:
+        for block in result.blocks:
+            if block.id is None or block.lesson_id is None:
+                continue
+            rows = [
+                row for row in result.rows
+                if row.source_block_id == block.id
+            ]
+            existing = [
+                row for row in db.get_lesson_words(block.lesson_id)
+                if row.get("source_block_id") == block.id
+            ]
+            if len(rows) >= len(existing):
+                db.replace_vocab_block(block.id, rows)
+            db.update_import_block(
+                block.id,
+                status=block.status,
+                ai_attempts=block.ai_attempts,
+                crop_path=block.crop_path,
+            )
+
+    @staticmethod
+    def _format_incomplete(lesson: dict, coverage) -> str:
+        items = (
+            coverage.items()
+            if isinstance(coverage, dict)
+            else enumerate(coverage, start=1)
+        )
+        for block_no, report in items:
+            if report.passed:
+                continue
+            if report.missing_orders:
+                first = report.missing_orders[0]
+                last = report.missing_orders[-1]
+                issue = f"thiếu STT {first}" if first == last else f"thiếu STT {first}-{last}"
+            elif "rate_limited" in report.issues:
+                issue = "HTTP 429"
+            elif report.issues:
+                issue = report.issues[0].replace("_", " ")
+            else:
+                issue = "coverage chưa đạt"
+            return f"Bài {lesson['index_no']} · block {block_no} · {issue}"
+        return f"Bài {lesson['index_no']} · dữ liệu chưa đầy đủ"
+
     def run(self) -> None:
         thread_db: UserDb | None = None
         thread_dict: DictDb | None = None
@@ -228,16 +327,31 @@ class VocabImporterWorker(QThread):
             thread_db.set_import_state(self.book_id, "extracting")
             extractor = VocabExtractor(thread_dict)
             mode = "Cloud AI" if self.ai_client.is_configured() else "Local Engine"
+
             with PdfSource(self.pdf_path) as pdf:
-                for i, lesson in enumerate(lessons):
+                for index, lesson in enumerate(lessons):
                     if lesson["index_no"] < 0:
                         continue
-                    if thread_db.get_lesson_words(lesson["id"]):
-                        pct = 65 + int((i + 1) / max(len(lessons), 1) * 34)
-                        self.progress.emit(
-                            pct,
-                            f"Bỏ qua Bài {lesson['index_no']} đã có dữ liệu [{mode}]...",
+                    if not hasattr(extractor, "extract_blocks"):
+                        if thread_db.get_lesson_words(lesson["id"]):
+                            continue
+                        legacy_rows = extractor.extract_lesson(
+                            pdf,
+                            LessonBoundary(
+                                lesson["index_no"],
+                                lesson.get("title"),
+                                lesson["page_start"],
+                                lesson["page_end"],
+                                float(lesson.get("confidence", 1.0)),
+                                "lesson",
+                            ),
+                            self.ai_client,
                         )
+                        if not legacy_rows:
+                            raise RuntimeError(
+                                f"Bài {lesson['index_no']} không trích xuất được từ mới"
+                            )
+                        thread_db.replace_vocab(lesson["id"], legacy_rows)
                         continue
                     boundary = LessonBoundary(
                         index_no=lesson["index_no"],
@@ -245,27 +359,70 @@ class VocabImporterWorker(QThread):
                         page_start=lesson["page_start"],
                         page_end=lesson["page_end"],
                         confidence=float(lesson.get("confidence", 1.0)),
-                        kind="review" if lesson["index_no"] < 0 else "lesson",
+                        kind="lesson",
                     )
-                    rows = extractor.extract_lesson(
-                        pdf, boundary, ai_client=self.ai_client
+                    blocks = self._load_or_create_blocks(
+                        thread_db, pdf, extractor, lesson, boundary
                     )
-                    if not rows:
+                    if not blocks:
+                        thread_db.set_import_state(self.book_id, "incomplete")
                         raise RuntimeError(
-                            f"Bài {lesson['index_no']} không trích xuất được từ mới; "
-                            "đã giữ nguyên các bài hoàn thành trước đó."
+                            f"Bài {lesson['index_no']} · không tìm thấy block từ mới"
                         )
-                    thread_db.replace_vocab(lesson["id"], rows)
-                    pct = 65 + int((i + 1) / max(len(lessons), 1) * 34)
-                    self.progress.emit(
-                        pct, f"Đã OCR bài {i + 1}/{len(lessons)} [{mode}]..."
+                    pending = [
+                        block for block in blocks
+                        if block.status not in {"local_ok", "ai_ok", "manual"}
+                    ]
+                    if pending:
+                        extractor.lesson_ai_attempts = sum(
+                            block.ai_attempts for block in blocks
+                        )
+                        result = extractor.extract_blocks(
+                            pdf, pending, self.ai_client
+                        )
+                        self._checkpoint_result(thread_db, result)
+                        if not result.complete:
+                            thread_db.set_import_state(
+                                self.book_id, "incomplete"
+                            )
+                            by_block = {
+                                block.block_no: report
+                                for block, report in zip(
+                                    result.blocks, result.coverage
+                                )
+                            }
+                            raise RuntimeError(
+                                self._format_incomplete(lesson, by_block)
+                            )
+
+                    pct = 65 + int(
+                        (index + 1) / max(len(lessons), 1) * 34
                     )
+                    self.progress.emit(
+                        pct,
+                        f"Đã OCR bài {index + 1}/{len(lessons)} [{mode}]...",
+                    )
+
+            if not thread_db.book_import_complete(self.book_id):
+                thread_db.set_import_state(self.book_id, "incomplete")
+                raise RuntimeError("Sách còn bài hoặc block chưa đủ dữ liệu")
             thread_db.set_import_state(self.book_id, "review")
             self.progress.emit(100, "Đã OCR — hãy duyệt các dòng từ mới.")
             self.finished_import.emit(self.book_id, book["title"])
         except Exception as err:
             if thread_db:
-                thread_db.set_import_state(self.book_id, "review_bounds")
+                current = thread_db.get_book(self.book_id)
+                if current and current["import_state"] != "incomplete":
+                    lessons = thread_db.get_lessons(self.book_id)
+                    has_manifest = any(
+                        thread_db.get_import_blocks(lesson["id"])
+                        for lesson in lessons
+                        if lesson["index_no"] > 0
+                    )
+                    thread_db.set_import_state(
+                        self.book_id,
+                        "incomplete" if has_manifest else "review_bounds",
+                    )
             self.failed_import.emit(str(err))
         finally:
             if thread_db:
