@@ -196,6 +196,15 @@ class DialogReviewBook(QDialog):
         root.addWidget(self.review_note)
 
         self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabBar::tab {"
+            f"background: {PALETTE['card']}; color: {PALETTE['ink2']}; "
+            f"border: 1px solid {PALETTE['line']}; padding: 7px 14px;"
+            "}"
+            "QTabBar::tab:selected {"
+            f"background: {PALETTE['accent']}; color: white;"
+            "}"
+        )
         self.review_tab = QWidget()
         self.all_lessons_tab = QWidget()
         self.tabs.addTab(self.review_tab, "Cần xác nhận")

@@ -6,6 +6,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import hanzi_app.service.importer as importer_module
@@ -22,6 +23,7 @@ from hanzi_app.data.models import (
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.ui.dialog_import import DialogReviewBoundaries
 from hanzi_app.ui.screen_books import DialogReviewBook, ScreenBooks
+from hanzi_app.ui.theme import PALETTE
 
 
 class _FakePreviewWorker(QObject):
@@ -100,6 +102,41 @@ def _visible_review_words(dialog):
         for row in range(dialog.review_table.rowCount())
         if not dialog.review_table.isRowHidden(row)
     ]
+
+
+def test_review_tabs_render_with_readable_contrast(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    dialog = None
+    try:
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        dialog.show()
+        app.processEvents()
+
+        bar = dialog.tabs.tabBar()
+        image = bar.grab().toImage()
+        selected = bar.tabRect(0)
+        inactive = bar.tabRect(1)
+
+        def count_near(rect, color_name, tolerance=8):
+            target = QColor(color_name)
+            return sum(
+                abs(image.pixelColor(x, y).red() - target.red()) <= tolerance
+                and abs(image.pixelColor(x, y).green() - target.green()) <= tolerance
+                and abs(image.pixelColor(x, y).blue() - target.blue()) <= tolerance
+                for y in range(rect.top(), rect.bottom() + 1)
+                for x in range(rect.left(), rect.right() + 1)
+            )
+
+        assert count_near(selected, PALETTE["accent"]) > selected.width() * selected.height() // 4
+        assert count_near(selected, "white") >= 2
+        assert count_near(inactive, PALETTE["card"]) > inactive.width() * inactive.height() // 4
+        assert count_near(inactive, PALETTE["ink2"]) >= 2
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
 
 
 def test_hang_doi_hien_ro_bai_trang_va_khong_tich_san(tmp_path):
