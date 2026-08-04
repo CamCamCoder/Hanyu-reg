@@ -1242,3 +1242,32 @@ def test_load_or_create_blocks_reuses_persisted_manifest(tmp_path):
     assert extractor.locate_blocks.call_count == 1
     assert pdf.get_page_crop_image_bytes.call_count == 1
     db.close()
+
+
+def test_load_or_create_blocks_retries_once_after_empty_locator_result(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Test book", "book.pdf", "locator-retry", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")]
+    )
+    lesson = db.get_lessons(book_id)[0]
+    boundary = LessonBoundary(1, "One", 0, 9, 1.0, "lesson")
+    located = VocabBlock(
+        None, None, 1, 1, (10, 20, 110, 220),
+        None, 2, 1, 2,
+    )
+    extractor = MagicMock()
+    extractor.locate_blocks.side_effect = [[], [located]]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"png"
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    blocks = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+
+    assert len(blocks) == 1
+    assert extractor.locate_blocks.call_count == 2
+    assert db.get_import_blocks(lesson["id"])[0]["block_no"] == 1
+    db.close()
