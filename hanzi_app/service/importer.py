@@ -247,7 +247,8 @@ class VocabImporterWorker(QThread):
         if not records:
             located = extractor.locate_blocks(pdf, boundary)
             if not located:
-                located = extractor.locate_blocks(pdf, boundary)
+                with PdfSource(self.pdf_path) as retry_pdf:
+                    located = extractor.locate_blocks(retry_pdf, boundary)
             crop_root = Path(self.db_path).parent / "book_crops"
             prepared: list[VocabBlock] = []
             for block in located:

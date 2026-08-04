@@ -1244,7 +1244,7 @@ def test_load_or_create_blocks_reuses_persisted_manifest(tmp_path):
     db.close()
 
 
-def test_load_or_create_blocks_retries_once_after_empty_locator_result(tmp_path):
+def test_load_or_create_blocks_retries_once_with_fresh_pdf_source(tmp_path, monkeypatch):
     db_path = str(tmp_path / "user.sqlite")
     db = UserDb(db_path)
     book_id = db.add_book("Test book", "book.pdf", "locator-retry", 10)
@@ -1261,6 +1261,10 @@ def test_load_or_create_blocks_retries_once_after_empty_locator_result(tmp_path)
     extractor.locate_blocks.side_effect = [[], [located]]
     pdf = MagicMock()
     pdf.get_page_crop_image_bytes.return_value = b"png"
+    retry_source = MagicMock()
+    retry_pdf = retry_source.__enter__.return_value
+    source_factory = MagicMock(return_value=retry_source)
+    monkeypatch.setattr(importer_module, "PdfSource", source_factory)
     worker = VocabImporterWorker(book_id, "book.pdf", db_path)
 
     blocks = worker._load_or_create_blocks(
@@ -1269,5 +1273,7 @@ def test_load_or_create_blocks_retries_once_after_empty_locator_result(tmp_path)
 
     assert len(blocks) == 1
     assert extractor.locate_blocks.call_count == 2
+    assert extractor.locate_blocks.call_args_list[0].args[0] is pdf
+    assert extractor.locate_blocks.call_args_list[1].args[0] is retry_pdf
     assert db.get_import_blocks(lesson["id"])[0]["block_no"] == 1
     db.close()
