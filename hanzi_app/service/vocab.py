@@ -115,10 +115,23 @@ _PINYIN_SYLLABLES = frozenset(
 
 def _line_has_vocab_heading(spans: list[TextSpan]) -> bool:
     compact = _compact_line(spans)
-    return any(
+    if any(
         compact.startswith(marker) and len(compact) <= len(marker) + 24
         for marker in _VOCAB_HEADING_MARKERS
-    )
+    ):
+        return True
+    parts = [
+        re.sub(r"\s+", "", span.text).lower()
+        for span in spans
+        if span.text.strip()
+    ]
+    for start in range(len(parts)):
+        joined = ""
+        for part in parts[start:start + 3]:
+            joined += part
+            if joined in _VOCAB_HEADING_MARKERS:
+                return True
+    return False
 
 
 def _has_vocab_heading(spans: list[TextSpan]) -> bool:
@@ -254,6 +267,70 @@ def _numeric_column_clusters(
     ]
 
 
+def _repeated_cjk_column_lines(
+    lines: list[list[TextSpan]],
+) -> list[list[TextSpan]]:
+    candidates: list[tuple[float, list[TextSpan]]] = []
+    for line in lines:
+        cjk = [span for span in line if RE_CJK_WORD.search(span.text)]
+        if not cjk:
+            continue
+        if _line_has_vocab_heading(line):
+            cjk_text = "".join(
+                character
+                for span in cjk
+                for character in span.text
+                if RE_CJK_ONLY.match(character)
+            )
+            if cjk_text in _VOCAB_HEADING_MARKERS:
+                continue
+        first = min(cjk, key=lambda span: span.bbox[0])
+        candidates.append(((first.bbox[0] + first.bbox[2]) / 2, line))
+
+    clusters: list[list[tuple[float, list[TextSpan]]]] = []
+    for candidate in sorted(candidates, key=lambda item: item[0]):
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        center = statistics.median(item[0] for item in clusters[-1])
+        if abs(candidate[0] - center) <= 35:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    repeated = [
+        cluster for cluster in clusters
+        if len({id(line) for _center, line in cluster}) >= 2
+    ]
+    heading_spans = [
+        span
+        for line in lines
+        if _line_has_vocab_heading(line)
+        for span in line
+    ]
+    heading_center = (
+        statistics.median(
+            (span.bbox[0] + span.bbox[2]) / 2 for span in heading_spans
+        )
+        if heading_spans
+        else None
+    )
+
+    def cluster_key(cluster: list[tuple[float, list[TextSpan]]]):
+        center = statistics.median(item[0] for item in cluster)
+        if heading_center is not None:
+            return (-abs(center - heading_center), len(cluster), -center)
+        return (len(cluster), 0, -center)
+
+    best = max(repeated, key=cluster_key, default=[])
+    result: list[list[TextSpan]] = []
+    for _center, line in sorted(
+        best, key=lambda item: min(span.bbox[1] for span in item[1])
+    ):
+        if line not in result:
+            result.append(line)
+    return result
+
+
 def _region_evidence(
     spans: list[TextSpan],
 ) -> tuple[
@@ -264,12 +341,15 @@ def _region_evidence(
     bool,
     int,
 ]:
+    lines = _line_groups(spans)
+    has_heading = _has_vocab_heading(spans)
+    columnar_lines = _repeated_cjk_column_lines(lines) if has_heading else []
     row_lines: list[list[TextSpan]] = []
     cjk_centers: list[float] = []
     pinyin_centers: list[float] = []
     third_centers: list[float] = []
     strong_pinyin_rows = 0
-    for line in _line_groups(spans):
+    for line in lines:
         numeric = [
             span for span in line
             if re.fullmatch(r"\d{1,3}", span.text.strip())
@@ -294,6 +374,17 @@ def _region_evidence(
             if other:
                 third_centers.append((other[0].bbox[0] + other[0].bbox[2]) / 2)
 
+    if columnar_lines:
+        row_lines = list(columnar_lines)
+        strong_pinyin_rows = sum(
+            any(
+                _pinyin_evidence_strength(span.text) >= 2
+                for span in line
+            )
+            for line in row_lines
+        )
+    row_lines.sort(key=lambda line: min(span.bbox[1] for span in line))
+
     clusters = _numeric_column_clusters(spans)
     aligned_orders = max(
         clusters,
@@ -305,11 +396,33 @@ def _region_evidence(
     for _value, _center, line in aligned_orders:
         if line not in order_lines:
             order_lines.append(line)
+    if not aligned_orders and has_heading:
+        parallel: list[tuple[list[int], list[TextSpan]]] = []
+        for line in lines:
+            values = sorted({
+                int(span.text.strip())
+                for span in line
+                if re.fullmatch(r"\d{1,3}", span.text.strip())
+            })
+            if len(values) >= 2 and any(
+                right == left + 1
+                for left, right in zip(values, values[1:])
+            ):
+                parallel.append((values, line))
+        if parallel:
+            unique_orders, parallel_line = max(
+                parallel,
+                key=lambda item: (
+                    len(item[0]),
+                    -min(span.bbox[1] for span in item[1]),
+                ),
+            )
+            order_lines = [parallel_line]
     sequential = any(
         right == left + 1
         for left, right in zip(unique_orders, unique_orders[1:])
     )
-    aligned = (
+    aligned = len(columnar_lines) >= 2 or (
         len(row_lines) >= 2
         and len(third_centers) >= 2
         and max(cjk_centers) - min(cjk_centers) <= 35
@@ -337,7 +450,12 @@ def _signal_line(line: list[TextSpan]) -> bool:
 
 
 def _split_page_regions(spans: list[TextSpan]) -> list[list[TextSpan]]:
-    signal_lines = [line for line in _line_groups(spans) if _signal_line(line)]
+    lines = _line_groups(spans)
+    columnar_ids = {id(line) for line in _repeated_cjk_column_lines(lines)}
+    signal_lines = [
+        line for line in lines
+        if _signal_line(line) or id(line) in columnar_ids
+    ]
     if not signal_lines:
         return []
     heights = [
@@ -345,6 +463,7 @@ def _split_page_regions(spans: list[TextSpan]) -> list[list[TextSpan]]:
         for line in signal_lines
     ]
     gap_limit = max(72.0, statistics.median(heights) * 5)
+    heading_gap_limit = max(280.0, statistics.median(heights) * 12)
     vertical_bands: list[list[list[TextSpan]]] = []
     for line in signal_lines:
         if not vertical_bands:
@@ -355,7 +474,32 @@ def _split_page_regions(spans: list[TextSpan]) -> list[list[TextSpan]]:
         )
         current_top = min(span.bbox[1] for span in line)
         if current_top - previous_bottom > gap_limit:
-            vertical_bands.append([line])
+            previous_region = [
+                span for previous in vertical_bands[-1] for span in previous
+            ]
+            previous_rows = _region_evidence(previous_region)[0]
+            heading_lines = [
+                previous
+                for previous in _line_groups(previous_region)
+                if _line_has_vocab_heading(previous)
+            ]
+            heading_bottom = max(
+                (span.bbox[3] for previous in heading_lines for span in previous),
+                default=float("-inf"),
+            )
+            has_row_below_heading = any(
+                min(span.bbox[1] for span in row) > heading_bottom
+                for row in previous_rows
+            )
+            detached_heading = (
+                bool(heading_lines)
+                and not has_row_below_heading
+                and current_top - previous_bottom <= heading_gap_limit
+            )
+            if detached_heading:
+                vertical_bands[-1].append(line)
+            else:
+                vertical_bands.append([line])
         else:
             vertical_bands[-1].append(line)
 
@@ -446,13 +590,38 @@ class VocabExtractor:
                 if sum(signals) < 2:
                     continue
 
+                region_lines = _line_groups(region)
+                heading_lines = [
+                    line for line in region_lines
+                    if _line_has_vocab_heading(line)
+                ]
                 relevant_lines = list(row_lines)
                 relevant_lines.extend(order_lines)
-                relevant_lines.extend(
-                    line
-                    for line in _line_groups(region)
-                    if _line_has_vocab_heading(line)
-                )
+                relevant_lines.extend(heading_lines)
+                if sequential_orders and heading_lines:
+                    heading_bottom = max(
+                        span.bbox[3]
+                        for line in heading_lines
+                        for span in line
+                    )
+                    has_data_below = any(
+                        min(span.bbox[1] for span in line) > heading_bottom
+                        for line in row_lines
+                    )
+                    if not has_data_below:
+                        continuation = next((
+                            line
+                            for line in region_lines
+                            if min(span.bbox[1] for span in line) > heading_bottom
+                            and any(
+                                RE_CJK_WORD.search(span.text) for span in line
+                            )
+                            and any(
+                                _is_pinyin_text(span.text) for span in line
+                            )
+                        ), None)
+                        if continuation is not None:
+                            relevant_lines.append(continuation)
                 relevant = [span for line in relevant_lines for span in line]
                 bbox = (
                     max(0.0, min(span.bbox[0] for span in relevant) - 8.0),
@@ -460,7 +629,11 @@ class VocabExtractor:
                     max(span.bbox[2] for span in relevant) + 8.0,
                     max(span.bbox[3] for span in relevant) + 8.0,
                 )
-                expected_rows = max(len(orders), len(row_lines))
+                expected_rows = (
+                    len(orders)
+                    if sequential_orders and orders
+                    else len(row_lines) if aligned_columns else None
+                )
                 candidates.append(
                     (
                         page_index,

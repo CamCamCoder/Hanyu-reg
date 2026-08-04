@@ -103,6 +103,153 @@ def _vocab_region(title, orders, y0):
     return spans
 
 
+def test_locator_joins_split_heading_to_rows_after_large_initial_gap():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("生", 20, 40, 20),
+        _span("词", 45, 40, 20),
+        _span("你好", 80, 300, 45),
+        _span("ni3 hao3", 160, 300, 80),
+        _span("谢谢", 80, 330, 45),
+        _span("xie4xie", 160, 330, 80),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(17, "Lesson 17", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 2
+    assert blocks[0].bbox[1] < 50
+    assert blocks[0].bbox[3] > 330
+
+
+def test_locator_accepts_heading_tokens_interleaved_with_first_row():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("谢谢", 20, 40, 45),
+        _span("New", 120, 40, 45),
+        _span("Words", 170, 40, 55),
+        _span("xie4xie", 250, 40, 80),
+        _span("不客气", 20, 80, 55),
+        _span("bu2 ke4qi", 120, 80, 90),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(18, "Lesson 18", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 2
+
+
+def test_locator_uses_repeated_hanzi_column_when_pinyin_is_unreadable():
+    page = [_span("New Words", 20, 40, 100, 18)]
+    for index, word in enumerate(("大家", "学生", "老师", "你们")):
+        y = 90 + index * 35
+        page.extend([
+            _span(word, 80, y, 50),
+            _span("@@", 170, y, 45),
+            _span("meaning", 280, y, 80),
+        ])
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(19, "Lesson 19", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 4
+
+
+def test_locator_counts_parallel_entries_on_one_physical_line():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("Vocabulary", 20, 40, 100, 18),
+        _span("1", 20, 90, 20),
+        _span("你好", 70, 90, 45),
+        _span("ni3 hao3", 130, 90, 80),
+        _span("2", 400, 90, 20),
+        _span("谢谢", 450, 90, 45),
+        _span("xie4xie", 510, 90, 80),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(20, "Lesson 20", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert (
+        blocks[0].expected_rows,
+        blocks[0].first_order,
+        blocks[0].last_order,
+    ) == (2, 1, 2)
+
+
+def test_locator_prefers_column_near_heading_and_stops_before_dialogue():
+    page = [_span("New Words", 400, 40, 100, 18)]
+    for index, word in enumerate(("大家", "学生", "老师", "你们")):
+        y = 90 + index * 35
+        page.extend([
+            _span(word, 450, y, 50),
+            _span("@@", 540, y, 45),
+            _span("meaning", 620, y, 80),
+        ])
+    for index, (word, pinyin) in enumerate((
+        ("你好", "ni3 hao3"),
+        ("谢谢", "xie4xie"),
+        ("再见", "zai4jian4"),
+        ("同学", "tong2xue2"),
+    )):
+        y = 250 + index * 35
+        page.extend([_span(word, 20, y, 50), _span(pinyin, 100, y, 90)])
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = page
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(21, "Lesson 21", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 4
+    assert blocks[0].bbox[3] < 250
+
+
+def test_locator_extends_heading_when_apparent_rows_are_only_above_anchor():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("生成", 20, 40, 50),
+        _span("sheng1cheng2", 100, 40, 110),
+        _span("生", 20, 100, 20),
+        _span("词", 45, 100, 20),
+        _span("ai", 80, 100, 30),
+        _span("一", 330, 100, 20),
+        _span("New", 400, 100, 45),
+        _span("Words", 450, 100, 55),
+        _span("1", 560, 100, 20),
+        _span("2", 600, 100, 20),
+        _span("老师", 450, 340, 50),
+        _span("lao3shi1", 520, 340, 80),
+        _span("王", 650, 340, 30),
+        _span("wang2", 700, 340, 60),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(22, "Lesson 22", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 2
+    assert blocks[0].bbox[3] > 340
+
+
 def test_locator_finds_disjoint_blocks_and_ignores_prose():
     pages = {
         0: [_span("Trong bài này 生词 nghĩa là từ mới", 20, 100, 300)],
