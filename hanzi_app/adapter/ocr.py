@@ -6,6 +6,8 @@ chưa cài Tesseract / PaddleOCR.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import subprocess
@@ -58,7 +60,8 @@ foreach ($line in $result.Lines) {
     }
   }
 }
-ConvertTo-Json -Compress -Depth 3 -InputObject @($words)
+$json = ConvertTo-Json -Compress -Depth 3 -InputObject @($words)
+[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 """
 
 
@@ -161,8 +164,15 @@ class OcrAdapter:
             return []
 
         try:
-            data = json.loads(completed.stdout or "[]")
-        except json.JSONDecodeError:
+            encoded = completed.stdout.strip()
+            if not encoded:
+                self._windows_available = False
+                return []
+            raw_json = base64.b64decode(
+                encoded, validate=True
+            ).decode("utf-8")
+            data = json.loads(raw_json or "[]")
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
             self._windows_available = False
             return []
 

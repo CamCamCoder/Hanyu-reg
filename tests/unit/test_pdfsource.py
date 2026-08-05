@@ -1,10 +1,14 @@
 """Kiểm thử unit cho adapter/pdfsource.py và adapter/ocr.py."""
 
+import base64
+import json
 from pathlib import Path
-import pytest
-import fitz
+from types import SimpleNamespace
 
-from hanzi_app.adapter.ocr import OcrAdapter
+import fitz
+import pytest
+
+from hanzi_app.adapter.ocr import OcrAdapter, _WINDOWS_OCR_SCRIPT
 from hanzi_app.adapter.pdfsource import PdfSource
 from hanzi_app.data.models import PageEvidence, TextSpan
 
@@ -60,6 +64,48 @@ def test_pdfsource_invalid_file():
 def test_ocr_adapter_fallback():
     ocr = OcrAdapter()
     assert ocr.is_available() is True
+
+
+def test_windows_ocr_decodes_base64_json_without_console_codepage(monkeypatch):
+    payload = [{
+        "text": "\u8c22\u8c22",
+        "x0": 10,
+        "y0": 20,
+        "x1": 30,
+        "y1": 40,
+    }]
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout=encoded,
+        stderr="",
+    )
+    monkeypatch.setattr(
+        "hanzi_app.adapter.ocr.subprocess.run",
+        lambda *_args, **_kwargs: completed,
+    )
+
+    spans = OcrAdapter().ocr_png_bytes(b"png")
+    assert [span.text for span in spans] == ["\u8c22\u8c22"]
+
+
+def test_windows_ocr_script_encodes_utf8_json_as_base64():
+    assert "ToBase64String" in _WINDOWS_OCR_SCRIPT
+    assert "UTF8.GetBytes($json)" in _WINDOWS_OCR_SCRIPT
+
+
+def test_windows_ocr_rejects_empty_stdout(monkeypatch):
+    completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(
+        "hanzi_app.adapter.ocr.subprocess.run",
+        lambda *_args, **_kwargs: completed,
+    )
+    ocr = OcrAdapter()
+
+    assert ocr.ocr_png_bytes(b"png") == []
+    assert ocr._windows_available is False
 
 
 def test_pdfsource_get_page_half_images(temp_pdf_path: Path):
