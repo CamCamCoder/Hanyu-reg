@@ -1,6 +1,7 @@
 """Kiểm thử logic dialog duyệt nhập sách ở chế độ Qt offscreen."""
 
 import os
+import logging
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -21,11 +22,38 @@ from hanzi_app.data.models import (
     VocabRow,
 )
 from hanzi_app.data.userdb import UserDb
-from hanzi_app.ui.dialog_import import DialogReviewBoundaries
+from hanzi_app.ui.dialog_import import DialogImport, DialogReviewBoundaries
 from hanzi_app.ui.screen_books import DialogReviewBook, ScreenBooks
 from hanzi_app.ui.theme import PALETTE
 
 
+def test_dialog_import_logs_progress_and_failure_breadcrumbs(caplog):
+    class _ProgressBar:
+        def setValue(self, _value):
+            return None
+
+    class _Label:
+        def setText(self, _text):
+            return None
+
+    class _Button:
+        def setEnabled(self, _enabled):
+            return None
+
+    class _FakeDialog:
+        progress_bar = _ProgressBar()
+        lbl_status = _Label()
+        btn_chon = _Button()
+
+    fake = _FakeDialog()
+    with caplog.at_level(logging.INFO, logger="hanzi_app.ui.dialog_import"):
+        DialogImport._on_progress(fake, 65, "Dang OCR bai 1")
+    assert "65%" in caplog.text
+    assert "Dang OCR bai 1" in caplog.text
+
+    with caplog.at_level(logging.ERROR, logger="hanzi_app.ui.dialog_import"):
+        DialogImport._on_failed(fake, "khong tim thay block")
+    assert "khong tim thay block" in caplog.text
 class _FakePreviewWorker(QObject):
     loaded = Signal(bytes)
     failed = Signal(str)
@@ -40,6 +68,7 @@ class _FakePreviewWorker(QObject):
 
 
 def _review_row(order, word, page, needs_review):
+
     return VocabRow(
         order_no=order,
         word=word,

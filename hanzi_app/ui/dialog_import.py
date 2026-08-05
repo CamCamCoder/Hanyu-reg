@@ -5,6 +5,7 @@ Cho phép chọn tệp PDF, gõ API Key (tùy chọn) và hiển thị thanh ti�
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from PySide6.QtCore import Qt
@@ -28,6 +29,8 @@ from hanzi_app.data.models import BoundaryEvidence, LessonBoundary, SplitResult
 from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.ui.theme import PALETTE, ui_font
+
+logger = logging.getLogger(__name__)
 
 
 class DialogReviewBoundaries(QDialog):
@@ -569,12 +572,14 @@ class DialogImport(QDialog):
         self.worker.start()
 
     def _on_progress(self, pct: int, msg: str) -> None:
+        logger.info("Import progress: %d%% %s", pct, msg)
         self.progress_bar.setValue(pct)
         self.lbl_status.setText(msg)
 
     def _on_finished(self, book_id: int, title: str) -> None:
         self.imported_book_id = book_id
         self.lbl_status.setText(f"Đã phân tích '{title}'. Hãy duyệt kết quả trước khi học.")
+        logger.info("Import finished: book_id=%s title=%s", book_id, title)
         self.progress_bar.setValue(100)
         self.btn_chon.setText("Xong")
         self.btn_chon.setEnabled(True)
@@ -584,3 +589,4 @@ class DialogImport(QDialog):
     def _on_failed(self, err: str) -> None:
         self.lbl_status.setText(f"Lỗi nhập sách: {err}")
         self.btn_chon.setEnabled(True)
+        logger.error("Import failed in UI: %s", err)

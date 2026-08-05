@@ -4,6 +4,7 @@ import hashlib
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
+import logging
 import pytest
 
 from hanzi_app.adapter.aiclient import AiRateLimitError
@@ -663,7 +664,7 @@ def test_vision_empty_response_is_failure_not_valid_empty_vocab(monkeypatch):
 
 
 def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     """Resume must preserve completed lessons and must not mark a partial book review."""
     db_path = str(tmp_path / "user.sqlite")
@@ -714,7 +715,8 @@ def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
         book_id, "boya.pdf", db_path, api_key="test-key"
     )
     worker.failed_import.connect(errors.append)
-    worker.run()
+    with caplog.at_level(logging.ERROR, logger="hanzi_app.service.importer"):
+        worker.run()
 
     checked = UserDb(db_path)
     assert [row["word"] for row in checked.get_lesson_words(lesson_1["id"])] == [
@@ -724,6 +726,15 @@ def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
     assert checked.get_book(book_id)["import_state"] == "review_bounds"
     checked.close()
     assert errors and "Bài 2" in errors[0]
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "hanzi_app.service.importer"
+    ]
+    assert records
+    assert records[-1].exc_info is not None
+    assert "Vocabulary import failed" in records[-1].getMessage()
+
 
 
 def test_multi_page_lesson_uses_one_combined_vision_request():

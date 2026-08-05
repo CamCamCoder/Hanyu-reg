@@ -7,6 +7,7 @@ Tự mở kết nối UserDb riêng cho luồng nền để tránh lỗi SQLite 
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +26,8 @@ from hanzi_app.data.models import (
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.service.vocab import VocabExtractor, render_block_crop
+
+logger = logging.getLogger(__name__)
 
 
 def _write_crop_atomic(
@@ -153,6 +156,11 @@ class BookImporterWorker(QThread):
                     thread_db.delete_book(book_id)
                 elif previous_state is not None:
                     thread_db.set_import_state(book_id, previous_state)
+            logger.exception(
+                "Book import failed: book_id=%s pdf=%s",
+                book_id,
+                self.pdf_path,
+            )
             self.failed_import.emit(str(err))
         finally:
             if thread_db:
@@ -427,6 +435,11 @@ class VocabImporterWorker(QThread):
                         self.book_id,
                         "incomplete" if has_manifest else "review_bounds",
                     )
+            logger.exception(
+                "Vocabulary import failed: book_id=%s pdf=%s",
+                self.book_id,
+                self.pdf_path,
+            )
             self.failed_import.emit(str(err))
         finally:
             if thread_db:
@@ -501,6 +514,11 @@ class VisionRepairWorker(QThread):
             ]
             self.finished_rows.emit(checked)
         except Exception as err:
+            logger.exception(
+                "Vision repair failed: lesson=%s pdf=%s",
+                self.lesson.index_no,
+                self.pdf_path,
+            )
             self.failed.emit(str(err))
         finally:
             if thread_dict:
@@ -590,6 +608,10 @@ class PreviewWorker(QThread):
                 )
             self.loaded.emit(preview)
         except Exception as err:
+            logger.exception(
+                "Preview load failed: pdf=%s",
+                self.pdf_path,
+            )
             self.failed.emit(str(err))
 
 def render_page_preview(
