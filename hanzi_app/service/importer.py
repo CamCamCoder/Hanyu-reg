@@ -30,6 +30,11 @@ from hanzi_app.service.vocab import VocabExtractor, render_block_crop
 logger = logging.getLogger(__name__)
 
 
+def _log_exception_if_configured(message: str, *args: object) -> None:
+    if logging.getLogger().handlers:
+        logger.exception(message, *args)
+
+
 def _write_crop_atomic(
     root: str | Path,
     book_id: int,
@@ -156,7 +161,7 @@ class BookImporterWorker(QThread):
                     thread_db.delete_book(book_id)
                 elif previous_state is not None:
                     thread_db.set_import_state(book_id, previous_state)
-            logger.exception(
+            _log_exception_if_configured(
                 "Book import failed: book_id=%s pdf=%s",
                 book_id,
                 self.pdf_path,
@@ -435,7 +440,7 @@ class VocabImporterWorker(QThread):
                         self.book_id,
                         "incomplete" if has_manifest else "review_bounds",
                     )
-            logger.exception(
+            _log_exception_if_configured(
                 "Vocabulary import failed: book_id=%s pdf=%s",
                 self.book_id,
                 self.pdf_path,
@@ -514,7 +519,7 @@ class VisionRepairWorker(QThread):
             ]
             self.finished_rows.emit(checked)
         except Exception as err:
-            logger.exception(
+            _log_exception_if_configured(
                 "Vision repair failed: lesson=%s pdf=%s",
                 self.lesson.index_no,
                 self.pdf_path,
@@ -608,7 +613,7 @@ class PreviewWorker(QThread):
                 )
             self.loaded.emit(preview)
         except Exception as err:
-            logger.exception(
+            _log_exception_if_configured(
                 "Preview load failed: pdf=%s",
                 self.pdf_path,
             )

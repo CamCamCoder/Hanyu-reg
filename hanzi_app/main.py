@@ -81,8 +81,9 @@ def _log_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
 
 
 def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    thread_name = args.thread.name if args.thread is not None else "<unknown>"
     logging.getLogger("hanzi_app.crash").critical(
-        "Unhandled thread exception: %s", args.thread.name,
+        "Unhandled thread exception: %s", thread_name,
         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
     )
 
