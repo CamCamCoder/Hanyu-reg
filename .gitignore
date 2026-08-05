@@ -17,6 +17,7 @@ __pycache__/
 tmp/
 .venv/
 venv/
+debug-latest.log
 .worktrees/
 .superpowers/
 

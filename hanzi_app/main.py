@@ -8,9 +8,13 @@ và tính lịch, mà tầng ui không được tự mở cơ sở dữ liệu.
 Chạy bằng `python -m hanzi_app.main` từ gốc kho.
 """
 
+import logging
+import os
 import sys
+import threading
 from pathlib import Path
 
+from PySide6.QtCore import qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
 from hanzi_app.data.dictdb import DictDb
@@ -69,6 +73,44 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 """
 
 
+def _log_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
+    logging.getLogger("hanzi_app.crash").critical(
+        "Unhandled Python exception",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    logging.getLogger("hanzi_app.crash").critical(
+        "Unhandled thread exception: %s", args.thread.name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def _log_qt_message(message_type, _context, message) -> None:
+    try:
+        logging.getLogger("hanzi_app.qt").debug(
+            "Qt message (%s): %s", message_type, message
+        )
+    except Exception:
+        pass
+
+
+def configure_debug_logging() -> bool:
+    if os.environ.get("HANZI_DEBUG") != "1":
+        return False
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
+        force=True,
+    )
+    sys.excepthook = _log_unhandled_exception
+    threading.excepthook = _log_thread_exception
+    qInstallMessageHandler(_log_qt_message)
+    logging.getLogger(__name__).info("Debug session started")
+    return True
+
+
 def find_dict() -> Path | None:
     return next((p for p in DICT_CANDIDATES if p.is_file()), None)
 
@@ -92,7 +134,13 @@ def build_window() -> MainWindow:
 def main() -> int:
     # Cảnh báo phông có dấu tiếng Việt; console Windows mặc định là cp1252 nên
     # ép utf-8 để dòng cảnh báo không tự làm sập chương trình.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    configure_debug_logging()
 
     app = QApplication(sys.argv)
     for dong in load_fonts():
