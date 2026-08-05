@@ -43,7 +43,7 @@ cột Trạng thái rồi mới sang phiên sau.
 | B7o | retry locator khi OCR thoáng qua trả rỗng | `service/importer.py`, `tests/unit/test_universal_engine.py` | xong phần tự động; locator thử lại đúng một lần bằng `PdfSource`/OCR adapter mới trước khi báo không có block, không gọi AI; +1 test, toàn suite 315 xanh 3 skip; chẩn đoán read-only Bài 1 vẫn tìm đúng 3 block trong QThread |
 | B7p | bảo toàn Unicode Windows OCR trong app GUI | `adapter/ocr.py`, `tests/unit/test_pdfsource.py` | xong phần tự động; PowerShell mã hóa JSON UTF-8 thành Base64 ASCII trước khi trả về Python, không còn phụ thuộc console code page; +3 test, toàn suite 318 xanh 3 skip; kiểm chứng detached Bài 1 trả 243/281/212/151 span, không `?`/`�`, locator tìm đúng 3 block 2/6/4 hàng |
 
-| B7q | nhật ký debug lệnh nhập sách | `hanzi_app/main.py`, `hanzi_app/service/importer.py`, `hanzi_app/ui/dialog_import.py`, `tests/unit/test_debug_logging.py` | xong; toàn suite 322 xanh 3 skip; logging chỉ ghi metadata chẩn đoán, không dùng PDF/SQLite/AI thật trong kiểm chứng; privacy/diff scope đạt |
+| B7q | nhật ký debug lệnh nhập sách | `hanzi_app/main.py`, `hanzi_app/service/importer.py`, `hanzi_app/ui/dialog_import.py`, `tests/unit/test_debug_logging.py` | xong; toàn suite 324 xanh 3 skip; logging chỉ ghi metadata chẩn đoán, không dùng PDF/SQLite/AI thật trong kiểm chứng; privacy/diff scope đạt |
 
 **Phiên tiếp theo phải làm: người dùng đóng app cũ, chạy `chay-app-go-loi.bat`, tái hiện lỗi nhập sách đúng một lần rồi báo `xong`; agent sẽ đọc `debug-latest.log` để xác định lỗi hiện tại. Chưa tuyên bố đã sửa lỗi import.**
 
