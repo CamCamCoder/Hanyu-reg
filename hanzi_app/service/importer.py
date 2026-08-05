@@ -257,6 +257,60 @@ class VocabImporterWorker(QThread):
         boundary: LessonBoundary,
     ) -> list[VocabBlock]:
         records = db.get_import_blocks(lesson["id"])
+        # stale recovery
+        if records and any(_manifest_record_stale(record) for record in records):
+            stale = [
+                record for record in records
+                if _manifest_record_stale(record)
+            ]
+            located = extractor.locate_blocks(pdf, boundary)
+            matches = []
+            used = set()
+            for record in stale:
+                candidates = sorted(
+                    (
+                        (_bbox_iou(record["bbox"], fresh.bbox), index, fresh)
+                        for index, fresh in enumerate(located)
+                        if fresh.page_index == record["page_index"]
+                        and _bbox_iou(record["bbox"], fresh.bbox) >= 0.5
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if (
+                    not candidates
+                    or candidates[0][1] in used
+                    or (
+                        len(candidates) > 1
+                        and candidates[0][0] == candidates[1][0]
+                    )
+                ):
+                    raise RuntimeError("manifest_needs_review")
+                used.add(candidates[0][1])
+                matches.append((record, candidates[0][2]))
+            crop_root = Path(self.db_path).parent / "book_crops"
+            repairs = []
+            for record, fresh in matches:
+                crop = render_block_crop(pdf, fresh)
+                crop_path = (
+                    _write_crop_atomic(
+                        crop_root, self.book_id, lesson["id"],
+                        record["block_no"], crop,
+                    )
+                    if crop else None
+                )
+                repairs.append(replace(
+                    fresh,
+                    id=record["id"],
+                    lesson_id=lesson["id"],
+                    block_no=record["block_no"],
+                    crop_path=crop_path,
+                    status="pending",
+                    ai_attempts=record["ai_attempts"],
+                ))
+            records = db.repair_import_blocks(
+                lesson["id"], [(block.id, block) for block in repairs]
+            )
         if not records:
             located = extractor.locate_blocks(pdf, boundary)
             if not located:
@@ -669,3 +723,28 @@ def render_vocab_table_preview(
         if not images:
             raise ValueError("Không kết xuất được crop bảng từ mới")
         return pdf.stack_image_bytes(images, max_width=1200)
+def _manifest_record_stale(record: dict) -> bool:
+    if record["status"] == "manual":
+        return False
+    first = record["first_order"]
+    last = record["last_order"]
+    expected = record["expected_rows"]
+    if first is None or last is None:
+        return (first is None) != (last is None)
+    if first <= 0 or last <= 0 or last < first:
+        return True
+    return expected is not None and last - first + 1 != expected
+
+
+def _bbox_iou(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> float:
+    lx0, ly0, lx1, ly1 = left
+    rx0, ry0, rx1, ry1 = right
+    ix0, iy0 = max(lx0, rx0), max(ly0, ry0)
+    ix1, iy1 = min(lx1, rx1), min(ly1, ry1)
+    intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    left_area = max(0.0, lx1 - lx0) * max(0.0, ly1 - ly0)
+    right_area = max(0.0, rx1 - rx0) * max(0.0, ry1 - ry0)
+    union = left_area + right_area - intersection
+    return intersection / union if union else 0.0

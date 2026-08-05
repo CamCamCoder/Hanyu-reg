@@ -990,3 +990,46 @@ def test_cache_put_hai_lan_cung_khoa_thi_ghi_de(db):
 
     assert db.cache_get("认") == {"v": 2}
     assert db._conn.execute("SELECT COUNT(*) FROM explain_cache").fetchone()[0] == 1
+def test_repair_import_blocks_preserves_id_attempts_and_clears_rows(db):
+    book_id = them_sach(db, "Repair", "repair-manifest")
+    db.replace_lessons(book_id, [bound(1, 0, 9)])
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    record = db.replace_import_blocks(lesson_id, [
+        VocabBlock(None, lesson_id, 1, 1, (0, 0, 100, 200), "old.png", 2, 0, 1,
+                   "incomplete", 4)
+    ])[0]
+    db.replace_vocab_block(record["id"], [vocab("old", 1)])
+
+    repaired = db.repair_import_blocks(lesson_id, [
+        (record["id"], VocabBlock(record["id"], lesson_id, 1, 2,
+                   (10, 20, 110, 220), "new.png", 3, 1, 3, "local_ok", 99))
+    ])
+
+    assert repaired[0]["id"] == record["id"]
+    assert repaired[0]["ai_attempts"] == 4
+    assert repaired[0]["first_order"] == 1
+    assert repaired[0]["last_order"] == 3
+    assert repaired[0]["status"] == "pending"
+    assert db.get_lesson_words(lesson_id) == []
+
+
+def test_repair_import_blocks_rejects_manual_without_mutation(db):
+    book_id = them_sach(db, "Manual repair", "repair-manual")
+    db.replace_lessons(book_id, [bound(1, 0, 9)])
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    record = db.replace_import_blocks(lesson_id, [
+        VocabBlock(None, lesson_id, 1, 1, (0, 0, 100, 200), "manual.png", 1, 1, 1,
+                   "manual", 2)
+    ])[0]
+    db.replace_vocab_block(record["id"], [vocab("manual", 1)])
+    before = db.get_import_blocks(lesson_id)
+    before_rows = db.get_lesson_words(lesson_id)
+
+    with pytest.raises(ValueError):
+        db.repair_import_blocks(lesson_id, [
+            (record["id"], VocabBlock(record["id"], lesson_id, 1, 2,
+                       (1, 1, 2, 2), "new.png", 1, 1, 1))
+        ])
+
+    assert db.get_import_blocks(lesson_id) == before
+    assert db.get_lesson_words(lesson_id) == before_rows

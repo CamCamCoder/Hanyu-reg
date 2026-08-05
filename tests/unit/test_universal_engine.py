@@ -1288,3 +1288,79 @@ def test_load_or_create_blocks_retries_once_with_fresh_pdf_source(tmp_path, monk
     assert extractor.locate_blocks.call_args_list[1].args[0] is retry_pdf
     assert db.get_import_blocks(lesson["id"])[0]["block_no"] == 1
     db.close()
+def test_resume_repairs_stale_block_and_preserves_valid_manual_blocks(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Repair", "book.pdf", "resume-repair", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    records = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 2, 0, 2,
+                   "incomplete", 4),
+        VocabBlock(None, lesson["id"], 2, 2, (0, 0, 50, 50), "valid.png", 1, 1, 1,
+                   "local_ok", 7),
+        VocabBlock(None, lesson["id"], 3, 3, (0, 0, 50, 50), "manual.png", 1, 1, 1,
+                   "manual", 8),
+    ])
+    db.replace_vocab_block(records[0]["id"], [
+        VocabRow(1, "old", "c2", None, None, 1, "regex", False, None,
+                 source_block_id=records[0]["id"])
+    ])
+    db.close()
+
+    fresh = VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2)
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [fresh]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"fresh-crop"
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    reopened = UserDb(db_path)
+    repaired = worker._load_or_create_blocks(
+        reopened, pdf, extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert repaired[0].id == records[0]["id"]
+    assert repaired[0].ai_attempts == 4
+    assert repaired[0].page_index == 1
+    assert repaired[0].first_order == 1
+    assert repaired[0].status == "pending"
+    assert Path(repaired[0].crop_path).read_bytes() == b"fresh-crop"
+    assert reopened.get_lesson_words(lesson["id"]) == []
+    saved = reopened.get_import_blocks(lesson["id"])
+    assert saved[1]["status"] == "local_ok"
+    assert saved[2]["status"] == "manual"
+    reopened.close()
+
+
+def test_resume_rejects_ambiguous_stale_manifest_without_mutation(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Ambiguous", "book.pdf", "resume-ambiguous", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 2, 0, 2,
+                   "incomplete", 4)
+    ])[0]
+    before = db.get_import_blocks(lesson["id"])
+    db.close()
+
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [
+        VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2),
+        VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2),
+    ]
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    with pytest.raises(RuntimeError, match="manifest_needs_review"):
+        worker._load_or_create_blocks(
+            reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+            LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+        )
+
+    assert reopened.get_import_blocks(lesson["id"]) == before
+    assert not (Path(db_path).parent / "book_crops").exists()
+    reopened.close()

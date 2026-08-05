@@ -319,6 +319,44 @@ class UserDb:
             for row in rows
         ]
 
+    def repair_import_blocks(
+        self, lesson_id: int, repairs: list[tuple[int, VocabBlock]]
+    ) -> list[dict]:
+        with self.transaction() as conn:
+            if len({block_id for block_id, _block in repairs}) != len(repairs):
+                raise ValueError("Tr?ng id block c?n s?a")
+            for block_id, _block in repairs:
+                row = conn.execute(
+                    "SELECT * FROM import_block WHERE id = ?", (block_id,)
+                ).fetchone()
+                if row is None or row["lesson_id"] != lesson_id:
+                    raise ValueError("Block kh?ng thu?c b?i h?c")
+                if row["status"] == "manual":
+                    raise ValueError("Kh?ng th? t? ??ng s?a block th? c?ng")
+
+            for block_id, _block in repairs:
+                conn.execute(
+                    "DELETE FROM lesson_word WHERE source_block_id = ?",
+                    (block_id,),
+                )
+            for block_id, block in repairs:
+                conn.execute(
+                    "UPDATE import_block SET page_index = ?, bbox_x0 = ?, "
+                    "bbox_y0 = ?, bbox_x1 = ?, bbox_y1 = ?, crop_path = ?, "
+                    "expected_rows = ?, first_order = ?, last_order = ?, "
+                    "status = 'pending' WHERE id = ?",
+                    (
+                        block.page_index,
+                        *block.bbox,
+                        block.crop_path,
+                        block.expected_rows,
+                        block.first_order,
+                        block.last_order,
+                        block_id,
+                    ),
+                )
+        return self.get_import_blocks(lesson_id)
+
     def update_import_block(
         self, block_id: int, *, status: str,
         ai_attempts: int, crop_path: str | None
