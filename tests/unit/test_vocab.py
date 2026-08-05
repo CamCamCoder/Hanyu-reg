@@ -773,3 +773,49 @@ def test_headerless_seven_columns_keep_first_auxiliary_as_hanviet():
 
     assert [row.hanviet_src for row in rows] == ["nhĩ hảo", "lão sư"]
     assert [row.meaning_src for row in rows] == ["xin chào", "giáo viên"]
+def test_locator_does_not_persist_range_for_non_strict_order_evidence():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _vocab_region("New Words", (0, 1, 3), 40)
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(17, "Lesson 17", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert (blocks[0].first_order, blocks[0].last_order) == (None, None)
+
+
+def test_locator_persists_range_for_strict_order_evidence():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _vocab_region("New Words", (1, 2, 3), 40)
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(18, "Lesson 18", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert (blocks[0].first_order, blocks[0].last_order) == (1, 3)
+def test_coverage_rejects_duplicate_orders_with_different_rows():
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2)
+    rows = [_block_row("A", 1, 7), _block_row("B", 1, 7)]
+
+    report = VocabExtractor().validate_block_coverage(block, rows, [], rows)
+
+    assert report.passed is False
+    assert "duplicate_orders" in report.issues
+
+
+def test_coverage_rejects_extra_rows():
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2)
+    rows = [_block_row(str(i), i, 7) for i in range(1, 4)]
+
+    report = VocabExtractor().validate_block_coverage(block, rows, [], rows)
+
+    assert report.passed is False
+    assert "expected_row_mismatch" in report.issues
+
+
+
+

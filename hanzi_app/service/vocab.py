@@ -242,7 +242,7 @@ def _numeric_column_clusters(
     candidates: list[tuple[int, float, list[TextSpan]]] = []
     for line in _line_groups(spans):
         for span in line:
-            if re.fullmatch(r"\d{1,3}", span.text.strip()):
+            if re.fullmatch(r"\d{1,3}", span.text.strip()) and int(span.text.strip()) >= 1:
                 candidates.append(
                     (
                         int(span.text.strip()),
@@ -418,7 +418,7 @@ def _region_evidence(
                 ),
             )
             order_lines = [parallel_line]
-    sequential = any(
+    sequential = len(unique_orders) >= 2 and all(
         right == left + 1
         for left, right in zip(unique_orders, unique_orders[1:])
     )
@@ -641,8 +641,8 @@ class VocabExtractor:
                         bbox[0],
                         bbox,
                         expected_rows or None,
-                        orders[0] if orders else None,
-                        orders[-1] if orders else None,
+                        orders[0] if sequential_orders else None,
+                        orders[-1] if sequential_orders else None,
                     )
                 )
 
@@ -1319,6 +1319,11 @@ class VocabExtractor:
         )
         if duplicate_in_source or len(keys) != len(set(keys)):
             issues.append("abnormal_exact_duplicates")
+        final_orders = [
+            row.order_no for row in final_rows if row.order_no is not None
+        ]
+        if len(final_orders) != len(set(final_orders)):
+            issues.append("duplicate_orders")
         if not final_rows:
             issues.append("zero_rows")
 
@@ -1355,6 +1360,8 @@ class VocabExtractor:
             "missing_orders",
             "coverage_below_80_percent",
             "expected_rows_unknown_needs_review",
+            "duplicate_orders",
+            "expected_row_mismatch",
         }
         return BlockCoverage(
             block.id,
