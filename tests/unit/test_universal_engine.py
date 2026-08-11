@@ -1066,6 +1066,93 @@ def test_429_result_carries_consumed_attempt(monkeypatch):
     assert "rate_limited" in result.coverage[0].issues
 
 
+def test_vocab_import_skips_incomplete_block_and_continues_later_lessons(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Skip errors", "book.pdf", "skip-errors", 20)
+    db.replace_lessons(
+        book_id,
+        [
+            LessonBoundary(1, "One", 0, 4, 1.0, "lesson"),
+            LessonBoundary(2, "Two", 5, 9, 1.0, "lesson"),
+        ],
+    )
+    lesson_1, lesson_2 = db.get_lessons(book_id)
+    block_1 = db.replace_import_blocks(lesson_1["id"], [
+        VocabBlock(None, lesson_1["id"], 4, 1, (0, 0, 100, 200), "b1.png", 3, 1, 3)
+    ])[0]
+    block_2 = db.replace_import_blocks(lesson_2["id"], [
+        VocabBlock(None, lesson_2["id"], 1, 6, (0, 0, 100, 200), "b2.png", 2, 1, 2)
+    ])[0]
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    seen = []
+
+    class FakeExtractor:
+        def __init__(self, _dict_db):
+            pass
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            block = pending[0]
+            seen.append(block.lesson_id)
+            if block.lesson_id == lesson_1["id"]:
+                row = VocabRow(
+                    1, "partial", None, None, None, 1, "vision", True,
+                    "missing", source_block_id=block.id,
+                )
+                coverage = BlockCoverage(
+                    block.id, 3, 0, 1, 1, (2, 3), ("missing_orders",), False
+                )
+                return ExtractionResult(
+                    (row,), (coverage,),
+                    (replace(block, status="incomplete", ai_attempts=1),),
+                    1, False,
+                )
+            rows = (
+                VocabRow(1, "done-1", None, None, None, 6, "vision", False, None,
+                         source_block_id=block.id),
+                VocabRow(2, "done-2", None, None, None, 6, "vision", False, None,
+                         source_block_id=block.id),
+            )
+            coverage = BlockCoverage(block.id, 2, 0, 2, 2, (), (), True)
+            return ExtractionResult(
+                rows, (coverage,), (replace(block, status="ai_ok", ai_attempts=1),),
+                1, True,
+            )
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    finished = []
+    errors = []
+    worker.finished_import.connect(lambda bid, title: finished.append((bid, title)))
+    worker.failed_import.connect(errors.append)
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    assert errors == []
+    assert finished == [(book_id, "Skip errors")]
+    assert seen == [lesson_1["id"], lesson_2["id"]]
+    assert reopened.get_book(book_id)["import_state"] == "incomplete"
+    assert reopened.get_import_blocks(lesson_1["id"])[0]["status"] == "incomplete"
+    assert reopened.get_import_blocks(lesson_2["id"])[0]["status"] == "ai_ok"
+    assert [row["word"] for row in reopened.get_lesson_words(lesson_2["id"])] == [
+        "done-1", "done-2"
+    ]
+    reopened.close()
 def test_429_keeps_completed_block_and_resume_skips_it(tmp_path, monkeypatch):
     db_path = str(tmp_path / "user.sqlite")
     db = UserDb(db_path)

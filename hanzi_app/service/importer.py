@@ -447,6 +447,10 @@ class VocabImporterWorker(QThread):
             return f"Bài {lesson['index_no']} · block {block_no} · {issue}"
         return f"Bài {lesson['index_no']} · dữ liệu chưa đầy đủ"
 
+    @staticmethod
+    def _coverage_has_issue(coverage, issue: str) -> bool:
+        items = coverage.values() if isinstance(coverage, dict) else coverage
+        return any(issue in report.issues for report in items)
     def run(self) -> None:
         thread_db: UserDb | None = None
         thread_dict: DictDb | None = None
@@ -461,6 +465,7 @@ class VocabImporterWorker(QThread):
             thread_db.set_import_state(self.book_id, "extracting")
             extractor = VocabExtractor(thread_dict)
             mode = "Cloud AI" if self.ai_client.is_configured() else "Local Engine"
+            incomplete_messages: list[str] = []
 
             with PdfSource(self.pdf_path) as pdf:
                 for index, lesson in enumerate(lessons):
@@ -499,10 +504,10 @@ class VocabImporterWorker(QThread):
                         thread_db, pdf, extractor, lesson, boundary
                     )
                     if not blocks:
-                        thread_db.set_import_state(self.book_id, "incomplete")
-                        raise RuntimeError(
+                        incomplete_messages.append(
                             f"Bài {lesson['index_no']} · không tìm thấy block từ mới"
                         )
+                        continue
                     pending = [
                         block for block in blocks
                         if block.status not in {"local_ok", "ai_ok", "manual"}
@@ -516,18 +521,19 @@ class VocabImporterWorker(QThread):
                         )
                         self._checkpoint_result(thread_db, result)
                         if not result.complete:
-                            thread_db.set_import_state(
-                                self.book_id, "incomplete"
-                            )
                             by_block = {
                                 block.block_no: report
                                 for block, report in zip(
                                     result.blocks, result.coverage
                                 )
                             }
-                            raise RuntimeError(
-                                self._format_incomplete(lesson, by_block)
-                            )
+                            message = self._format_incomplete(lesson, by_block)
+                            if self._coverage_has_issue(by_block, "rate_limited"):
+                                thread_db.set_import_state(
+                                    self.book_id, "incomplete"
+                                )
+                                raise RuntimeError(message)
+                            incomplete_messages.append(message)
 
                     pct = 65 + int(
                         (index + 1) / max(len(lessons), 1) * 34
@@ -539,7 +545,13 @@ class VocabImporterWorker(QThread):
 
             if not thread_db.book_import_complete(self.book_id):
                 thread_db.set_import_state(self.book_id, "incomplete")
-                raise RuntimeError("Sách còn bài hoặc block chưa đủ dữ liệu")
+                count = len(incomplete_messages) or 1
+                self.progress.emit(
+                    100,
+                    f"Đã OCR phần đọc được — còn {count} mục cần sửa tay hoặc chạy lại.",
+                )
+                self.finished_import.emit(self.book_id, book["title"])
+                return
             thread_db.set_import_state(self.book_id, "review")
             self.progress.emit(100, "Đã OCR — hãy duyệt các dòng từ mới.")
             self.finished_import.emit(self.book_id, book["title"])
