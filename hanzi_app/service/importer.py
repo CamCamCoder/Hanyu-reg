@@ -257,59 +257,71 @@ class VocabImporterWorker(QThread):
         boundary: LessonBoundary,
     ) -> list[VocabBlock]:
         records = db.get_import_blocks(lesson["id"])
-        # stale recovery
-        if records and any(_manifest_record_stale(record) for record in records):
-            stale = [
-                record for record in records
-                if _manifest_record_stale(record)
-            ]
-            located = extractor.locate_blocks(pdf, boundary)
-            matches = []
-            used = set()
-            for record in stale:
-                candidates = sorted(
-                    (
-                        (_bbox_iou(record["bbox"], fresh.bbox), index, fresh)
-                        for index, fresh in enumerate(located)
-                        if fresh.page_index == record["page_index"]
-                        and _bbox_iou(record["bbox"], fresh.bbox) >= 0.5
-                    ),
-                    key=lambda item: item[0],
-                    reverse=True,
-                )
-                if (
-                    not candidates
-                    or candidates[0][1] in used
-                    or (
-                        len(candidates) > 1
-                        and candidates[0][0] == candidates[1][0]
+        lesson_rows = db.get_lesson_words(lesson["id"]) if records else []
+        rows_by_block: dict[int, list[dict]] = {}
+        for row in lesson_rows:
+            if row.get("source_block_id") is not None:
+                rows_by_block.setdefault(row["source_block_id"], []).append(row)
+        stale_manifest = [
+            record for record in records
+            if _manifest_record_stale(record)
+        ]
+        stale_rows = [
+            record for record in records
+            if _manifest_rows_stale(record, rows_by_block.get(record["id"], []))
+        ]
+        if stale_manifest or stale_rows:
+            repairs_by_id: dict[int, VocabBlock] = {}
+            if stale_manifest:
+                located = extractor.locate_blocks(pdf, boundary)
+                matches = []
+                used = set()
+                for record in stale_manifest:
+                    candidates = sorted(
+                        (
+                            (_bbox_iou(record["bbox"], fresh.bbox), index, fresh)
+                            for index, fresh in enumerate(located)
+                            if fresh.page_index == record["page_index"]
+                            and _bbox_iou(record["bbox"], fresh.bbox) >= 0.5
+                        ),
+                        key=lambda item: item[0],
+                        reverse=True,
                     )
-                ):
-                    raise RuntimeError("manifest_needs_review")
-                used.add(candidates[0][1])
-                matches.append((record, candidates[0][2]))
-            crop_root = Path(self.db_path).parent / "book_crops"
-            repairs = []
-            for record, fresh in matches:
-                crop = render_block_crop(pdf, fresh)
-                crop_path = (
-                    _write_crop_atomic(
-                        crop_root, self.book_id, lesson["id"],
-                        record["block_no"], crop,
+                    if (
+                        not candidates
+                        or candidates[0][1] in used
+                        or (
+                            len(candidates) > 1
+                            and candidates[0][0] == candidates[1][0]
+                        )
+                    ):
+                        raise RuntimeError("manifest_needs_review")
+                    used.add(candidates[0][1])
+                    matches.append((record, candidates[0][2]))
+                crop_root = Path(self.db_path).parent / "book_crops"
+                for record, fresh in matches:
+                    crop = render_block_crop(pdf, fresh)
+                    crop_path = (
+                        _write_crop_atomic(
+                            crop_root, self.book_id, lesson["id"],
+                            record["block_no"], crop,
+                        )
+                        if crop else None
                     )
-                    if crop else None
-                )
-                repairs.append(replace(
-                    fresh,
-                    id=record["id"],
-                    lesson_id=lesson["id"],
-                    block_no=record["block_no"],
-                    crop_path=crop_path,
-                    status="pending",
-                    ai_attempts=record["ai_attempts"],
-                ))
+                    repairs_by_id[record["id"]] = replace(
+                        fresh,
+                        id=record["id"],
+                        lesson_id=lesson["id"],
+                        block_no=record["block_no"],
+                        crop_path=crop_path,
+                        status="pending",
+                        ai_attempts=record["ai_attempts"],
+                    )
+            for record in stale_rows:
+                if record["id"] not in repairs_by_id:
+                    repairs_by_id[record["id"]] = self._record_to_block(record)
             records = db.repair_import_blocks(
-                lesson["id"], [(block.id, block) for block in repairs]
+                lesson["id"], [(block.id, block) for block in repairs_by_id.values()]
             )
         if not records:
             located = extractor.locate_blocks(pdf, boundary)
@@ -723,6 +735,7 @@ def render_vocab_table_preview(
         if not images:
             raise ValueError("Không kết xuất được crop bảng từ mới")
         return pdf.stack_image_bytes(images, max_width=1200)
+
 def _manifest_record_stale(record: dict) -> bool:
     if record["status"] == "manual":
         return False
@@ -734,6 +747,29 @@ def _manifest_record_stale(record: dict) -> bool:
     if first <= 0 or last <= 0 or last < first:
         return True
     return expected is not None and last - first + 1 != expected
+
+
+def _manifest_rows_stale(record: dict, rows: list[dict]) -> bool:
+    if record["status"] == "manual":
+        return False
+    expected = record["expected_rows"]
+    if not rows:
+        return record["status"] in {"local_ok", "ai_ok"} and expected not in {None, 0}
+    orders = [row["order_no"] for row in rows if row["order_no"] is not None]
+    if len(orders) != len(set(orders)):
+        return True
+
+    first = record["first_order"]
+    last = record["last_order"]
+    if first is not None and last is not None:
+        observed = set(orders)
+        if any(order not in observed for order in range(first, last + 1)):
+            return True
+
+    if expected is not None and len(rows) != expected:
+        return True
+
+    return False
 
 
 def _bbox_iou(

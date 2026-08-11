@@ -44,8 +44,9 @@ cột Trạng thái rồi mới sang phiên sau.
 | B7p | bảo toàn Unicode Windows OCR trong app GUI | `adapter/ocr.py`, `tests/unit/test_pdfsource.py` | xong phần tự động; PowerShell mã hóa JSON UTF-8 thành Base64 ASCII trước khi trả về Python, không còn phụ thuộc console code page; +3 test, toàn suite 318 xanh 3 skip; kiểm chứng detached Bài 1 trả 243/281/212/151 span, không `?`/`�`, locator tìm đúng 3 block 2/6/4 hàng |
 
 | B7q | nhật ký debug lệnh nhập sách | `hanzi_app/main.py`, `hanzi_app/service/importer.py`, `hanzi_app/ui/dialog_import.py`, `tests/unit/test_debug_logging.py` | xong; toàn suite 324 xanh 3 skip; logging chỉ ghi metadata chẩn đoán, không dùng PDF/SQLite/AI thật trong kiểm chứng; privacy/diff scope đạt |
+| B7r | stale manifest recovery khi tiếp tục nhập | `hanzi_app/service/vocab.py`, `hanzi_app/data/userdb.py`, `hanzi_app/service/importer.py`, `tests/unit/test_vocab.py`, `tests/unit/test_userdb.py`, `tests/unit/test_universal_engine.py` | xong; toàn suite 335 xanh 3 skip; STT dương/liên tiếp, tự sửa manifest tự động cũ, clear rows cache sai, giữ block thủ công và `ai_attempts`, ghép mơ hồ báo `manifest_needs_review` |
 
-**Phiên tiếp theo phải làm: người dùng đóng app cũ, chạy `chay-app-go-loi.bat`, tái hiện lỗi nhập sách đúng một lần rồi báo `xong`; agent sẽ đọc `debug-latest.log` để xác định lỗi hiện tại. Chưa tuyên bố đã sửa lỗi import.**
+**Phiên tiếp theo phải làm: người dùng đóng app cũ, chạy `chay-app-go-loi.bat`, bấm tiếp tục nhập phần còn thiếu và nghiệm thu riêng Bài 3 đúng một lần rồi báo `xong` hoặc gửi lỗi; agent sẽ đọc `debug-latest.log` nếu còn lỗi. Chưa chạy tiếp toàn sách trước khi Bài 3 qua.**
 
 Phiên 08a thêm đúng ba phương thức: `UserDb.undo_review`, `DictDb.candidate_meanings`
 và `DictDb.candidate_hanviet`, không đổi lược đồ, không thêm bậc migration. Hoàn tác

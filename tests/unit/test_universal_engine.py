@@ -1306,6 +1306,14 @@ def test_resume_repairs_stale_block_and_preserves_valid_manual_blocks(tmp_path):
         VocabRow(1, "old", "c2", None, None, 1, "regex", False, None,
                  source_block_id=records[0]["id"])
     ])
+    db.replace_vocab_block(records[1]["id"], [
+        VocabRow(1, "valid", "c2", None, None, 2, "regex", False, None,
+                 source_block_id=records[1]["id"])
+    ])
+    db.replace_vocab_block(records[2]["id"], [
+        VocabRow(1, "manual", "c2", None, None, 3, "manual", False, None,
+                 source_block_id=records[2]["id"])
+    ])
     db.close()
 
     fresh = VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2)
@@ -1327,7 +1335,11 @@ def test_resume_repairs_stale_block_and_preserves_valid_manual_blocks(tmp_path):
     assert repaired[0].first_order == 1
     assert repaired[0].status == "pending"
     assert Path(repaired[0].crop_path).read_bytes() == b"fresh-crop"
-    assert reopened.get_lesson_words(lesson["id"]) == []
+    remaining_rows = reopened.get_lesson_words(lesson["id"])
+    assert [row["word"] for row in remaining_rows] == ["valid", "manual"]
+    assert {row["source_block_id"] for row in remaining_rows} == {
+        records[1]["id"], records[2]["id"]
+    }
     saved = reopened.get_import_blocks(lesson["id"])
     assert saved[1]["status"] == "local_ok"
     assert saved[2]["status"] == "manual"
@@ -1363,4 +1375,72 @@ def test_resume_rejects_ambiguous_stale_manifest_without_mutation(tmp_path):
 
     assert reopened.get_import_blocks(lesson["id"]) == before
     assert not (Path(db_path).parent / "book_crops").exists()
+    reopened.close()
+
+
+def test_resume_clears_stale_rows_for_valid_automatic_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Rows", "book.pdf", "resume-stale-rows", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "valid.png", 2, 1, 2,
+                   "ai_ok", 2)
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(1, "one", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+        VocabRow(2, "two", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+        VocabRow(3, "three", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+    ])
+    db.close()
+
+    extractor = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].id == record["id"]
+    assert blocks[0].status == "pending"
+    assert blocks[0].ai_attempts == 2
+    assert blocks[0].first_order == 1
+    assert blocks[0].last_order == 2
+    assert reopened.get_lesson_words(lesson["id"]) == []
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
+
+
+def test_resume_clears_zero_rows_for_valid_automatic_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Zero Rows", "book.pdf", "resume-zero-rows", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "valid.png", 2, 1, 2,
+                   "local_ok", 2)
+    ])[0]
+    db.close()
+
+    extractor = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].id == record["id"]
+    assert blocks[0].status == "pending"
+    assert blocks[0].ai_attempts == 2
+    assert reopened.get_lesson_words(lesson["id"]) == []
+    extractor.locate_blocks.assert_not_called()
     reopened.close()

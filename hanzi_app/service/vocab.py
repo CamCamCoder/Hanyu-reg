@@ -403,6 +403,7 @@ def _region_evidence(
                 int(span.text.strip())
                 for span in line
                 if re.fullmatch(r"\d{1,3}", span.text.strip())
+                and int(span.text.strip()) >= 1
             })
             if len(values) >= 2 and any(
                 right == left + 1

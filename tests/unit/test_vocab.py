@@ -797,6 +797,32 @@ def test_locator_persists_range_for_strict_order_evidence():
 
     assert len(blocks) == 1
     assert (blocks[0].first_order, blocks[0].last_order) == (1, 3)
+
+
+def test_locator_parallel_order_line_ignores_zero_as_order_start():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("New Words", 20, 40, 100, 18),
+        _span("0", 20, 70, 20),
+        _span("1", 60, 70, 20),
+        _span("2", 100, 70, 20),
+        _span("你好", 80, 110, 45),
+        _span("nǐhǎo", 160, 110, 70),
+        _span("hello", 260, 110, 70),
+        _span("谢谢", 80, 140, 45),
+        _span("xièxie", 160, 140, 70),
+        _span("thanks", 260, 140, 70),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(19, "Lesson 19", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert (blocks[0].first_order, blocks[0].last_order) == (1, 2)
+
+
 def test_coverage_rejects_duplicate_orders_with_different_rows():
     block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2)
     rows = [_block_row("A", 1, 7), _block_row("B", 1, 7)]
