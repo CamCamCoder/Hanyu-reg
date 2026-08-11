@@ -1416,6 +1416,73 @@ class VocabExtractor:
         ]
 
     @staticmethod
+    def _renumber_ai_rows_for_known_range(
+        block: VocabBlock, rows: list[VocabRow]
+    ) -> list[VocabRow]:
+        if block.first_order is None or block.last_order is None:
+            return rows
+        expected = block.last_order - block.first_order + 1
+        if len(rows) != expected:
+            return rows
+        return [
+            replace(row, order_no=block.first_order + offset)
+            for offset, row in enumerate(rows)
+        ]
+
+    @staticmethod
+    def _ai_candidate_block(
+        block: VocabBlock, rows: list[VocabRow]
+    ) -> VocabBlock:
+        if block.first_order is not None or block.last_order is not None:
+            return block
+        if block.expected_rows is None or len(rows) <= block.expected_rows:
+            return block
+        orders = [row.order_no for row in rows if row.order_no is not None]
+        if len(orders) != len(rows) or len(orders) != len(set(orders)):
+            return block
+        return replace(block, expected_rows=len(rows))
+
+    def _select_block_rows(
+        self,
+        block: VocabBlock,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+    ) -> tuple[VocabBlock, list[VocabRow], BlockCoverage]:
+        if ai_rows:
+            ai_candidate = self._renumber_ai_rows_for_known_range(block, ai_rows)
+            ai_block = self._ai_candidate_block(block, ai_candidate)
+            ai_report = self.validate_block_coverage(
+                ai_block,
+                [],
+                ai_candidate,
+                ai_candidate,
+            )
+            if ai_report.passed:
+                return ai_block, ai_candidate, ai_report
+
+        final = self.merge_block_rows(local_rows, ai_rows)
+        report = self.validate_block_coverage(
+            block,
+            local_rows,
+            ai_rows,
+            final,
+        )
+        return block, final, report
+
+    def reconcile_checkpointed_block(
+        self, block: VocabBlock, rows: list[VocabRow]
+    ) -> tuple[VocabBlock, list[VocabRow]] | None:
+        local_rows = [row for row in rows if row.extract_by == "regex"]
+        ai_rows = [row for row in rows if row.extract_by != "regex"]
+        selected_block, selected_rows, report = self._select_block_rows(
+            block, local_rows, ai_rows
+        )
+        if not report.passed:
+            return None
+        status = "ai_ok" if ai_rows else "local_ok"
+        return replace(selected_block, status=status), selected_rows
+
+    @staticmethod
     def _coverage_issue(
         report: BlockCoverage, issue: str
     ) -> BlockCoverage:
@@ -1513,15 +1580,15 @@ class VocabExtractor:
                 continue
 
             ai_rows[index].extend(extracted)
-            final_rows[index] = self.merge_block_rows(
-                local_rows[index], ai_rows[index]
+            selected_block, selected_rows, selected_report = self._select_block_rows(
+                block, local_rows[index], ai_rows[index]
             )
-            reports[index] = self.validate_block_coverage(
-                block,
-                local_rows[index],
-                ai_rows[index],
-                final_rows[index],
-            )
+            blocks[index] = selected_block
+            ai_rows[index] = [
+                row for row in selected_rows if row.extract_by != "regex"
+            ]
+            final_rows[index] = selected_rows
+            reports[index] = selected_report
             if not reports[index].passed and attempts < remaining:
                 queue.append(index)
 

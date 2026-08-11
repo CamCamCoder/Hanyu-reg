@@ -1,5 +1,6 @@
 """Kiểm thử unit cho service/vocab.py."""
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 from hanzi_app.data.models import LessonBoundary, TextSpan, VocabBlock, VocabRow
@@ -841,6 +842,79 @@ def test_coverage_rejects_extra_rows():
 
     assert report.passed is False
     assert "expected_row_mismatch" in report.issues
+
+
+def test_extract_blocks_prefers_passing_ai_rows_over_noisy_local(monkeypatch):
+    extractor = VocabExtractor()
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 4, None, None)
+    local = [_block_row("local-noise", 1, 7)]
+    ai = [
+        replace(_block_row(f"ai-{i}", i, 7, pinyin="ai"), extract_by="vision")
+        for i in range(9, 13)
+    ]
+    monkeypatch.setattr(extractor, "_extract_local_block", lambda _pdf, _block: local)
+    monkeypatch.setattr(extractor, "extract_by_llm_image", lambda *_args, **_kwargs: ai)
+
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    client = MagicMock()
+    client.is_configured.return_value = True
+
+    result = extractor.extract_blocks(pdf, [block], client)
+
+    assert result.complete is True
+    assert [row.word for row in result.rows] == [f"ai-{i}" for i in range(9, 13)]
+    assert result.blocks[0].status == "ai_ok"
+
+
+def test_extract_blocks_accepts_ai_count_when_manifest_has_no_order_range(monkeypatch):
+    extractor = VocabExtractor()
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 6, None, None)
+    local = [_block_row(f"local-{i}", i, 7) for i in range(1, 4)]
+    ai = [
+        replace(_block_row(f"ai-{i}", i, 7, pinyin="ai"), extract_by="vision")
+        for i in range(2, 9)
+    ]
+    monkeypatch.setattr(extractor, "_extract_local_block", lambda _pdf, _block: local)
+    monkeypatch.setattr(extractor, "extract_by_llm_image", lambda *_args, **_kwargs: ai)
+
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    client = MagicMock()
+    client.is_configured.return_value = True
+
+    result = extractor.extract_blocks(pdf, [block], client)
+
+    assert result.complete is True
+    assert len(result.rows) == 7
+    assert result.blocks[0].expected_rows == 7
+    assert result.blocks[0].status == "ai_ok"
+
+
+def test_extract_blocks_renumbers_ai_rows_when_range_count_matches(monkeypatch):
+    extractor = VocabExtractor()
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2)
+    local = [_block_row(f"local-{i}", i, 7) for i in range(1, 5)]
+    ai = [
+        replace(_block_row("hello", 1, 7, pinyin="ai"), extract_by="vision"),
+        replace(_block_row("teacher", 1, 7, pinyin="ai"), extract_by="vision"),
+    ]
+    monkeypatch.setattr(extractor, "_extract_local_block", lambda _pdf, _block: local)
+    monkeypatch.setattr(extractor, "extract_by_llm_image", lambda *_args, **_kwargs: ai)
+
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    client = MagicMock()
+    client.is_configured.return_value = True
+
+    result = extractor.extract_blocks(pdf, [block], client)
+
+    assert result.complete is True
+    assert [(row.order_no, row.word) for row in result.rows] == [
+        (1, "hello"),
+        (2, "teacher"),
+    ]
+    assert result.blocks[0].status == "ai_ok"
 
 
 

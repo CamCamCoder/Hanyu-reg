@@ -22,10 +22,13 @@ from hanzi_app.data.models import (
     LessonBoundary,
     SplitResult,
     VocabBlock,
+    VocabRow,
 )
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.service.vocab import VocabExtractor, render_block_crop
+
+_REAL_VOCAB_EXTRACTOR = VocabExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +251,22 @@ class VocabImporterWorker(QThread):
             record["ai_attempts"],
         )
 
+    @staticmethod
+    def _row_record_to_vocab(row: dict) -> VocabRow:
+        return VocabRow(
+            row["order_no"],
+            row["word"],
+            row["pinyin_src"],
+            row["pos"],
+            row["meaning_src"],
+            row["source_page"],
+            row["extract_by"],
+            bool(row["needs_review"]),
+            None,
+            hanviet_src=row.get("hanviet_src"),
+            source_block_id=row.get("source_block_id"),
+        )
+
     def _load_or_create_blocks(
         self,
         db: UserDb,
@@ -262,6 +281,37 @@ class VocabImporterWorker(QThread):
         for row in lesson_rows:
             if row.get("source_block_id") is not None:
                 rows_by_block.setdefault(row["source_block_id"], []).append(row)
+        reconciled = False
+        if isinstance(extractor, _REAL_VOCAB_EXTRACTOR):
+            for record in records:
+                if record["status"] == "manual":
+                    continue
+                cached = rows_by_block.get(record["id"], [])
+                if not cached:
+                    continue
+                result = extractor.reconcile_checkpointed_block(
+                    self._record_to_block(record),
+                    [self._row_record_to_vocab(row) for row in cached],
+                )
+                if result is None:
+                    continue
+                block, rows = result
+                db.replace_vocab_block(record["id"], rows)
+                db.update_import_block(
+                    record["id"],
+                    status=block.status,
+                    ai_attempts=block.ai_attempts,
+                    crop_path=block.crop_path,
+                )
+                reconciled = True
+        if reconciled:
+            records = db.get_import_blocks(lesson["id"])
+            lesson_rows = db.get_lesson_words(lesson["id"])
+            rows_by_block = {}
+            for row in lesson_rows:
+                if row.get("source_block_id") is not None:
+                    rows_by_block.setdefault(row["source_block_id"], []).append(row)
+
         stale_manifest = [
             record for record in records
             if _manifest_record_stale(record)
