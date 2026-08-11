@@ -95,6 +95,12 @@ _VOCAB_HEADING_MARKERS = (
     "新词",
     "từmới",
 )
+_NON_VOCAB_REFERENCE_TERMS = frozenset({
+    "名词", "动词", "形容", "形容词", "代词", "量词", "助动", "助动词",
+    "数量", "来自本册", "新词", "汉字", "拼音", "词类",
+})
+MAX_AI_ATTEMPTS_PER_BLOCK = 3
+
 _PINYIN_INITIALS = (
     "",
     "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
@@ -138,6 +144,36 @@ def _has_vocab_heading(spans: list[TextSpan]) -> bool:
     if spans and any(not hasattr(span, "bbox") for span in spans):
         return _line_has_vocab_heading(spans)
     return any(_line_has_vocab_heading(line) for line in _line_groups(spans))
+
+
+def _looks_like_non_vocab_reference_region(spans: list[TextSpan]) -> bool:
+    texts = [re.sub(r"\s+", "", span.text.strip()) for span in spans]
+    joined = "".join(texts)
+    term_hits = sum(
+        1 for term in _NON_VOCAB_REFERENCE_TERMS
+        if term in joined or any(term == text for text in texts)
+    )
+    if "来自本册" in joined and "新词" in joined:
+        return True
+    if term_hits < 2:
+        return False
+    lines = _line_groups(spans)
+    pinyin_rows = sum(
+        1 for line in lines
+        if any(RE_CJK_WORD.search(span.text) for span in line)
+        and any(_is_pinyin_text(span.text) for span in line)
+    )
+    vocab_like_rows = [
+        line for line in lines
+        if any(RE_CJK_WORD.search(span.text) for span in line)
+        and not all(
+            re.sub(r"\s+", "", span.text.strip()) in _NON_VOCAB_REFERENCE_TERMS
+            or re.fullmatch(r"\d{1,3}", span.text.strip())
+            for span in line
+            if span.text.strip()
+        )
+    ]
+    return pinyin_rows < 2 and len(vocab_like_rows) <= term_hits + 1
 
 
 def _segment_plain_pinyin(value: str) -> tuple[str, ...] | None:
@@ -577,6 +613,16 @@ class VocabExtractor:
                     aligned_columns,
                     strong_pinyin_rows,
                 ) = _region_evidence(region)
+                region_lines = _line_groups(region)
+                has_data_text = any(
+                    any(RE_CJK_WORD.search(span.text) for span in line)
+                    and not _line_has_vocab_heading(line)
+                    for line in region_lines
+                )
+                if not has_data_text:
+                    continue
+                if _looks_like_non_vocab_reference_region(region):
+                    continue
                 has_heading = _has_vocab_heading(region)
                 has_rows = len(row_lines) >= 2 and (
                     strong_pinyin_rows >= 1
@@ -1514,7 +1560,7 @@ class VocabExtractor:
         blocks: list[VocabBlock],
         ai_client: AiClient | None = None,
     ) -> ExtractionResult:
-        """Extract blocks with a three-request budget shared by one lesson."""
+        """Extract blocks with one Vision request per pending block per run."""
         local_rows: list[list[VocabRow]] = []
         ai_rows: list[list[VocabRow]] = []
         final_rows: list[list[VocabRow]] = []
@@ -1530,18 +1576,29 @@ class VocabExtractor:
             final_rows.append(final)
             reports.append(report)
 
-        prior_attempts = max(
-            self.lesson_ai_attempts,
-            sum(block.ai_attempts for block in blocks),
-        )
-        remaining = max(0, 3 - prior_attempts)
+        configured = ai_client is not None and ai_client.is_configured()
+        remaining_by_block = [
+            1
+            if configured
+            and not report.passed
+            and block.ai_attempts < MAX_AI_ATTEMPTS_PER_BLOCK
+            else 0
+            for block, report in zip(blocks, reports)
+        ]
         queue = [
             index
-            for index, report in enumerate(reports)
-            if not report.passed
+            for index, remaining in enumerate(remaining_by_block)
+            if remaining > 0
         ]
+        for index, report in enumerate(reports):
+            if (
+                configured
+                and not report.passed
+                and blocks[index].ai_attempts >= MAX_AI_ATTEMPTS_PER_BLOCK
+            ):
+                reports[index] = self._coverage_issue(report, "ai_exhausted")
         attempts = 0
-        configured = ai_client is not None and ai_client.is_configured()
+        remaining = sum(remaining_by_block)
 
         while configured and queue and attempts < remaining:
             index = queue.pop(0)
@@ -1580,7 +1637,10 @@ class VocabExtractor:
                 reports[index] = self._coverage_issue(
                     reports[index], "ai_empty"
                 )
-                if attempts < remaining:
+                if (
+                    attempt_counts[index] < remaining_by_block[index]
+                    and attempts < remaining
+                ):
                     queue.append(index)
                 continue
 
@@ -1594,7 +1654,11 @@ class VocabExtractor:
             ]
             final_rows[index] = selected_rows
             reports[index] = selected_report
-            if not reports[index].passed and attempts < remaining:
+            if (
+                not reports[index].passed
+                and attempt_counts[index] < remaining_by_block[index]
+                and attempts < remaining
+            ):
                 queue.append(index)
 
         updated: list[VocabBlock] = []
@@ -1613,7 +1677,7 @@ class VocabExtractor:
             ))
             all_rows.extend(final_rows[index])
 
-        self.lesson_ai_attempts = prior_attempts + attempts
+        self.lesson_ai_attempts = sum(block.ai_attempts for block in blocks) + attempts
         return ExtractionResult(
             tuple(self.merge_block_rows(all_rows, [])),
             tuple(reports),

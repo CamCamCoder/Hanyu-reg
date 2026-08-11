@@ -1020,7 +1020,7 @@ def test_crop_writer_cleans_temp_and_preserves_previous_crop_on_replace_failure(
     assert target.read_bytes() == b"previous"
     assert not list(tmp_path.rglob("*.tmp"))
 
-def test_vocab_ai_budget_is_three_per_lesson(monkeypatch):
+def test_vocab_ai_budget_gives_each_pending_block_one_attempt(monkeypatch):
     pdf = MagicMock()
     pdf.get_page_crop_image_bytes.return_value = b"crop"
     blocks = [
@@ -1041,8 +1041,8 @@ def test_vocab_ai_budget_is_three_per_lesson(monkeypatch):
     result = extractor.extract_blocks(pdf, blocks, ai_client=client)
 
     assert result.complete is False
-    assert result.ai_attempts == 3
-    assert client.extract_vocab_from_image.call_count == 3
+    assert result.ai_attempts == 4
+    assert client.extract_vocab_from_image.call_count == 4
 
 
 def test_429_result_carries_consumed_attempt(monkeypatch):

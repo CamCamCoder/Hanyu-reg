@@ -800,6 +800,29 @@ def test_locator_persists_range_for_strict_order_evidence():
     assert (blocks[0].first_order, blocks[0].last_order) == (1, 3)
 
 
+def test_locator_rejects_grammar_reference_table_false_positive():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("生词", 20, 40, 80, 18),
+        _span("1", 20, 90, 20),
+        _span("名词", 80, 90, 45),
+        _span("2", 20, 120, 20),
+        _span("动词", 80, 120, 45),
+        _span("3", 20, 150, 20),
+        _span("形容词", 80, 150, 60),
+        _span("4", 20, 180, 20),
+        _span("来自本册", 80, 180, 80),
+        _span("5", 20, 210, 20),
+        _span("新词", 80, 210, 45),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(25, "summary", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
 def test_locator_parallel_order_line_ignores_zero_as_order_start():
     pdf = MagicMock()
     pdf.page_count.return_value = 1
