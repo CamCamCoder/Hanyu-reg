@@ -799,6 +799,111 @@ def render_vocab_table_preview(
             raise ValueError("Không kết xuất được crop bảng từ mới")
         return pdf.stack_image_bytes(images, max_width=1200)
 
+_GRAMMAR_TABLE_TERMS = frozenset({
+    "名词", "动词", "形容", "形容词", "代词", "量词", "助动", "助动词",
+    "数量", "来自本册", "新词", "汉字", "拼音", "词类",
+})
+
+
+def _row_words(rows: list[dict]) -> list[str]:
+    return [str(row.get("word") or "").strip() for row in rows]
+
+
+def _grammar_table_score(words: list[str]) -> int:
+    return sum(1 for word in words if word in _GRAMMAR_TABLE_TERMS)
+
+
+def _classify_import_block(record: dict, rows: list[dict]) -> tuple[str, ...]:
+    issues: list[str] = []
+    first = record["first_order"]
+    last = record["last_order"]
+    expected = record["expected_rows"]
+    orders = [row["order_no"] for row in rows if row.get("order_no") is not None]
+    words = _row_words(rows)
+
+    if record["status"] not in {"local_ok", "ai_ok", "manual"}:
+        issues.append("INCOMPLETE_BLOCK")
+    if not rows:
+        issues.append("EMPTY_BLOCK")
+    if len(orders) != len(set(orders)):
+        issues.append("DUPLICATE_ORDERS")
+    if first is not None and last is not None:
+        observed = set(orders)
+        if any(order not in observed for order in range(first, last + 1)):
+            issues.append("MISSING_ORDERS")
+    if expected is not None and len(rows) != expected:
+        issues.append("ROW_COUNT_MISMATCH")
+    if _grammar_table_score(words) >= 2 or any(
+        token in words for token in ("来自本册", "新词")
+    ):
+        issues.append("GRAMMAR_TABLE_FALSE_POSITIVE")
+    if rows and all((row.get("extract_by") == "regex") for row in rows):
+        short_rows = [word for word in words if len(word) <= 2]
+        if len(short_rows) == len(words) and any(
+            issue in issues for issue in ("MISSING_ORDERS", "ROW_COUNT_MISMATCH")
+        ):
+            issues.append("OCR_NOISE")
+    if record["status"] not in {"local_ok", "ai_ok", "manual"} and record[
+        "ai_attempts"
+    ] >= 3:
+        issues.append("AI_EXHAUSTED")
+    return tuple(dict.fromkeys(issues))
+
+
+def collect_import_issues(db: UserDb, book_id: int) -> list[dict]:
+    """Return a read-only, whole-book import issue report for triage."""
+    issues: list[dict] = []
+    for lesson in db.get_lessons(book_id):
+        if lesson["index_no"] < 0:
+            continue
+        blocks = db.get_import_blocks(lesson["id"])
+        if not blocks:
+            issues.append({
+                "lesson_id": lesson["id"],
+                "lesson_no": lesson["index_no"],
+                "lesson_title": lesson.get("title"),
+                "page_start": lesson["page_start"],
+                "page_end": lesson["page_end"],
+                "block_id": None,
+                "block_no": None,
+                "status": "missing",
+                "issues": ("NO_BLOCKS",),
+                "saved_rows": 0,
+                "ai_attempts": 0,
+                "sample_words": (),
+                "crop_path": None,
+            })
+            continue
+        lesson_rows = db.get_lesson_words(lesson["id"])
+        for block in blocks:
+            rows = [
+                row for row in lesson_rows
+                if row.get("source_block_id") == block["id"]
+            ]
+            block_issues = _classify_import_block(block, rows)
+            if not block_issues:
+                continue
+            issues.append({
+                "lesson_id": lesson["id"],
+                "lesson_no": lesson["index_no"],
+                "lesson_title": lesson.get("title"),
+                "page_start": lesson["page_start"],
+                "page_end": lesson["page_end"],
+                "block_id": block["id"],
+                "block_no": block["block_no"],
+                "page_index": block["page_index"],
+                "status": block["status"],
+                "issues": block_issues,
+                "expected_rows": block["expected_rows"],
+                "first_order": block["first_order"],
+                "last_order": block["last_order"],
+                "saved_rows": len(rows),
+                "ai_attempts": block["ai_attempts"],
+                "sample_words": tuple(_row_words(rows)[:8]),
+                "crop_path": block["crop_path"],
+            })
+    return issues
+
 def _manifest_record_stale(record: dict) -> bool:
     if record["status"] == "manual":
         return False

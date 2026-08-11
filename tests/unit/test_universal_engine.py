@@ -27,6 +27,7 @@ from hanzi_app.service.importer import (
     BookImporterWorker,
     VocabImporterWorker,
     _write_crop_atomic,
+    collect_import_issues,
 )
 from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
@@ -1066,6 +1067,51 @@ def test_429_result_carries_consumed_attempt(monkeypatch):
     assert "rate_limited" in result.coverage[0].issues
 
 
+def test_collect_import_issues_groups_whole_book_failures(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Issues", "book.pdf", "issue-report", 40)
+    db.replace_lessons(
+        book_id,
+        [
+            LessonBoundary(1, "Missing rows", 0, 4, 1.0, "lesson"),
+            LessonBoundary(2, "Grammar table", 5, 9, 1.0, "lesson"),
+            LessonBoundary(3, "No blocks", 10, 14, 1.0, "lesson"),
+        ],
+    )
+    lesson_1, lesson_2, _lesson_3 = db.get_lessons(book_id)
+    block_1 = db.replace_import_blocks(lesson_1["id"], [
+        VocabBlock(None, lesson_1["id"], 1, 1, (0, 0, 100, 200), "b1.png", 2, 1, 2,
+                   "incomplete", 3)
+    ])[0]
+    db.replace_vocab_block(block_1["id"], [
+        VocabRow(1, "音", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block_1["id"]),
+    ])
+    block_2 = db.replace_import_blocks(lesson_2["id"], [
+        VocabBlock(None, lesson_2["id"], 1, 6, (0, 0, 100, 200), "b2.png", 3, None, None,
+                   "incomplete", 1)
+    ])[0]
+    db.replace_vocab_block(block_2["id"], [
+        VocabRow(1, "名词", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+        VocabRow(2, "动词", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+        VocabRow(3, "形容", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+    ])
+
+    issues = collect_import_issues(db, book_id)
+
+    by_lesson = {item["lesson_no"]: item for item in issues}
+    assert set(by_lesson) == {1, 2, 3}
+    assert by_lesson[1]["issues"] == (
+        "INCOMPLETE_BLOCK", "MISSING_ORDERS", "ROW_COUNT_MISMATCH",
+        "OCR_NOISE", "AI_EXHAUSTED",
+    )
+    assert by_lesson[1]["sample_words"] == ("音",)
+    assert "GRAMMAR_TABLE_FALSE_POSITIVE" in by_lesson[2]["issues"]
+    assert by_lesson[3]["issues"] == ("NO_BLOCKS",)
+    db.close()
 def test_vocab_import_skips_incomplete_block_and_continues_later_lessons(
     tmp_path, monkeypatch
 ):
