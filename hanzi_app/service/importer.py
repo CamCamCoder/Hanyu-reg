@@ -296,6 +296,7 @@ class VocabImporterWorker(QThread):
                 if result is None:
                     continue
                 block, rows = result
+                db.repair_import_blocks(lesson["id"], [(record["id"], block)])
                 db.replace_vocab_block(record["id"], rows)
                 db.update_import_block(
                     record["id"],

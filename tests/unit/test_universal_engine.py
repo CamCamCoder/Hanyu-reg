@@ -1419,6 +1419,47 @@ def test_resume_reconciles_cached_ai_rows_without_resetting_attempts(tmp_path):
     extractor.locate_blocks.assert_not_called()
     reopened.close()
 
+def test_resume_reconciles_range_manifest_count_without_relocating(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Cached range", "book.pdf", "cached-range", 10)
+    db.replace_lessons(book_id, [LessonBoundary(2, "Two", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 3, 9, 12,
+                   "ai_ok", 1)
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(order, f"word-{order}", "ai", None, None, 1, "vision", False, None,
+                 source_block_id=record["id"])
+        for order in range(9, 13)
+    ])
+    db.close()
+
+    extractor = VocabExtractor()
+    extractor.locate_blocks = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(2, "Two", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].status == "ai_ok"
+    assert blocks[0].expected_rows == 4
+    assert blocks[0].ai_attempts == 1
+    saved = reopened.get_import_blocks(lesson["id"])[0]
+    assert saved["expected_rows"] == 4
+    assert [(row["order_no"], row["word"], row["extract_by"])
+            for row in reopened.get_lesson_words(lesson["id"])] == [
+        (9, "word-9", "vision"),
+        (10, "word-10", "vision"),
+        (11, "word-11", "vision"),
+        (12, "word-12", "vision"),
+    ]
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
 def test_resume_clears_stale_rows_for_valid_automatic_manifest(tmp_path):
     db_path = str(tmp_path / "user.sqlite")
     db = UserDb(db_path)

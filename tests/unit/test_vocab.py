@@ -891,6 +891,32 @@ def test_extract_blocks_accepts_ai_count_when_manifest_has_no_order_range(monkey
     assert result.blocks[0].status == "ai_ok"
 
 
+def test_extract_blocks_normalizes_expected_rows_to_known_range(monkeypatch):
+    extractor = VocabExtractor()
+    block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 3, 9, 12)
+    ai = [
+        replace(_block_row(f"ai-{i}", i, 7, pinyin="ai"), extract_by="vision")
+        for i in range(9, 13)
+    ]
+    monkeypatch.setattr(extractor, "_extract_local_block", lambda _pdf, _block: [])
+    monkeypatch.setattr(extractor, "extract_by_llm_image", lambda *_args, **_kwargs: ai)
+
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    client = MagicMock()
+    client.is_configured.return_value = True
+
+    result = extractor.extract_blocks(pdf, [block], client)
+
+    assert result.complete is True
+    assert result.blocks[0].expected_rows == 4
+    assert [(row.order_no, row.word) for row in result.rows] == [
+        (9, "ai-9"),
+        (10, "ai-10"),
+        (11, "ai-11"),
+        (12, "ai-12"),
+    ]
+    assert result.blocks[0].status == "ai_ok"
 def test_extract_blocks_renumbers_ai_rows_when_range_count_matches(monkeypatch):
     extractor = VocabExtractor()
     block = VocabBlock(7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2)

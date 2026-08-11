@@ -1433,6 +1433,11 @@ class VocabExtractor:
     def _ai_candidate_block(
         block: VocabBlock, rows: list[VocabRow]
     ) -> VocabBlock:
+        if block.first_order is not None and block.last_order is not None:
+            range_count = block.last_order - block.first_order + 1
+            if range_count > 0 and len(rows) == range_count:
+                return replace(block, expected_rows=range_count)
+            return block
         if block.first_order is not None or block.last_order is not None:
             return block
         if block.expected_rows is None or len(rows) <= block.expected_rows:
