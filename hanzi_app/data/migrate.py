@@ -15,7 +15,7 @@ Tầng data không import bất cứ thứ gì của Qt.
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _TAO_BANG_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -223,11 +223,19 @@ def _len_bac_3(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE progress_source_lw_map")
 
 
+def _len_bac_4(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE import_block ADD COLUMN region_decision TEXT NOT NULL "
+                 "DEFAULT 'auto' CHECK(region_decision IN ('auto','review','accepted','skipped'))")
+    conn.execute("ALTER TABLE import_block ADD COLUMN region_revision INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE import_block SET region_decision='accepted' WHERE status='manual'")
+
+
 # Bậc n chạy khi tệp đang ở bậc n-1. Bản sau chỉ thêm một dòng vào đây.
 _CAC_BAC = {
     1: _len_bac_1,
     2: _len_bac_2,
     3: _len_bac_3,
+    4: _len_bac_4,
 }
 
 

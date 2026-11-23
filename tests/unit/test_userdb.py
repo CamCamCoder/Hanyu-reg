@@ -178,7 +178,7 @@ def test_02_schema_version_co_dung_mot_dong_version_hien_tai(db, duong_dan):
     # 06b thêm bậc 2, nên con số chốt ở đây đổi theo; bảng vẫn phải đúng một dòng.
     dong = doc_schema_version(duong_dan)
     assert len(dong) == 1
-    assert dong[0][0] == 3 == SCHEMA_VERSION
+    assert dong[0][0] == 4 == SCHEMA_VERSION
     assert dong[0][1]          # applied_at không rỗng
 
 
@@ -708,7 +708,7 @@ def test_06b_e_schema_version_sau_khi_nang_cap_dung_mot_dong_bang_2(duong_dan):
 
     dong = doc_schema_version(duong_dan)
     assert len(dong) == 1
-    assert dong[0][0] == 3 == SCHEMA_VERSION
+    assert dong[0][0] == 4 == SCHEMA_VERSION
 
 
 # ----------------------------------------- 06c: manifest block nhập từ mới
@@ -762,7 +762,7 @@ def test_migration_3_preserves_progress_source_and_allows_repeated_word(tmp_path
         db.replace_vocab_block(blocks[0]["id"], [vocab("你好", 1)])
         db.replace_vocab_block(blocks[1]["id"], [vocab("你好", 2)])
 
-        assert migrate.current_version(db._conn) == 3
+        assert migrate.current_version(db._conn) == 4
         assert [row["id"] for row in db.get_lesson_words(lesson_id)] == [7, 8, 9]
         assert db._conn.execute(
             "SELECT source_lw_id FROM progress WHERE word='你好'"
@@ -1013,6 +1013,46 @@ def test_repair_import_blocks_preserves_id_attempts_and_clears_rows(db):
     assert db.get_lesson_words(lesson_id) == []
 
 
+def test_delete_import_blocks_removes_only_selected_non_manual_rows(db):
+    book_id = them_sach(db, "Delete blocks", "delete-blocks")
+    db.replace_lessons(book_id, [bound(1, 0, 9)])
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    first, second = db.replace_import_blocks(lesson_id, [
+        VocabBlock(None, lesson_id, 1, 1, (0, 0, 100, 100), "a.png", 1, 1, 1,
+                   "incomplete", 2),
+        VocabBlock(None, lesson_id, 2, 2, (0, 0, 100, 100), "b.png", 1, 2, 2,
+                   "ai_ok", 1),
+    ])
+    db.replace_vocab_block(first["id"], [vocab("bad", 1)])
+    db.replace_vocab_block(second["id"], [vocab("good", 2)])
+
+    remaining = db.delete_import_blocks(lesson_id, [first["id"]])
+
+    assert [block["id"] for block in remaining] == [second["id"]]
+    rows = db.get_lesson_words(lesson_id)
+    assert [(row["word"], row["source_block_id"]) for row in rows] == [
+        ("good", second["id"]),
+    ]
+
+
+def test_delete_import_blocks_rejects_manual_without_mutation(db):
+    book_id = them_sach(db, "Delete manual", "delete-manual")
+    db.replace_lessons(book_id, [bound(1, 0, 9)])
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    record = db.replace_import_blocks(lesson_id, [
+        VocabBlock(None, lesson_id, 1, 1, (0, 0, 100, 100), "manual.png", 1, 1, 1,
+                   "manual", 0),
+    ])[0]
+    db.replace_vocab_block(record["id"], [vocab("manual", 1)])
+    before_blocks = db.get_import_blocks(lesson_id)
+    before_rows = db.get_lesson_words(lesson_id)
+
+    with pytest.raises(ValueError):
+        db.delete_import_blocks(lesson_id, [record["id"]])
+
+    assert db.get_import_blocks(lesson_id) == before_blocks
+    assert db.get_lesson_words(lesson_id) == before_rows
+
 def test_repair_import_blocks_rejects_manual_without_mutation(db):
     book_id = them_sach(db, "Manual repair", "repair-manual")
     db.replace_lessons(book_id, [bound(1, 0, 9)])
@@ -1033,3 +1073,55 @@ def test_repair_import_blocks_rejects_manual_without_mutation(db):
 
     assert db.get_import_blocks(lesson_id) == before
     assert db.get_lesson_words(lesson_id) == before_rows
+
+
+def test_migration_4_preserves_manual_block_and_source(tmp_path):
+    path = create_version_2_database_with_source_word(tmp_path)
+    with sqlite3.connect(path) as conn:
+        migrate._len_bac_3(conn)
+        migrate._ghi_version(conn, 3)
+        conn.execute("INSERT INTO import_block(id,lesson_id,block_no,page_index,bbox_x0,"
+                     "bbox_y0,bbox_x1,bbox_y1,status,crop_path) "
+                     "VALUES(12,1,1,3,2,3,100,200,'manual','old.png')")
+        conn.execute("UPDATE lesson_word SET source_block_id=12 WHERE id=7")
+    upgraded = UserDb(str(path))
+    try:
+        record, = upgraded.get_import_blocks(1)
+        assert (record["region_decision"], record["region_revision"], record["crop_path"]) == ("accepted", 0, "old.png")
+        assert upgraded.get_lesson_words(1)[0]["source_block_id"] == 12
+        assert upgraded._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        upgraded.close()
+
+
+def test_region_decisions_preserve_neighbour_manual_edits_and_reject_stale_write(db):
+    bid = them_sach(db, "Khung", "regions")
+    db.replace_lessons(bid, [bound(1, 0, 4)])
+    lid = db.get_lessons(bid)[0]["id"]
+    box = (20, 30, 110, 210)
+    first = db.save_region_review(lid, 2, box, "accepted", None, 0, "one.png",
+                                  [vocab("手", 1, extract_by="manual"), vocab("旧", 2)], "local_ok")
+    other = db.save_region_review(lid, 2, (30, 50, 110, 300), "accepted", None, 0, "two.png",
+                                  [vocab("邻", 3)], "local_ok")
+    db.save_region_review(lid, 2, box, "accepted", first, 1, "new.png",
+                          [vocab("错", 1), vocab("新", 2)], "local_ok")
+    with pytest.raises(ValueError, match="đã thay đổi"):
+        db.save_region_review(lid, 2, box, "skipped", first, 1, None, [], "pending")
+    assert [(r["word"], r["source_block_id"]) for r in db.get_lesson_words(lid)] == [
+        ("手", first), ("新", first), ("邻", other)]
+    db.save_region_review(lid, 2, box, "skipped", first, 2, None, [], "pending")
+    with pytest.raises(ValueError, match="ngoài bài"):
+        db.save_region_review(lid, 5, box, "accepted", None, 0, None, [], "pending")
+    assert db.book_import_complete(bid)
+    db.save_region_review(lid, 2, box, "skipped", other, 1, None, [], "pending")
+    reopened = UserDb(db.path)
+    try:
+        assert [r["region_decision"] for r in reopened.get_import_blocks(lid)] == ["skipped", "skipped"]
+        manual, = reopened.get_lesson_words(lid)
+        assert (manual["word"], manual["needs_review"], manual["source_block_id"]) == ("手", 1, first)
+        assert not reopened.book_import_complete(bid)
+        reopened.save_region_review(lid, 2, box, "accepted", first, 3, "restored.png",
+                                    [vocab("手", 1)], "local_ok")
+        assert [r["word"] for r in reopened.get_lesson_words(lid)] == ["手"]
+    finally:
+        reopened.close()

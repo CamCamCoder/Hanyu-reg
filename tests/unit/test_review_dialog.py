@@ -947,6 +947,38 @@ def test_review_preview_prefers_saved_block_crop(tmp_path, monkeypatch):
         db.close()
 
 
+def test_selected_confirmation_preserves_crops_for_the_whole_lesson(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    db, book_id = _make_review_queue_book(tmp_path)
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    dialog = None
+    try:
+        blocks = db.replace_import_blocks(lesson_id, [
+            VocabBlock(None, lesson_id, n, 4, (0, 0, 100, 200),
+                       str(tmp_path / f"{n}.png"), 1, n, n)
+            for n in (1, 2)
+        ])
+        words = db.get_lesson_words(lesson_id)
+        with db.transaction() as conn:
+            for block, word in zip(blocks, words):
+                conn.execute("UPDATE lesson_word SET source_block_id=? WHERE id=?",
+                             (block["id"], word["id"]))
+        dialog = DialogReviewBook(db, db.get_book(book_id))
+        monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+        dialog.review_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog._confirm_selected_rows()
+        saved = db.get_lesson_words(lesson_id)
+        assert [db.get_word_source_crop(w["id"]) for w in saved] == [
+            blocks[0]["crop_path"], blocks[1]["crop_path"], None,
+        ]
+        assert [w["needs_review"] for w in saved] == [0, 1, 0]
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+            app.processEvents()
+        db.close()
+
+
 def test_manual_block_confirmation_unblocks_book(tmp_path):
     app = QApplication.instance() or QApplication([])
     db = UserDb(str(tmp_path / "user.sqlite"))
@@ -1010,4 +1042,125 @@ def test_manual_block_confirmation_unblocks_book(tmp_path):
         if dialog is not None:
             dialog.deleteLater()
             app.processEvents()
+        db.close()
+
+
+def test_compare_boundary_candidates_persists_selected_pdf_page(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QPushButton
+    import hanzi_app.ui.dialog_import as boundary_ui
+
+    app = QApplication.instance() or QApplication([])
+    db = UserDb(str(tmp_path / "qa.sqlite"))
+    bid = db.add_book("Sách", "book.pdf", "compare", 40)
+    dialog = DialogReviewBoundaries(db, bid, 40, _conflicting_boundary_result())
+    pages = []
+    def render(path, page, dpi):
+        pages.append(page)
+        return b""
+    def choose(popup):
+        next(btn for btn in popup.findChildren(QPushButton) if btn.text() == "Dùng trang 9").click()
+        return popup.result()
+    monkeypatch.setattr(boundary_ui, "render_page_preview", render)
+    monkeypatch.setattr(QDialog, "exec", choose)
+    try:
+        dialog.table.setCurrentCell(0, 0)
+        assert dialog.btn_compare.isEnabled()
+        dialog.btn_compare.click()
+        assert pages == [5, 8]
+        assert dialog.btn_confirm.isEnabled()
+        dialog._confirm()
+        assert db.get_lessons(bid)[0]["page_start"] == 8
+    finally:
+        dialog.deleteLater()
+        app.processEvents()
+        db.close()
+
+
+def test_region_draw_coordinates_after_zoom_and_scroll(tmp_path):
+    from PySide6.QtCore import QRectF, QPointF
+    from PySide6.QtTest import QTest
+    from hanzi_app.ui.screen_books import RegionView
+
+    app = QApplication.instance() or QApplication([])
+    view = RegionView()
+    view.resize(350, 250)
+    view.setSceneRect(QRectF(0, 0, 800, 800))
+    view.show()
+    try:
+        for scale in (1, 2):
+            view.resetTransform()
+            view.scale(scale, scale)
+            view.centerOn(385, 420)
+            app.processEvents()
+            start = view.mapFromScene(QPointF(350, 400))
+            end = view.mapFromScene(QPointF(410, 445))
+            QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+            QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=end)
+            box = view.outline.rect()
+            assert tuple(2 * v for v in box.getCoords()) == (700, 800, 820, 890)
+    finally:
+        view.close()
+
+
+def test_region_editor_saves_new_box_on_empty_page_and_reopens(tmp_path, monkeypatch):
+    import fitz
+    from PySide6.QtCore import QRectF
+    from hanzi_app.adapter.pdfsource import PdfSource
+    from hanzi_app.ui.screen_books import DialogReviewRegion
+
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "source.pdf"
+    with fitz.open() as document:
+        for number in range(2):
+            page = document.new_page(width=300, height=350)
+            page.insert_text((32, 72), f"Source page number {number + 1} with native text")
+            page.draw_rect(fitz.Rect(34, 35, 42, 47), fill=(1, 0, 0))
+        document.save(path)
+    monkeypatch.setattr(PdfSource, "ocr_spans", lambda *args, **kwargs: [])
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    bid = db.add_book("PDF", str(path), "region-pdf", 2)
+    db.replace_lessons(bid, [LessonBoundary(1, None, 0, 1, 1, "lesson")])
+    book = db.get_book(bid)
+    lesson, = db.get_lessons(bid)
+    def wait_until(predicate):
+        end = time.monotonic() + 8
+        while not predicate() and time.monotonic() < end:
+            app.processEvents()
+            time.sleep(.005)
+        assert predicate()
+    def open_editor():
+        dialog = DialogReviewRegion(db, book, lesson)
+        dialog.show()
+        wait_until(lambda: not dialog.loaders)
+        assert dialog.view.isEnabled()
+        return dialog
+    try:
+        dialog = open_editor()
+        dialog.page.setValue(2)
+        dialog.page.setValue(1)
+        dialog.page.setValue(2)
+        wait_until(lambda: not dialog.loaders)
+        rect = QRectF(50, 45, 125, 105)
+        dialog.view.set_box(rect)
+        dialog.save.click()
+        wait_until(lambda: dialog.saver is None)
+        assert dialog.committed
+        block, = db.get_import_blocks(lesson["id"])
+        assert (block["page_index"], block["region_decision"], block["bbox"]) == (1, "accepted", (100, 90, 350, 300))
+        with PdfSource(path) as pdf:
+            expected = pdf.get_page_crop_image_bytes(1, block["bbox"])
+        from pathlib import Path
+        assert Path(block["crop_path"]).read_bytes() == expected
+        dialog = open_editor()
+        assert dialog.page.value() == 2
+        assert dialog.view.outline.rect() == rect
+        dialog.view.set_box(QRectF(5, 5, 9, 9))
+        dialog.cancel.click()
+        assert db.get_import_blocks(lesson["id"])[0] == block
+        dialog = open_editor()
+        dialog.skip.click()
+        wait_until(lambda: dialog.saver is None)
+        assert db.get_import_blocks(lesson["id"])[0]["region_decision"] == "skipped"
+        assert not db.book_import_complete(bid)
+    finally:
         db.close()

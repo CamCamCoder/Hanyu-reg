@@ -240,8 +240,8 @@ class UserDb:
                 conn.executemany(
                     "INSERT INTO lesson_word (lesson_id, order_no, word, pos, "
                     "                         pinyin_src, hanviet_src, meaning_src, source_page, "
-                    "                         extract_by, needs_review) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "                         extract_by, needs_review, source_block_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             lesson_id,
@@ -254,6 +254,7 @@ class UserDb:
                             r.source_page,
                             r.extract_by,
                             int(r.needs_review),
+                            r.source_block_id,
                         )
                         for r in rows
                     ],
@@ -270,8 +271,8 @@ class UserDb:
                 "INSERT INTO import_block ("
                 "lesson_id, block_no, page_index, bbox_x0, bbox_y0, bbox_x1, "
                 "bbox_y1, crop_path, expected_rows, first_order, last_order, "
-                "status, ai_attempts"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "status, ai_attempts, region_decision, region_revision"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         lesson_id,
@@ -284,6 +285,9 @@ class UserDb:
                         block.last_order,
                         block.status,
                         block.ai_attempts,
+                        "accepted" if block.status == "manual" and block.region_decision == "auto"
+                        else block.region_decision,
+                        block.region_revision,
                     )
                     for block in blocks
                 ],
@@ -295,7 +299,7 @@ class UserDb:
         rows = self._conn.execute(
             "SELECT id, lesson_id, block_no, page_index, bbox_x0, bbox_y0, "
             "bbox_x1, bbox_y1, crop_path, expected_rows, first_order, last_order, "
-            "status, ai_attempts FROM import_block "
+            "status, ai_attempts, region_decision, region_revision FROM import_block "
             "WHERE lesson_id = ? ORDER BY block_no, id",
             (lesson_id,),
         ).fetchall()
@@ -314,10 +318,47 @@ class UserDb:
                 "first_order": row["first_order"],
                 "last_order": row["last_order"],
                 "status": row["status"],
+                "region_decision": row["region_decision"],
+                "region_revision": row["region_revision"],
                 "ai_attempts": row["ai_attempts"],
             }
             for row in rows
         ]
+
+    def save_region_review(
+        self, lesson_id: int, page_index: int, bbox: tuple[float, float, float, float],
+        decision: str, block_id: int | None, revision: int, crop_path: str | None,
+        rows: list[VocabRow], status: str,
+    ) -> int:
+        """Commit one page selection and its OCR together without replacing neighbouring rows."""
+        if decision not in {"accepted", "skipped"} or not (0 <= bbox[0] < bbox[2] and 0 <= bbox[1] < bbox[3]):
+            raise ValueError("Khung bảng không hợp lệ")
+        with self.transaction() as conn:
+            lesson = conn.execute("SELECT book_id,page_start,page_end FROM lesson WHERE id=?", (lesson_id,)).fetchone()
+            if not lesson or not lesson["page_start"] <= page_index <= lesson["page_end"]:
+                raise ValueError("Trang nằm ngoài bài")
+            if block_id is None:
+                if decision == "skipped":
+                    raise ValueError("Chưa có vùng để bỏ qua")
+                block_id = conn.execute(
+                    "INSERT INTO import_block(lesson_id,block_no,page_index,bbox_x0,bbox_y0,bbox_x1,bbox_y1) "
+                    "SELECT ?,COALESCE(MAX(block_no),0)+1,?,?,?,?,? FROM import_block WHERE lesson_id=?",
+                    (lesson_id, page_index, *bbox, lesson_id),
+                ).lastrowid
+            updated = conn.execute(
+                "UPDATE import_block SET bbox_x0=?,bbox_y0=?,bbox_x1=?,bbox_y1=?,crop_path=?,"
+                "region_decision=?,region_revision=region_revision+1,status=?,expected_rows=NULL,"
+                "first_order=NULL,last_order=NULL,ai_attempts=0 "
+                "WHERE id=? AND lesson_id=? AND page_index=? AND region_revision=?",
+                (*bbox, crop_path, decision, status, block_id, lesson_id, page_index, revision),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Khung đã thay đổi, hãy mở lại trang")
+            conn.execute("UPDATE lesson_word SET needs_review=1 WHERE source_block_id=? AND extract_by='manual'",
+                         (block_id,))
+            self.replace_vocab_block(block_id, rows, preserve_manual=True)
+            self.set_import_state(lesson["book_id"], "review" if self.book_import_complete(lesson["book_id"]) else "incomplete")
+            return block_id
 
     def repair_import_blocks(
         self, lesson_id: int, repairs: list[tuple[int, VocabBlock]]
@@ -331,7 +372,7 @@ class UserDb:
                 ).fetchone()
                 if row is None or row["lesson_id"] != lesson_id:
                     raise ValueError("Block kh?ng thu?c b?i h?c")
-                if row["status"] == "manual":
+                if row["status"] == "manual" or row["region_decision"] != "auto":
                     raise ValueError("Kh?ng th? t? ??ng s?a block th? c?ng")
 
             for block_id, _block in repairs:
@@ -357,6 +398,36 @@ class UserDb:
                 )
         return self.get_import_blocks(lesson_id)
 
+    def delete_import_blocks(
+        self, lesson_id: int, block_ids: list[int]
+    ) -> list[dict]:
+        """Delete selected non-manual import blocks and their checkpointed rows."""
+        unique_ids = list(dict.fromkeys(block_ids))
+        if not unique_ids:
+            return self.get_import_blocks(lesson_id)
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT id, lesson_id, status, region_decision FROM import_block "
+                f"WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            ).fetchall()
+            found = {int(row["id"]): row for row in rows}
+            if set(found) != set(unique_ids):
+                raise ValueError("Co block can xoa khong ton tai")
+            if any(row["lesson_id"] != lesson_id for row in rows):
+                raise ValueError("Block khong thuoc bai hoc")
+            if any(row["status"] == "manual" or row["region_decision"] != "auto" for row in rows):
+                raise ValueError("Khong the tu dong xoa block thu cong")
+            conn.execute(
+                f"DELETE FROM lesson_word WHERE source_block_id IN ({placeholders})",
+                tuple(unique_ids),
+            )
+            conn.execute(
+                f"DELETE FROM import_block WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            )
+        return self.get_import_blocks(lesson_id)
     def update_import_block(
         self, block_id: int, *, status: str,
         ai_attempts: int, crop_path: str | None
@@ -369,7 +440,7 @@ class UserDb:
             )
 
     def replace_vocab_block(
-        self, block_id: int, rows: list[VocabRow]
+        self, block_id: int, rows: list[VocabRow], *, preserve_manual: bool = False
     ) -> None:
         """Thay các dòng đã checkpoint của đúng một block."""
         with self.transaction() as conn:
@@ -377,9 +448,17 @@ class UserDb:
                 "SELECT lesson_id FROM import_block WHERE id = ?", (block_id,)
             ).fetchone()
             lesson_id = block["lesson_id"]
-            conn.execute(
-                "DELETE FROM lesson_word WHERE source_block_id = ?", (block_id,)
-            )
+            delete = "DELETE FROM lesson_word WHERE source_block_id = ?"
+            if preserve_manual:
+                manual = conn.execute(
+                    "SELECT word,order_no FROM lesson_word WHERE source_block_id=? AND extract_by='manual'",
+                    (block_id,),
+                ).fetchall()
+                words = {r["word"] for r in manual}
+                orders = {r["order_no"] for r in manual if r["order_no"] is not None}
+                rows = [r for r in rows if r.word not in words and r.order_no not in orders]
+                delete += " AND extract_by != 'manual'"
+            conn.execute(delete, (block_id,))
             conn.executemany(
                 "INSERT INTO lesson_word ("
                 "lesson_id, order_no, word, pos, pinyin_src, hanviet_src, "
@@ -408,16 +487,19 @@ class UserDb:
         row = self._conn.execute(
             "SELECT EXISTS("
             "SELECT 1 FROM lesson WHERE book_id = ? AND index_no > 0"
+            ") AND EXISTS(SELECT 1 FROM import_block b JOIN lesson l ON b.lesson_id=l.id "
+            "WHERE l.book_id=? AND l.index_no>0 AND b.region_decision!='skipped'"
             ") AND NOT EXISTS("
             "SELECT 1 FROM lesson l WHERE l.book_id = ? AND l.index_no > 0 "
             "AND ("
             "NOT EXISTS(SELECT 1 FROM import_block ib WHERE ib.lesson_id = l.id) "
             "OR EXISTS(SELECT 1 FROM import_block ib "
             "WHERE ib.lesson_id = l.id "
-            "AND ib.status NOT IN ('local_ok', 'ai_ok', 'manual'))"
+            "AND ib.region_decision != 'skipped' AND (ib.region_decision = 'review' "
+            "OR ib.status NOT IN ('local_ok', 'ai_ok', 'manual')))"
             ")"
             ")",
-            (book_id, book_id),
+            (book_id, book_id, book_id),
         ).fetchone()
         return bool(row[0])
 

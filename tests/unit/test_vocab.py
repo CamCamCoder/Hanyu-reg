@@ -167,6 +167,42 @@ def test_locator_uses_repeated_hanzi_column_when_pinyin_is_unreadable():
     assert blocks[0].expected_rows == 4
 
 
+
+def test_locator_keeps_hsk1_heading_region_when_orders_and_pinyin_are_noisy():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("生", 20, 40, 20),
+        _span("词", 45, 40, 20),
+        _span("New", 120, 42, 45),
+        _span("Words", 170, 42, 55),
+        _span("0", 250, 42, 20),
+        _span("2", 280, 42, 20),
+        _span("．", 20, 120, 18),
+        _span("请", 80, 120, 20),
+        _span("问", 105, 120, 20),
+        _span("qngwen", 230, 130, 70),
+        _span("V.", 420, 130, 25),
+        _span("translation", 540, 130, 95),
+        _span("叫", 170, 200, 25),
+        _span("℃", 260, 210, 20),
+        _span("O", 285, 210, 20),
+        _span("V.", 420, 210, 25),
+        _span("translation", 540, 210, 95),
+        _span("Role-play", 20, 520, 90),
+        _span("对话", 120, 520, 40),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(2, "Lesson 2", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows is None
+    assert blocks[0].bbox[1] < 50
+    assert 220 < blocks[0].bbox[3] < 500
+    assert blocks[0].bbox[2] > 620
+
 def test_locator_counts_parallel_entries_on_one_physical_line():
     pdf = MagicMock()
     pdf.page_count.return_value = 1
@@ -504,6 +540,112 @@ def test_locator_accepts_u_colon_numbered_pinyin_in_continuation_block():
     ] == [(2, 1, 2), (4, 3, 6)]
 
 
+
+def test_locator_rejects_numbered_grammar_examples():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("Cau truc", 20, 100, 110),
+        _span("的时候", 150, 100, 90),
+        _span("1", 20, 170, 20),
+        _span("我", 70, 170, 35),
+        _span("八点", 130, 170, 45),
+        _span("的时候", 210, 170, 70),
+        _span("在家", 300, 170, 55),
+        _span("2", 20, 220, 20),
+        _span("他", 70, 220, 35),
+        _span("十岁", 130, 220, 45),
+        _span("的时候", 210, 220, 70),
+        _span("来北京", 300, 220, 70),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(5, "Bai 5", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+
+def test_locator_rejects_dialogue_translation_region():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("A:", 20, 100, 20),
+        _span("大卫", 70, 100, 45),
+        _span("回来", 130, 100, 45),
+        _span("了吗", 190, 100, 45),
+        _span("B:", 20, 150, 20),
+        _span("没有", 70, 150, 45),
+        _span("他", 130, 150, 30),
+        _span("还", 180, 150, 30),
+        _span("学习", 230, 150, 45),
+        _span("Dich nghia", 20, 230, 100),
+        _span("A:", 20, 280, 20),
+        _span("David", 70, 280, 55),
+        _span("chua ve", 150, 280, 70),
+        _span("B:", 20, 330, 20),
+        _span("Chua", 70, 330, 55),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(9, "Bai 9", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+
+
+def test_locator_rejects_question_exercise_region_without_heading():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("他", 20, 100, 35),
+        _span("准备", 70, 100, 55),
+        _span("做", 140, 100, 35),
+        _span("什么", 190, 100, 55),
+        _span("？", 260, 100, 20),
+        _span("Mingtian", 340, 100, 80),
+        _span("他们", 20, 150, 45),
+        _span("在等", 80, 150, 55),
+        _span("谁", 150, 150, 35),
+        _span("？", 210, 150, 20),
+        _span("deng shei", 340, 150, 90),
+        _span("天气", 20, 200, 45),
+        _span("怎么样", 80, 200, 70),
+        _span("？", 170, 200, 20),
+        _span("tianqi", 340, 200, 70),
+        _span("1", 20, 280, 20),
+        _span("2", 20, 330, 20),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(25, "Bai 25", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+def test_locator_rejects_hanzi_culture_region():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("汉字的", 20, 100, 60),
+        _span("本义", 100, 100, 45),
+        _span("读", 160, 100, 30),
+        _span("yue", 210, 100, 45),
+        _span("1", 20, 180, 20),
+        _span("乐", 70, 180, 35),
+        _span("yue", 130, 180, 45),
+        _span("2", 20, 230, 20),
+        _span("长", 70, 230, 35),
+        _span("zhang", 130, 230, 65),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(5, "Bai 5", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
 def test_locator_rejects_china_change_three_column_bilingual_prose():
     pdf = MagicMock()
     pdf.page_count.return_value = 1
@@ -572,6 +714,21 @@ def test_unknown_expected_rows_requires_two_equal_nonzero_sources():
     assert "expected_rows_unknown_needs_review" in local_only.issues
     assert agreed.passed is True
 
+
+
+def test_coverage_rejects_local_only_ocr_fragments_even_when_count_matches():
+    block = VocabBlock(
+        9, 2, 3, 28, (0, 0, 100, 200), "crop.png", 2, None, None
+    )
+    rows = [
+        VocabRow(1, "新", None, None, None, 29, "regex", True, "noise", source_block_id=9),
+        VocabRow(2, "王", None, None, None, 29, "regex", True, "noise", source_block_id=9),
+    ]
+
+    report = VocabExtractor().validate_block_coverage(block, rows, [], rows)
+
+    assert report.passed is False
+    assert "local_ocr_noise" in report.issues
 
 def test_merge_keeps_same_word_from_different_blocks_and_deduplicates_exact_key():
     first = _block_row("行", 1, 11)
@@ -800,6 +957,51 @@ def test_locator_persists_range_for_strict_order_evidence():
     assert (blocks[0].first_order, blocks[0].last_order) == (1, 3)
 
 
+def test_locator_accepts_ocr_mangled_translated_vocab_heading():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("D/ch", 20, 40, 35),
+        _span("nghla", 70, 40, 50),
+        _span("moi", 150, 40, 35),
+        _span("2", 20, 90, 20),
+        _span("机场", 80, 90, 45),
+        _span("jichang", 150, 90, 80),
+        _span("san bay", 260, 90, 80),
+        _span("3", 20, 125, 20),
+        _span("路", 80, 125, 45),
+        _span("lu4", 150, 125, 40),
+        _span("duong", 260, 125, 80),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(9, "Lesson 9", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert (blocks[0].first_order, blocks[0].last_order) == (2, 3)
+    assert blocks[0].expected_rows == 2
+
+def test_locator_accepts_single_row_after_translated_vocab_heading():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("Dich", 20, 40, 40),
+        _span("nghla", 70, 40, 50),
+        _span("moi", 150, 40, 35),
+        _span("2", 20, 90, 20),
+        _span("妻子", 80, 90, 45),
+        _span("qizi", 150, 90, 45),
+        _span("vo", 260, 90, 40),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(18, "Lesson 18", 0, 0, 1.0, "lesson")
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].expected_rows == 1
+
 def test_locator_rejects_grammar_reference_table_false_positive():
     pdf = MagicMock()
     pdf.page_count.return_value = 1
@@ -815,6 +1017,44 @@ def test_locator_rejects_grammar_reference_table_false_positive():
         _span("来自本册", 80, 180, 80),
         _span("5", 20, 210, 20),
         _span("新词", 80, 210, 45),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(25, "summary", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+def test_locator_rejects_part_of_speech_reference_table():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("生词", 20, 40, 80, 18),
+        _span("词性", 20, 90, 45),
+        _span("简称", 80, 90, 45),
+        _span("名词", 20, 130, 45),
+        _span("副词", 120, 130, 45),
+        _span("介词", 20, 170, 45),
+        _span("助词", 120, 170, 45),
+    ]
+
+    blocks = VocabExtractor().locate_blocks(
+        pdf, LessonBoundary(25, "summary", 0, 0, 1.0, "lesson")
+    )
+
+    assert blocks == []
+
+
+def test_locator_rejects_cross_book_reference_table():
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = [
+        _span("新词", 20, 40, 80, 18),
+        _span("拿", 20, 90, 45),
+        _span("na", 100, 90, 40),
+        _span("来自本册", 20, 130, 80),
+        _span("粉", 120, 130, 45),
+        _span("电视", 20, 170, 45),
     ]
 
     blocks = VocabExtractor().locate_blocks(
@@ -889,6 +1129,44 @@ def test_extract_blocks_prefers_passing_ai_rows_over_noisy_local(monkeypatch):
     assert [row.word for row in result.rows] == [f"ai-{i}" for i in range(9, 13)]
     assert result.blocks[0].status == "ai_ok"
 
+
+def test_extract_blocks_uses_full_page_recovery_after_repeated_ai_failures(monkeypatch):
+    extractor = VocabExtractor()
+    block = VocabBlock(
+        7, 2, 1, 10, (0, 0, 100, 200), None, 2, 1, 2,
+        "incomplete", 3,
+    )
+    ai = [
+        replace(_block_row("page-1", 1, 7, pinyin="ai"), extract_by="vision"),
+        replace(_block_row("page-2", 2, 7, pinyin="ai"), extract_by="vision"),
+    ]
+    seen: list[tuple[bytes, str | None]] = []
+
+    def fake_extract(image, _client, _source_page, issue_context=None):
+        seen.append((image, issue_context))
+        return ai
+
+    monkeypatch.setattr(extractor, "_extract_local_block", lambda _pdf, _block: [])
+    monkeypatch.setattr(extractor, "extract_by_llm_image", fake_extract)
+
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"bad-crop"
+    pdf.get_page_image_bytes.return_value = b"full-page"
+    client = MagicMock()
+    client.is_configured.return_value = True
+
+    result = extractor.extract_blocks(pdf, [block], client)
+
+    assert result.complete is True
+    assert result.ai_attempts == 1
+    assert result.blocks[0].ai_attempts == 4
+    assert result.blocks[0].status == "ai_ok"
+    pdf.get_page_crop_image_bytes.assert_not_called()
+    pdf.get_page_image_bytes.assert_called_once_with(10, dpi=200)
+    assert len(seen) == 1
+    assert seen[0][0] == b"full-page"
+    assert "full page recovery fallback" in (seen[0][1] or "")
+    assert "target order range 1-2" in (seen[0][1] or "")
 
 def test_extract_blocks_accepts_ai_count_when_manifest_has_no_order_range(monkeypatch):
     extractor = VocabExtractor()
@@ -968,3 +1246,17 @@ def test_extract_blocks_renumbers_ai_rows_when_range_count_matches(monkeypatch):
 
 
 
+
+
+def test_named_table_continuation_stops_before_proper_nouns_and_later_reading():
+    from hanzi_app.service.vocab import _main_vocab_table
+
+    head = [_span("Expressions", 330, 30), _span("New", 20, 34),
+            _span("Words and", 130, 31), _span("STT", 20, 70), _span("Pinyin", 110, 70)]
+    body = [_span("学生", 30, 110), _span("student", 410, 110)]
+    first, continues = _main_vocab_table(head + body, False)
+    assert first and continues
+    later = [_span("Proper Nouns", 35, 170), _span("王明", 30, 204), _span("Wang Ming", 410, 204)]
+    second, continues = _main_vocab_table(body + later, True)
+    assert second and second[3] < 170 and not continues
+    assert _main_vocab_table(body + later, False) == (None, False)

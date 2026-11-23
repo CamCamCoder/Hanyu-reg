@@ -241,9 +241,11 @@ class PdfSource:
                     "heading_lesson_no": lesson_no,
                     "heading_title": title,
                     "is_toc_candidate": is_toc_candidate,
-                    "layout_fingerprint": self._layout_fingerprint(
-                        page,
-                        self._band_ocr_cache.get((page_index, "top"), ()),
+                    "layout_fingerprint": (
+                        "captioned-opening-banner" if self._is_opening_banner(page, top_text)
+                        else self._layout_fingerprint(
+                            page, self._band_ocr_cache.get((page_index, "top"), ()),
+                        )
                     ),
                 }
             )
@@ -333,6 +335,35 @@ class PdfSource:
         return 1
 
     @staticmethod
+    def _is_opening_banner(page: fitz.Page, caption: str) -> bool:
+        """A short uppercase caption on a coloured band with a pale number badge."""
+        letters = [c for c in caption if c.isalpha() and c.lower() != c.upper()]
+        if not letters or len(caption) > 100 or sum(c.isupper() for c in letters) < 0.8 * len(letters):
+            return False
+        rect = page.rect
+        scale = 100 / rect.width
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                              clip=fitz.Rect(0, 0, rect.width, rect.height * 0.13),
+                              colorspace=fitz.csRGB, alpha=False)
+        if pix.width < 95 or pix.height < 5:
+            return False
+        pixels = pix.samples
+        band = badge_pale = badge_ink = 0
+        rows = pix.height - 4
+        for y in range(2, pix.height - 2):
+            for x in range(3, 95):
+                offset = y * pix.stride + x * 3
+                r, g, b = pixels[offset:offset + 3]
+                contrast = max(r, g, b) - min(r, g, b)
+                if x >= 35:
+                    band += contrast > 45
+                elif x < 24:
+                    badge_pale += min(r, g, b) > 201
+                    badge_ink += contrast > 115 and min(r, g, b) < 135
+        return (band > 0.44 * rows * 60 and badge_pale > 0.18 * rows * 21
+                and badge_ink > 0.022 * rows * 21)
+
+    @staticmethod
     def _layout_fingerprint(page: fitz.Page, spans: tuple[TextSpan, ...]) -> str:
         """Hash a 12x4 occupancy grid of OCR boxes from the page's top band."""
         columns, rows = 12, 4
@@ -363,7 +394,9 @@ class PdfSource:
                 for span in line.get("spans", []):
                     text = span.get("text", "").strip()
                     if text:
-                        bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
+                        # The editor and persisted table rectangles use rendered 250-DPI pixels.
+                        rect = fitz.Rect(span["bbox"]) * page.rotation_matrix
+                        bbox = tuple(value * 250 / 72 for value in rect)
                         font_size = float(span.get("size", 12.0))
                         spans.append(
                             TextSpan(
@@ -394,7 +427,7 @@ class PdfSource:
             # Head text: lấy các span ở 25% trên cùng trang, font to nhất
             top_spans = [
                 s for s in spans_list
-                if s.bbox[1] < 200  # y0 < 200 (phần trên trang)
+                if s.bbox[1] < (200 if s.is_ocr else 200 * 250 / 72)
             ]
             if top_spans:
                 top_spans.sort(key=lambda s: s.font_size, reverse=True)

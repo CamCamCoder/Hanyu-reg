@@ -11,6 +11,7 @@ import logging
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QThread, Qt, Signal
 from PySide6.QtGui import QImage, QPainter
@@ -26,7 +27,7 @@ from hanzi_app.data.models import (
 )
 from hanzi_app.data.userdb import UserDb
 from hanzi_app.service.splitter import Splitter
-from hanzi_app.service.vocab import VocabExtractor, render_block_crop
+from hanzi_app.service.vocab import MAX_AI_ATTEMPTS_PER_BLOCK, VocabExtractor, render_block_crop
 
 _REAL_VOCAB_EXTRACTOR = VocabExtractor
 
@@ -123,12 +124,15 @@ class BookImporterWorker(QThread):
 
                 self.progress.emit(40, "Phân tích bản tóm lược các trang...")
                 evidence = pdf.page_census()
-                evidence_image = pdf.boundary_contact_sheet(evidence)
 
                 mode_str = "Lớp 2 (Cloud AI)" if self.ai_client.is_configured() else "Lớp 1 (Local Engine)"
                 self.progress.emit(60, f"Phân tách bài học [{mode_str}]...")
                 splitter = Splitter()
                 remaining_ai_calls = self._remaining_ai_calls(thread_db, file_hash)
+                evidence_image = (
+                    pdf.boundary_contact_sheet(evidence)
+                    if remaining_ai_calls > 0 and self.ai_client.is_configured() else None
+                )
                 try:
                     result = splitter.propose(
                         [],
@@ -249,6 +253,7 @@ class VocabImporterWorker(QThread):
             record["last_order"],
             record["status"],
             record["ai_attempts"],
+            record.get("region_decision", "auto"), record.get("region_revision", 0),
         )
 
     @staticmethod
@@ -284,7 +289,7 @@ class VocabImporterWorker(QThread):
         reconciled = False
         if isinstance(extractor, _REAL_VOCAB_EXTRACTOR):
             for record in records:
-                if record["status"] == "manual":
+                if record["status"] == "manual" or record["region_decision"] != "auto":
                     continue
                 cached = rows_by_block.get(record["id"], [])
                 if not cached:
@@ -415,14 +420,15 @@ class VocabImporterWorker(QThread):
                 row for row in db.get_lesson_words(block.lesson_id)
                 if row.get("source_block_id") == block.id
             ]
-            if len(rows) >= len(existing):
-                db.replace_vocab_block(block.id, rows)
-            db.update_import_block(
-                block.id,
-                status=block.status,
-                ai_attempts=block.ai_attempts,
-                crop_path=block.crop_path,
-            )
+            with db.transaction():
+                current = next((b for b in db.get_import_blocks(block.lesson_id) if b["id"] == block.id), None)
+                if not current or current["region_revision"] != block.region_revision:
+                    continue
+                if len(rows) >= len(existing):
+                    db.replace_vocab_block(block.id, rows, preserve_manual=block.region_decision == "accepted")
+                db.update_import_block(
+                    block.id, status=block.status, ai_attempts=block.ai_attempts, crop_path=block.crop_path,
+                )
 
     @staticmethod
     def _format_incomplete(lesson: dict, coverage) -> str:
@@ -511,6 +517,7 @@ class VocabImporterWorker(QThread):
                     pending = [
                         block for block in blocks
                         if block.status not in {"local_ok", "ai_ok", "manual"}
+                        and block.region_decision not in {"review", "skipped"}
                     ]
                     if pending:
                         extractor.lesson_ai_attempts = sum(
@@ -543,9 +550,12 @@ class VocabImporterWorker(QThread):
                         f"Đã OCR bài {index + 1}/{len(lessons)} [{mode}]...",
                     )
 
+                cleanup_import_issues(thread_db, self.book_id, pdf=pdf)
+
+            remaining_issues = collect_import_issues(thread_db, self.book_id)
             if not thread_db.book_import_complete(self.book_id):
                 thread_db.set_import_state(self.book_id, "incomplete")
-                count = len(incomplete_messages) or 1
+                count = len(remaining_issues) or len(incomplete_messages) or 1
                 self.progress.emit(
                     100,
                     f"Đã OCR phần đọc được — còn {count} mục cần sửa tay hoặc chạy lại.",
@@ -705,6 +715,72 @@ def _load_saved_crop_preview(crop_paths: tuple[str | Path, ...]) -> bytes:
     return bytes(data)
 
 
+class RegionPageWorker(QThread):
+    loaded = Signal(bytes)
+    failed = Signal(str)
+
+    def __init__(self, path, page_index, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.page_index = page_index
+
+    def run(self):
+        try:
+            with PdfSource(self.path) as pdf:
+                self.loaded.emit(pdf.get_page_image_bytes(self.page_index, dpi=125))
+        except Exception as err:
+            self.failed.emit(str(err))
+
+
+class RegionSaveWorker(QThread):
+    saved = Signal()
+    failed = Signal(str)
+
+    def __init__(self, db_path, book, lesson_id, page_index, bbox, record, decision, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.book = book
+        self.lesson_id = lesson_id
+        self.page_index = page_index
+        self.bbox = bbox
+        self.record = record or {}
+        self.decision = decision
+
+    def run(self):
+        db = None
+        crop = None
+        try:
+            rows = []
+            status = "pending"
+            if self.decision == "accepted":
+                block = VocabBlock(self.record.get("id"), self.lesson_id, self.record.get("block_no", 1),
+                                   self.page_index, self.bbox, None, None, None, None)
+                with PdfSource(self.book["file_path"]) as pdf:
+                    data = render_block_crop(pdf, block)
+                    if not data:
+                        raise ValueError("Không đọc được vùng đã chọn")
+                    result = VocabExtractor().extract_blocks(pdf, [block])
+                rows = list(result.rows)
+                status = result.blocks[0].status
+                folder = Path(self.db_path).parent / "book_crops" / f"book-{self.book['id']}" / f"lesson-{self.lesson_id}"
+                folder.mkdir(parents=True, exist_ok=True)
+                crop = folder / f"review-{uuid4().hex}.png"
+                crop.write_bytes(data)
+            db = UserDb(self.db_path)
+            db.save_region_review(self.lesson_id, self.page_index, self.bbox, self.decision,
+                                  self.record.get("id"), self.record.get("region_revision", 0),
+                                  str(crop) if crop else None, rows, status)
+            crop = None
+            self.saved.emit()
+        except Exception as err:
+            self.failed.emit(str(err))
+        finally:
+            if crop is not None:
+                crop.unlink(missing_ok=True)
+            if db is not None:
+                db.close()
+
+
 class PreviewWorker(QThread):
     """Render a persisted crop, falling back to the legacy PDF preview."""
 
@@ -809,6 +885,21 @@ def _row_words(rows: list[dict]) -> list[str]:
     return [str(row.get("word") or "").strip() for row in rows]
 
 
+def _stored_rows_look_like_local_ocr_noise(rows: list[dict]) -> bool:
+    if not rows:
+        return False
+    if any(row.get("extract_by") != "regex" for row in rows):
+        return False
+    suspicious = 0
+    for row in rows:
+        word = str(row.get("word") or "").strip()
+        weak_payload = not row.get("pinyin_src") and not row.get("meaning_src")
+        tiny_reviewed = len(word) <= 1 and bool(row.get("needs_review"))
+        heading_fragment = word in {"生", "词", "新", "课"}
+        if weak_payload or tiny_reviewed or heading_fragment:
+            suspicious += 1
+    return suspicious * 5 >= len(rows) * 3
+
 def _grammar_table_score(words: list[str]) -> int:
     return sum(1 for word in words if word in _GRAMMAR_TABLE_TERMS)
 
@@ -843,9 +934,11 @@ def _classify_import_block(record: dict, rows: list[dict]) -> tuple[str, ...]:
             issue in issues for issue in ("MISSING_ORDERS", "ROW_COUNT_MISMATCH")
         ):
             issues.append("OCR_NOISE")
+    if _stored_rows_look_like_local_ocr_noise(rows):
+        issues.append("OCR_NOISE")
     if record["status"] not in {"local_ok", "ai_ok", "manual"} and record[
         "ai_attempts"
-    ] >= 3:
+    ] >= MAX_AI_ATTEMPTS_PER_BLOCK:
         issues.append("AI_EXHAUSTED")
     return tuple(dict.fromkeys(issues))
 
@@ -876,6 +969,8 @@ def collect_import_issues(db: UserDb, book_id: int) -> list[dict]:
             continue
         lesson_rows = db.get_lesson_words(lesson["id"])
         for block in blocks:
+            if block["region_decision"] == "skipped":
+                continue
             rows = [
                 row for row in lesson_rows
                 if row.get("source_block_id") == block["id"]
@@ -890,6 +985,7 @@ def collect_import_issues(db: UserDb, book_id: int) -> list[dict]:
                 "page_start": lesson["page_start"],
                 "page_end": lesson["page_end"],
                 "block_id": block["id"],
+                "region_decision": block["region_decision"],
                 "block_no": block["block_no"],
                 "page_index": block["page_index"],
                 "status": block["status"],
@@ -904,8 +1000,464 @@ def collect_import_issues(db: UserDb, book_id: int) -> list[dict]:
             })
     return issues
 
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    x0, y0, x1, y1 = bbox
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _bbox_overlap_ratio(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    x0 = max(left[0], right[0])
+    y0 = max(left[1], right[1])
+    x1 = min(left[2], right[2])
+    y1 = min(left[3], right[3])
+    overlap = _bbox_area((x0, y0, x1, y1))
+    smaller = min(_bbox_area(left), _bbox_area(right))
+    if smaller <= 0:
+        return 0.0
+    return overlap / smaller
+
+
+def _block_supported_by_locator(record: dict, located: list[VocabBlock]) -> bool:
+    record_block = VocabImporterWorker._record_to_block(record)
+    for block in located:
+        if block.page_index != record_block.page_index:
+            continue
+        if _bbox_overlap_ratio(record_block.bbox, block.bbox) < 0.55:
+            continue
+        if (
+            record_block.first_order is not None
+            and record_block.last_order is not None
+            and block.first_order is not None
+            and block.last_order is not None
+            and (
+                record_block.first_order != block.first_order
+                or record_block.last_order != block.last_order
+            )
+        ):
+            continue
+        return True
+    return False
+
+
+
+def _orders_contiguous(orders: set[int]) -> bool:
+    if not orders:
+        return False
+    return orders == set(range(min(orders), max(orders) + 1))
+
+
+def _dedupe_ai_rows_by_order(rows: list[VocabRow]) -> list[VocabRow]:
+    by_order: dict[int, VocabRow] = {}
+    for row in rows:
+        if row.order_no is None:
+            continue
+        current = by_order.get(row.order_no)
+        if current is None:
+            by_order[row.order_no] = row
+            continue
+        current_key = (len(current.word.strip()), not current.needs_review)
+        row_key = (len(row.word.strip()), not row.needs_review)
+        if row_key > current_key:
+            by_order[row.order_no] = row
+    return [by_order[order] for order in sorted(by_order)]
+
+
+def _finish_cleanup_repair(
+    db: UserDb,
+    actions: list[dict],
+    *,
+    lesson_id: int,
+    issue: dict,
+    block: dict,
+    repaired_block: VocabBlock,
+    repaired_rows: list[VocabRow],
+    reason: str,
+) -> None:
+    db.repair_import_blocks(lesson_id, [(block["id"], repaired_block)])
+    db.replace_vocab_block(block["id"], repaired_rows)
+    db.update_import_block(
+        block["id"],
+        status=repaired_block.status,
+        ai_attempts=repaired_block.ai_attempts,
+        crop_path=repaired_block.crop_path,
+    )
+    actions.append({
+        "lesson_id": lesson_id,
+        "lesson_no": issue["lesson_no"],
+        "block_id": block["id"],
+        "block_no": block["block_no"],
+        "reason": reason,
+        "issues_before": issue["issues"],
+        "expected_rows_before": block["expected_rows"],
+        "expected_rows_after": repaired_block.expected_rows,
+        "status_after": repaired_block.status,
+        "saved_rows": len(repaired_rows),
+    })
+
+def cleanup_import_issues(
+    db: UserDb, book_id: int, pdf: PdfSource | None = None
+) -> list[dict]:
+    """Repair safe whole-book import issues without touching manual work."""
+    actions: list[dict] = []
+    def automatic_issues():
+        return [i for i in collect_import_issues(db, book_id) if i.get("region_decision", "auto") == "auto"]
+
+    issues = automatic_issues()
+    by_lesson: dict[int, list[dict]] = {}
+    for issue in issues:
+        if issue.get("block_id") is None:
+            continue
+        if "GRAMMAR_TABLE_FALSE_POSITIVE" not in issue["issues"]:
+            continue
+        by_lesson.setdefault(issue["lesson_id"], []).append(issue)
+
+    for lesson_id, lesson_issues in by_lesson.items():
+        blocks = db.get_import_blocks(lesson_id)
+        block_ids = {issue["block_id"] for issue in lesson_issues}
+        removable = [
+            block for block in blocks
+            if block["id"] in block_ids and block["status"] != "manual"
+        ]
+        if not removable:
+            continue
+        if len(removable) >= len(blocks):
+            actions.append({
+                "lesson_id": lesson_id,
+                "lesson_no": lesson_issues[0]["lesson_no"],
+                "removed_block_ids": (),
+                "removed_block_nos": (),
+                "reason": "SKIPPED_ALL_BLOCKS_FALSE_POSITIVE",
+            })
+            continue
+        db.delete_import_blocks(lesson_id, [block["id"] for block in removable])
+        actions.append({
+            "lesson_id": lesson_id,
+            "lesson_no": lesson_issues[0]["lesson_no"],
+            "removed_block_ids": tuple(block["id"] for block in removable),
+            "removed_block_nos": tuple(block["block_no"] for block in removable),
+            "reason": "GRAMMAR_TABLE_FALSE_POSITIVE",
+        })
+
+    issues = automatic_issues()
+    by_lesson = {}
+    for issue in issues:
+        if issue.get("block_id") is None:
+            continue
+        if issue["status"] != "local_ok" or issue["issues"] != ("OCR_NOISE",):
+            continue
+        by_lesson.setdefault(issue["lesson_id"], []).append(issue)
+
+    for lesson_id, lesson_issues in by_lesson.items():
+        blocks = db.get_import_blocks(lesson_id)
+        blocks_by_id = {block["id"]: block for block in blocks}
+        removable = [
+            blocks_by_id[issue["block_id"]]
+            for issue in lesson_issues
+            if issue["block_id"] in blocks_by_id
+            and blocks_by_id[issue["block_id"]]["status"] != "manual"
+        ]
+        if not removable:
+            continue
+        if len(removable) >= len(blocks):
+            actions.append({
+                "lesson_id": lesson_id,
+                "lesson_no": lesson_issues[0]["lesson_no"],
+                "removed_block_ids": (),
+                "removed_block_nos": (),
+                "reason": "SKIPPED_ALL_LOCAL_OK_OCR_NOISE_BLOCKS",
+            })
+            continue
+        db.delete_import_blocks(lesson_id, [block["id"] for block in removable])
+        actions.append({
+            "lesson_id": lesson_id,
+            "lesson_no": lesson_issues[0]["lesson_no"],
+            "removed_block_ids": tuple(block["id"] for block in removable),
+            "removed_block_nos": tuple(block["block_no"] for block in removable),
+            "reason": "LOCAL_OK_OCR_NOISE_FALSE_POSITIVE",
+        })
+    if pdf is not None:
+        located_by_lesson: dict[int, list[VocabBlock]] = {}
+        lessons_by_id = {lesson["id"]: lesson for lesson in db.get_lessons(book_id)}
+        for lesson in lessons_by_id.values():
+            boundary = LessonBoundary(
+                lesson["index_no"],
+                lesson.get("title"),
+                lesson["page_start"],
+                lesson["page_end"],
+                lesson["confidence"],
+                "lesson",
+            )
+            located_by_lesson[lesson["id"]] = VocabExtractor().locate_blocks(
+                pdf, boundary
+            )
+        issues = automatic_issues()
+        by_lesson = {}
+        for issue in issues:
+            if issue.get("block_id") is None:
+                continue
+            if "GRAMMAR_TABLE_FALSE_POSITIVE" in issue["issues"]:
+                continue
+            by_lesson.setdefault(issue["lesson_id"], []).append(issue)
+        for lesson_id, lesson_issues in by_lesson.items():
+            blocks = db.get_import_blocks(lesson_id)
+            blocks_by_id = {block["id"]: block for block in blocks}
+            stale = [
+                blocks_by_id[issue["block_id"]]
+                for issue in lesson_issues
+                if issue["block_id"] in blocks_by_id
+                and blocks_by_id[issue["block_id"]]["status"] != "manual"
+                and not _block_supported_by_locator(
+                    blocks_by_id[issue["block_id"]],
+                    located_by_lesson.get(lesson_id, []),
+                )
+            ]
+            if not stale:
+                continue
+            if len(stale) >= len(blocks):
+                actions.append({
+                    "lesson_id": lesson_id,
+                    "lesson_no": lesson_issues[0]["lesson_no"],
+                    "removed_block_ids": (),
+                    "removed_block_nos": (),
+                    "reason": "SKIPPED_ALL_STALE_LOCATOR_BLOCKS",
+                })
+                continue
+            db.delete_import_blocks(lesson_id, [block["id"] for block in stale])
+            actions.append({
+                "lesson_id": lesson_id,
+                "lesson_no": lesson_issues[0]["lesson_no"],
+                "removed_block_ids": tuple(block["id"] for block in stale),
+                "removed_block_nos": tuple(block["block_no"] for block in stale),
+                "reason": "STALE_LOCATOR_FALSE_POSITIVE",
+            })
+
+    extractor = VocabExtractor()
+    issues = automatic_issues()
+    by_lesson = {}
+    for issue in issues:
+        if issue.get("block_id") is None:
+            continue
+        if "GRAMMAR_TABLE_FALSE_POSITIVE" in issue["issues"]:
+            continue
+        by_lesson.setdefault(issue["lesson_id"], []).append(issue)
+
+    for lesson_id, lesson_issues in by_lesson.items():
+        blocks = db.get_import_blocks(lesson_id)
+        blocks_by_id = {block["id"]: block for block in blocks}
+        lesson_rows = db.get_lesson_words(lesson_id)
+        rows_by_block: dict[int, list[dict]] = {}
+        for row in lesson_rows:
+            if row.get("source_block_id") is not None:
+                rows_by_block.setdefault(row["source_block_id"], []).append(row)
+
+        for issue in lesson_issues:
+            block = blocks_by_id.get(issue["block_id"])
+            if block is None or block["status"] == "manual":
+                continue
+            cached = rows_by_block.get(block["id"], [])
+            if not cached:
+                continue
+            record_block = VocabImporterWorker._record_to_block(block)
+            vocab_rows = [
+                VocabImporterWorker._row_record_to_vocab(row)
+                for row in cached
+            ]
+            result = extractor.reconcile_checkpointed_block(
+                record_block,
+                vocab_rows,
+            )
+            if result is None:
+                orders = [row.order_no for row in vocab_rows]
+                ai_rows = [
+                    row for row in vocab_rows
+                    if row.extract_by != "regex" and row.order_no is not None
+                ]
+                deduped_ai_rows = _dedupe_ai_rows_by_order(ai_rows)
+                can_use_deduped_ai_rows = (
+                    "DUPLICATE_ORDERS" in issue["issues"]
+                    and block["first_order"] is None
+                    and block["last_order"] is None
+                    and vocab_rows
+                    and all(row.extract_by != "regex" for row in vocab_rows)
+                    and len(deduped_ai_rows) < len(ai_rows)
+                    and len(deduped_ai_rows) > 0
+                )
+                if can_use_deduped_ai_rows:
+                    candidate_block = replace(
+                        record_block,
+                        expected_rows=len(deduped_ai_rows),
+                        status="ai_ok",
+                    )
+                    report = extractor.validate_block_coverage(
+                        candidate_block, [], deduped_ai_rows, deduped_ai_rows
+                    )
+                    if report.passed:
+                        _finish_cleanup_repair(
+                            db, actions,
+                            lesson_id=lesson_id,
+                            issue=issue,
+                            block=block,
+                            repaired_block=candidate_block,
+                            repaired_rows=deduped_ai_rows,
+                            reason="RECONCILED_DEDUPED_AI_ROWS",
+                        )
+                        continue
+
+                ai_orders = {row.order_no for row in ai_rows}
+                can_drop_regex_noise_without_range = (
+                    block["first_order"] is None
+                    and block["last_order"] is None
+                    and ai_rows
+                    and len(ai_rows) == len(ai_orders)
+                    and len(ai_rows) < len(vocab_rows)
+                )
+                if can_drop_regex_noise_without_range:
+                    candidate_block = replace(
+                        record_block,
+                        expected_rows=len(ai_rows),
+                        status="ai_ok",
+                    )
+                    report = extractor.validate_block_coverage(
+                        candidate_block, [], ai_rows, ai_rows
+                    )
+                    if report.passed:
+                        _finish_cleanup_repair(
+                            db, actions,
+                            lesson_id=lesson_id,
+                            issue=issue,
+                            block=block,
+                            repaired_block=candidate_block,
+                            repaired_rows=ai_rows,
+                            reason="RECONCILED_AI_ROWS_DROPPED_REGEX_NOISE",
+                        )
+                        continue
+
+                can_replace_stale_range_with_ai_rows = (
+                    "MISSING_ORDERS" in issue["issues"]
+                    and block["first_order"] is not None
+                    and block["last_order"] is not None
+                    and len(ai_rows) >= 2
+                    and len(ai_rows) == len(ai_orders)
+                    and _orders_contiguous(ai_orders)
+                )
+                if can_replace_stale_range_with_ai_rows:
+                    candidate_block = replace(
+                        record_block,
+                        first_order=min(ai_orders),
+                        last_order=max(ai_orders),
+                        expected_rows=len(ai_rows),
+                        status="ai_ok",
+                    )
+                    report = extractor.validate_block_coverage(
+                        candidate_block, [], ai_rows, ai_rows
+                    )
+                    if report.passed:
+                        _finish_cleanup_repair(
+                            db, actions,
+                            lesson_id=lesson_id,
+                            issue=issue,
+                            block=block,
+                            repaired_block=candidate_block,
+                            repaired_rows=ai_rows,
+                            reason="RECONCILED_AI_ROWS_REPLACED_STALE_RANGE",
+                        )
+                        continue
+                can_shrink_sibling_range = (
+                    "MISSING_ORDERS" in issue["issues"]
+                    and block["first_order"] is not None
+                    and block["last_order"] is not None
+                    and ai_rows
+                    and len(ai_rows) == len({row.order_no for row in ai_rows})
+                )
+                if can_shrink_sibling_range:
+                    target_orders = set(range(block["first_order"], block["last_order"] + 1))
+                    ai_orders = {row.order_no for row in ai_rows}
+                    observed_orders = ai_orders & target_orders
+                    missing_orders = target_orders - observed_orders
+                    sibling_orders = {
+                        row["order_no"]
+                        for other_block_id, other_rows in rows_by_block.items()
+                        if other_block_id != block["id"]
+                        for row in other_rows
+                        if row.get("order_no") is not None
+                    }
+                    range_rows = [row for row in ai_rows if row.order_no in observed_orders]
+                    if (
+                        observed_orders
+                        and missing_orders
+                        and missing_orders <= sibling_orders
+                        and _orders_contiguous(observed_orders)
+                        and len(range_rows) == len(observed_orders)
+                    ):
+                        candidate_block = replace(
+                            record_block,
+                            first_order=min(observed_orders),
+                            last_order=max(observed_orders),
+                            expected_rows=len(range_rows),
+                            status="ai_ok",
+                        )
+                        report = extractor.validate_block_coverage(
+                            candidate_block, [], range_rows, range_rows
+                        )
+                        if report.passed:
+                            _finish_cleanup_repair(
+                                db, actions,
+                                lesson_id=lesson_id,
+                                issue=issue,
+                                block=block,
+                                repaired_block=candidate_block,
+                                repaired_rows=range_rows,
+                                reason="RECONCILED_RANGE_SPLIT_BY_SIBLING_BLOCK",
+                            )
+                            continue
+
+                trusted_ai_rows = (
+                    issue["issues"] == ("INCOMPLETE_BLOCK", "ROW_COUNT_MISMATCH")
+                    and block["first_order"] is None
+                    and block["last_order"] is None
+                    and vocab_rows
+                    and all(row.extract_by != "regex" for row in vocab_rows)
+                    and all(order is not None for order in orders)
+                    and len(orders) == len(set(orders))
+                )
+                if not trusted_ai_rows:
+                    continue
+                candidate_block = replace(
+                    record_block,
+                    expected_rows=len(vocab_rows),
+                    status="ai_ok",
+                )
+                report = extractor.validate_block_coverage(
+                    candidate_block, [], vocab_rows, vocab_rows
+                )
+                if not report.passed:
+                    continue
+                _finish_cleanup_repair(
+                    db, actions,
+                    lesson_id=lesson_id,
+                    issue=issue,
+                    block=block,
+                    repaired_block=candidate_block,
+                    repaired_rows=vocab_rows,
+                    reason="RECONCILED_TRUSTED_AI_ROWS_WITHOUT_RANGE",
+                )
+                continue
+            repaired_block, repaired_rows = result
+            _finish_cleanup_repair(
+                db, actions,
+                lesson_id=lesson_id,
+                issue=issue,
+                block=block,
+                repaired_block=repaired_block,
+                repaired_rows=repaired_rows,
+                reason="RECONCILED_CHECKPOINTED_BLOCK",
+            )
+    return actions
 def _manifest_record_stale(record: dict) -> bool:
-    if record["status"] == "manual":
+    if record["status"] == "manual" or record["region_decision"] != "auto":
         return False
     first = record["first_order"]
     last = record["last_order"]
@@ -918,7 +1470,7 @@ def _manifest_record_stale(record: dict) -> bool:
 
 
 def _manifest_rows_stale(record: dict, rows: list[dict]) -> bool:
-    if record["status"] == "manual":
+    if record["status"] == "manual" or record["region_decision"] != "auto":
         return False
     expected = record["expected_rows"]
     if not rows:

@@ -171,3 +171,27 @@ def test_boundary_contact_sheet_is_bounded(temp_pdf_path):
     pix = fitz.Pixmap(image)
     assert pix.width <= 1200
     assert pix.height > 0
+
+
+def test_native_text_box_matches_rendered_250_dpi_crop(temp_pdf_path):
+    with PdfSource(temp_pdf_path) as pdf:
+        first = pdf.spans(0)[0]
+        crop = fitz.Pixmap(pdf.get_page_crop_image_bytes(0, first.bbox))
+        assert abs(crop.width - (first.bbox[2] - first.bbox[0])) <= 2
+        assert min(crop.samples) < 50
+        assert first.bbox[0] == pytest.approx(50 * 250 / 72)
+
+
+def test_windows_ocr_starts_powershell_without_a_console(monkeypatch):
+    import subprocess
+
+    no_window = 0x08000000
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+
+    def run(command, *, creationflags, **kwargs):
+        assert command[0] == "powershell"
+        assert creationflags & no_window
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert OcrAdapter().ocr_png_bytes(b"png") == []

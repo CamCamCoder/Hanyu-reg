@@ -18,6 +18,7 @@ from hanzi_app.data.models import (
     PageSummary,
     SplitResult,
     ExtractionResult,
+    TextSpan,
     VocabBlock,
     VocabRow,
 )
@@ -28,6 +29,7 @@ from hanzi_app.service.importer import (
     VocabImporterWorker,
     _write_crop_atomic,
     collect_import_issues,
+    cleanup_import_issues,
 )
 from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
@@ -1081,7 +1083,7 @@ def test_collect_import_issues_groups_whole_book_failures(tmp_path):
     lesson_1, lesson_2, _lesson_3 = db.get_lessons(book_id)
     block_1 = db.replace_import_blocks(lesson_1["id"], [
         VocabBlock(None, lesson_1["id"], 1, 1, (0, 0, 100, 200), "b1.png", 2, 1, 2,
-                   "incomplete", 3)
+                   "incomplete", 4)
     ])[0]
     db.replace_vocab_block(block_1["id"], [
         VocabRow(1, "音", None, None, None, 1, "regex", True, "ocr",
@@ -1112,6 +1114,549 @@ def test_collect_import_issues_groups_whole_book_failures(tmp_path):
     assert "GRAMMAR_TABLE_FALSE_POSITIVE" in by_lesson[2]["issues"]
     assert by_lesson[3]["issues"] == ("NO_BLOCKS",)
     db.close()
+
+def test_collect_import_issues_flags_local_ok_ocr_noise(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Hidden OCR noise", "book.pdf", "hidden-ocr-noise", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 200), "b4.png", 2, None, None,
+                   "local_ok", 0)
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "fragment-a", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block["id"]),
+        VocabRow(2, "fragment-b", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block["id"]),
+    ])
+
+    issues = collect_import_issues(db, book_id)
+
+    assert len(issues) == 1
+    assert issues[0]["issues"] == ("OCR_NOISE",)
+    assert issues[0]["status"] == "local_ok"
+    db.close()
+
+
+def test_cleanup_import_issues_removes_local_ok_ocr_noise_when_lesson_has_other_blocks(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup local noise", "book.pdf", "cleanup-local-noise", 20)
+    db.replace_lessons(book_id, [LessonBoundary(15, "Fifteen", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, noisy = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "good.png", 1, 1, 1,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (100, 0, 200, 100), "noise.png", 2, None, None,
+                   "local_ok", 0),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "real", "real", None, "real", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    db.replace_vocab_block(noisy["id"], [
+        VocabRow(1, "fragment-a", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=noisy["id"]),
+        VocabRow(2, "fragment-b", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=noisy["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 15,
+        "removed_block_ids": (noisy["id"],),
+        "removed_block_nos": (2,),
+        "reason": "LOCAL_OK_OCR_NOISE_FALSE_POSITIVE",
+    }]
+    assert collect_import_issues(db, book_id) == []
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["real"]
+    db.close()
+
+def test_cleanup_import_issues_removes_false_positive_blocks_only(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup", "book.pdf", "cleanup", 20)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, bad = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "good.png", 1, 1, 1,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 2, (0, 0, 100, 100), "bad.png", 3, None, None,
+                   "incomplete", 2),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "你好", None, None, None, 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    db.replace_vocab_block(bad["id"], [
+        VocabRow(1, "名词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(2, "动词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(3, "形容词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 1,
+        "removed_block_ids": (bad["id"],),
+        "removed_block_nos": (2,),
+        "reason": "GRAMMAR_TABLE_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["你好"]
+    db.close()
+
+
+
+
+
+def _cleanup_span(text, x, y, width=48):
+    return TextSpan(text, (x, y, x + width, y + 18), 14)
+
+
+def _cleanup_vocab_region():
+    return [
+        _cleanup_span("New Words", 20, 40, 90),
+        _cleanup_span("1", 20, 90, 18),
+        _cleanup_span("你好", 80, 90, 48),
+        _cleanup_span("nihao", 150, 90, 60),
+        _cleanup_span("xin chao", 260, 90, 80),
+        _cleanup_span("2", 20, 125, 18),
+        _cleanup_span("老师", 80, 125, 48),
+        _cleanup_span("laoshi", 150, 125, 60),
+        _cleanup_span("giao vien", 260, 125, 80),
+    ]
+
+def test_cleanup_import_issues_removes_stale_locator_false_positive(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup stale", "book.pdf", "cleanup-stale", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, stale = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (12, 82, 270, 150), "good.png", 2, 1, 2,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (500, 500, 800, 700), "stale.png", 2, 2, 3,
+                   "incomplete", 4),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "你好", "nihao", None, "xin chao", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+        VocabRow(2, "老师", "laoshi", None, "giao vien", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _cleanup_vocab_region()
+
+    actions = cleanup_import_issues(db, book_id, pdf=pdf)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 4,
+        "removed_block_ids": (stale["id"],),
+        "removed_block_nos": (2,),
+        "reason": "STALE_LOCATOR_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["你好", "老师"]
+    db.close()
+
+
+def test_cleanup_import_issues_keeps_issue_still_supported_by_locator(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup keep", "book.pdf", "cleanup-keep", 20)
+    db.replace_lessons(book_id, [LessonBoundary(9, "Nine", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (12, 82, 270, 150), "real.png", 2, 1, 2,
+                   "incomplete", 1),
+    ])[0]
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _cleanup_vocab_region()
+
+    actions = cleanup_import_issues(db, book_id, pdf=pdf)
+
+    assert actions == []
+
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [block["id"]]
+    db.close()
+
+def test_cleanup_import_issues_reconciles_checkpointed_block_metadata(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup reconcile", "book.pdf", "cleanup-reconcile", 20)
+    db.replace_lessons(book_id, [LessonBoundary(20, "Twenty", 100, 109, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 2, 103, (0, 0, 100, 100), "b20.png", 2, None, None,
+                   "ai_ok", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "alpha", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(2, "beta", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(3, "gamma", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == ("ROW_COUNT_MISMATCH",)
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 20,
+        "block_id": block["id"],
+        "block_no": 2,
+        "reason": "RECONCILED_CHECKPOINTED_BLOCK",
+        "issues_before": ("ROW_COUNT_MISMATCH",),
+        "expected_rows_before": 2,
+        "expected_rows_after": 3,
+        "status_after": "ai_ok",
+        "saved_rows": 3,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 3
+    assert repaired["status"] == "ai_ok"
+    assert repaired["ai_attempts"] == 1
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "alpha", "beta", "gamma",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_reconciles_trusted_ai_rows_without_range(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup trusted rows", "book.pdf", "cleanup-trusted", 20)
+    db.replace_lessons(book_id, [LessonBoundary(9, "Nine", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b9.png", 4, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "教室", "jiàoshì", "n.", "phòng học", 1, "vision", True, None,
+                 hanviet_src="giáo thất", source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "ROW_COUNT_MISMATCH",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 9,
+        "block_id": block["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_TRUSTED_AI_ROWS_WITHOUT_RANGE",
+        "issues_before": ("INCOMPLETE_BLOCK", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 4,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 1
+    assert repaired["status"] == "ai_ok"
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["教室"]
+    db.close()
+
+def test_cleanup_import_issues_does_not_remove_all_blocks(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup skip", "book.pdf", "cleanup-skip", 20)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    bad = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 2, (0, 0, 100, 100), "bad.png", 2, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(bad["id"], [
+        VocabRow(1, "名词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(2, "动词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 1,
+        "removed_block_ids": (),
+        "removed_block_nos": (),
+        "reason": "SKIPPED_ALL_BLOCKS_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [bad["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["名词", "动词"]
+    db.close()
+
+
+
+def test_cleanup_import_issues_dedupes_ai_rows_by_order(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup duplicate AI", "book.pdf", "cleanup-dup-ai", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 3, 0, (0, 0, 100, 100), "b4.png", 5, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(7, "room", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(8, "husband", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(9, "beside", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(10, "really", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(11, "pink_color", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(11, "pink", None, None, None, 1, "vision", True, "substring duplicate",
+                 source_block_id=block["id"]),
+        VocabRow(12, "color", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "DUPLICATE_ORDERS", "ROW_COUNT_MISMATCH",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 4,
+        "block_id": block["id"],
+        "block_no": 3,
+        "reason": "RECONCILED_DEDUPED_AI_ROWS",
+        "issues_before": ("INCOMPLETE_BLOCK", "DUPLICATE_ORDERS", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 5,
+        "expected_rows_after": 6,
+        "status_after": "ai_ok",
+        "saved_rows": 6,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 6
+    assert repaired["status"] == "ai_ok"
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "room", "husband", "beside", "really", "pink_color", "color",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_shrinks_range_when_missing_order_is_in_sibling_block(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup sibling range", "book.pdf", "cleanup-sibling", 20)
+    db.replace_lessons(book_id, [LessonBoundary(22, "Twenty Two", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block_1, block_2 = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b22-1.png", 2, 6, 7,
+                   "incomplete", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (100, 0, 200, 100), "b22-2.png", 1, 7, 7,
+                   "ai_ok", 1),
+    ])
+    db.replace_vocab_block(block_1["id"], [
+        VocabRow(1, "ocr_noise", None, None, None, 1, "regex", True, "out of range",
+                 source_block_id=block_1["id"]),
+        VocabRow(6, "sunny", None, None, None, 1, "vision", False, None,
+                 source_block_id=block_1["id"]),
+    ])
+    db.replace_vocab_block(block_2["id"], [
+        VocabRow(7, "hundred", None, None, None, 1, "vision", False, None,
+                 source_block_id=block_2["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "MISSING_ORDERS",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 22,
+        "block_id": block_1["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_RANGE_SPLIT_BY_SIBLING_BLOCK",
+        "issues_before": ("INCOMPLETE_BLOCK", "MISSING_ORDERS"),
+        "expected_rows_before": 2,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    blocks = db.get_import_blocks(lesson["id"])
+    assert blocks[0]["first_order"] == 6
+    assert blocks[0]["last_order"] == 6
+    assert blocks[0]["expected_rows"] == 1
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "sunny", "hundred",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_keeps_ai_rows_and_drops_regex_noise_without_range(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup mixed AI", "book.pdf", "cleanup-mixed-ai", 20)
+    db.replace_lessons(book_id, [LessonBoundary(13, "Thirteen", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b13.png", None, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "header", None, None, None, 1, "regex", True, "heading",
+                 source_block_id=block["id"]),
+        VocabRow(1, "can", "keyi", None, "can", 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(2, "fragment", None, None, None, 1, "regex", True, "fragment",
+                 source_block_id=block["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 13,
+        "block_id": block["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_AI_ROWS_DROPPED_REGEX_NOISE",
+        "issues_before": ("INCOMPLETE_BLOCK", "DUPLICATE_ORDERS"),
+        "expected_rows_before": None,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["can"]
+    db.close()
+
+
+def test_cleanup_import_issues_replaces_stale_range_with_contiguous_ai_rows(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup stale range", "book.pdf", "cleanup-stale-range", 20)
+    db.replace_lessons(book_id, [LessonBoundary(7, "Seven", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 2, 0, (0, 0, 100, 100), "b7.png", 2, 6, 7,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "noise", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=block["id"]),
+        VocabRow(18, "at", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(19, "home", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(20, "inside", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 7,
+        "block_id": block["id"],
+        "block_no": 2,
+        "reason": "RECONCILED_AI_ROWS_REPLACED_STALE_RANGE",
+        "issues_before": ("INCOMPLETE_BLOCK", "MISSING_ORDERS", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 2,
+        "expected_rows_after": 3,
+        "status_after": "ai_ok",
+        "saved_rows": 3,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["first_order"] == 18
+    assert repaired["last_order"] == 20
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["at", "home", "inside"]
+    db.close()
+
+def test_vocab_import_runs_cleanup_before_final_state(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Cleanup in worker", "book.pdf", "worker-cleanup", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_page_crop_image_bytes(self, _page, _bbox, dpi=200):
+            return b"crop"
+
+    class FakeExtractor:
+        def __init__(self, _dict_db=None):
+            self.lesson_ai_attempts = 0
+
+        def locate_blocks(self, _pdf, boundary):
+            return [
+                VocabBlock(
+                    None, lesson["id"], 1, 0, (0, 0, 100, 100),
+                    None, 4, None, None,
+                )
+            ]
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            block = pending[0]
+            row = VocabRow(
+                1, "教室", "jiàoshì", "n.", "phòng học", 1,
+                "vision", True, None, source_block_id=block.id,
+            )
+            coverage = BlockCoverage(
+                block.id, 4, 0, 1, 1, (), ("expected_row_mismatch",), False
+            )
+            return ExtractionResult(
+                (row,), (coverage,),
+                (replace(block, status="incomplete", ai_attempts=1),),
+                1, False,
+            )
+
+        def reconcile_checkpointed_block(self, block, rows):
+            return replace(block, expected_rows=len(rows), status="ai_ok"), rows
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    finished = []
+    errors = []
+    worker.finished_import.connect(lambda bid, title: finished.append((bid, title)))
+    worker.failed_import.connect(errors.append)
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    assert errors == []
+    assert finished == [(book_id, "Cleanup in worker")]
+    assert reopened.get_book(book_id)["import_state"] == "review"
+    [block] = reopened.get_import_blocks(lesson["id"])
+    assert block["status"] == "ai_ok"
+    assert block["expected_rows"] == 1
+    assert [row["word"] for row in reopened.get_lesson_words(lesson["id"])] == ["教室"]
+    reopened.close()
+
 def test_vocab_import_skips_incomplete_block_and_continues_later_lessons(
     tmp_path, monkeypatch
 ):
@@ -1147,8 +1692,14 @@ def test_vocab_import_skips_incomplete_block_and_continues_later_lessons(
     seen = []
 
     class FakeExtractor:
-        def __init__(self, _dict_db):
+        def __init__(self, _dict_db=None):
             pass
+
+        def locate_blocks(self, _pdf, _boundary):
+            return []
+
+        def reconcile_checkpointed_block(self, _block, _rows):
+            return None
 
         def extract_blocks(self, _pdf, pending, ai_client=None):
             block = pending[0]
@@ -1241,8 +1792,14 @@ def test_429_keeps_completed_block_and_resume_skips_it(tmp_path, monkeypatch):
             return False
 
     class FakeExtractor:
-        def __init__(self, _dict_db):
+        def __init__(self, _dict_db=None):
             pass
+
+        def locate_blocks(self, _pdf, _boundary):
+            return []
+
+        def reconcile_checkpointed_block(self, _block, _rows):
+            return None
 
         def extract_blocks(self, _pdf, pending, ai_client=None):
             assert [block.block_no for block in pending] == [2]
@@ -1659,3 +2216,26 @@ def test_resume_clears_zero_rows_for_valid_automatic_manifest(tmp_path):
     assert reopened.get_lesson_words(lesson["id"]) == []
     extractor.locate_blocks.assert_not_called()
     reopened.close()
+
+
+def test_checkpoint_before_region_redraw_does_not_restore_old_rows_or_crop(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    try:
+        book = db.add_book("Regions", "test.pdf", "stale-region", 1)
+        db.replace_lessons(book, [LessonBoundary(1, None, 0, 0, 1, "lesson")])
+        lesson = db.get_lessons(book)[0]["id"]
+        record, = db.replace_import_blocks(lesson, [
+            VocabBlock(None, lesson, 1, 0, (10, 20, 100, 200), "old.png", 1, 1, 1)
+        ])
+        stale = replace(VocabImporterWorker._record_to_block(record), status="local_ok")
+        word = VocabRow(1, "新", None, None, None, 1, "manual", False, None,
+                        source_block_id=stale.id)
+        db.save_region_review(lesson, 0, (20, 30, 150, 200), "accepted",
+                              stale.id, 0, "new.png", [word], "manual")
+        result = ExtractionResult((replace(word, word="旧", extract_by="regex"),), (), (stale,), 0, True)
+        VocabImporterWorker._checkpoint_result(db, result)
+        assert [r["word"] for r in db.get_lesson_words(lesson)] == ["新"]
+        current, = db.get_import_blocks(lesson)
+        assert (current["crop_path"], current["status"], current["region_revision"]) == ("new.png", "manual", 1)
+    finally:
+        db.close()

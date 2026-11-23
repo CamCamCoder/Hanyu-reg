@@ -308,6 +308,21 @@ class Splitter:
                 )
         else:
             boundaries = self.split_by_regex(summaries) or self.split_by_heuristics(summaries)
+            if not boundaries:
+                banners = [p for p in page_evidence if p.layout_fingerprint == "captioned-opening-banner"]
+                if len(banners) >= 3 and all(b.pdf_page - a.pdf_page >= 2
+                                             for a, b in zip(banners, banners[1:])):
+                    end = next((p.pdf_page for p in page_evidence if p.pdf_page > banners[-1].pdf_page
+                                and re.search(r"translation\s+of\s+the\s+texts|[il]ndex\s+of\s+word|词\s*语\s*索\s*引",
+                                              p.top_text, re.I)), total_pages)
+                    starts = [p.pdf_page for p in banners] + [end]
+                    for i, page in enumerate(banners, start=1):
+                        boundaries.append(LessonBoundary(i, page.top_text, page.pdf_page,
+                                                         starts[i] - 1, 0.55, "lesson"))
+                        boundary_evidence.append(BoundaryEvidence(
+                            "layout", page.pdf_page, i, page.top_text, 0.55,
+                            f"Kiểu trang mở bài lặp lại · kiểm tra trang {page.pdf_page + 1}",
+                        ))
 
         report = self.validate(boundaries, boundary_evidence, total_pages)
         local = SplitResult(

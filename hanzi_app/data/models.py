@@ -218,6 +218,8 @@ class VocabBlock:
     last_order: int | None
     status: str = "pending"
     ai_attempts: int = 0
+    region_decision: str = "auto"
+    region_revision: int = 0
 
 
 @dataclass(frozen=True)

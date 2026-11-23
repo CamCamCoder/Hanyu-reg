@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from hanzi_app.data.models import BoundaryEvidence, LessonBoundary, SplitResult
-from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker
+from hanzi_app.service.importer import BookImporterWorker, VocabImporterWorker, render_page_preview
 from hanzi_app.service.splitter import Splitter
 from hanzi_app.ui.theme import PALETTE, ui_font
 
@@ -137,6 +137,11 @@ class DialogReviewBoundaries(QDialog):
         self.btn_manual = QPushButton("Dùng ranh giới đang nhập")
         self.btn_manual.clicked.connect(self._use_manual_boundaries)
         edit_actions.addWidget(self.btn_manual)
+        self.btn_compare = QPushButton("So hai trang đề xuất")
+        self.btn_compare.clicked.connect(self._compare_pages)
+        edit_actions.addWidget(self.btn_compare)
+        self.table.currentCellChanged.connect(self._refresh_compare_button)
+        self._refresh_compare_button()
         self.btn_sort = QPushButton("Sắp xếp")
         self.btn_sort.clicked.connect(self._sort_rows)
         edit_actions.addWidget(self.btn_sort)
@@ -159,11 +164,68 @@ class DialogReviewBoundaries(QDialog):
 
     def _evidence_text(self, lesson_no: int) -> str:
         entries = [
-            f"{item.source}: {item.detail}"
+            f"{item.source} · trang {item.page_index + 1} · {item.detail}"
             for item in self.evidence
             if item.lesson_no == lesson_no
         ]
         return " · ".join(entries)
+
+    def _candidate_pages(self, row):
+        number = self.table.item(row, 0)
+        if not number or self._is_manual(row):
+            return []
+        entries = [item for item in self.evidence if str(item.lesson_no) == number.text()
+                   and item.source in {"toc", "heading"} and 0 <= item.page_index < self.page_count]
+        toc = {item.page_index for item in entries if item.source == "toc"}
+        headings = {item.page_index for item in entries if item.source == "heading"}
+        if not toc or not headings or toc == headings:
+            return []
+        return sorted({(item.page_index, item.source) for item in entries})
+
+    def _refresh_compare_button(self):
+        self.btn_compare.setEnabled(bool(self._candidate_pages(self.table.currentRow())))
+
+    def _choose_page(self, row, page_index):
+        start = self.table.item(row, 2)
+        previous_end = self.table.item(row - 1, 3) if row > 0 else None
+        self._updating_table = True
+        if previous_end and start.text().isdigit() and previous_end.text() == str(int(start.text()) - 1):
+            previous_end.setText(str(page_index))
+        start.setText(str(page_index + 1))
+        self.table.item(row, 5).setData(Qt.ItemDataRole.UserRole, True)
+        self._updating_table = False
+        self._validate_rows()
+        self._refresh_compare_button()
+
+    def _compare_pages(self):
+        row = self.table.currentRow()
+        book = self.user_db.get_book(self.book_id)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("So trang mở bài")
+        panels = QHBoxLayout(dialog)
+        for page, source in self._candidate_pages(row):
+            column = QVBoxLayout()
+            panels.addLayout(column)
+            label = "Mục lục" if source == "toc" else "Tiêu đề trên trang"
+            column.addWidget(QLabel(f"{label} · trang PDF {page + 1}"))
+            preview = QLabel()
+            pixmap = QPixmap()
+            try:
+                data = render_page_preview(book["file_path"], page, dpi=75)
+                if not pixmap.loadFromData(data, "PNG"):
+                    raise ValueError("Ảnh trang trống")
+                preview.setPixmap(pixmap.scaled(350, 470, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+            except Exception as error:
+                preview.setText(f"Không mở được trang PDF. {error}")
+                preview.setWordWrap(True)
+            column.addWidget(preview)
+            choose = QPushButton(f"Dùng trang {page + 1}")
+            choose.clicked.connect(lambda checked=False, p=page: dialog.done(p + 1))
+            column.addWidget(choose)
+        answer = dialog.exec()
+        if answer > 0:
+            self._choose_page(row, answer - 1)
 
     def _set_row_values(
         self, row: int, values: tuple[object, ...], manual: bool = False

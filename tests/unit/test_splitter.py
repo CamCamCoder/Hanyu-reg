@@ -181,3 +181,16 @@ def test_propose_does_not_use_ai_when_local_evidence_is_absent():
     result = Splitter().propose([], [], ai_client=ForbiddenAi())
 
     assert result.boundaries == ()
+
+
+def test_repeated_opening_banner_stops_at_appendix_and_requires_repetition():
+    def evidence(page, text, banner=False):
+        return PageEvidence(page, "scan", text, "", None, None, None, None, False,
+                            "captioned-opening-banner" if banner else None)
+
+    pages = [evidence(2, "FIRST", True), evidence(5, "SECOND", True),
+             evidence(9, "THIRD", True), evidence(13, "Translation of the texts")]
+    result = Splitter().propose([], pages)
+    assert [(b.page_start, b.page_end) for b in result.boundaries] == [(2, 4), (5, 8), (9, 12)]
+    assert all(item.source == "layout" for item in result.evidence)
+    assert not Splitter().propose([], pages[:2]).boundaries

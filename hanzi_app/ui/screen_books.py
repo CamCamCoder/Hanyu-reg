@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFrame,
     QGridLayout,
+    QGraphicsScene,
+    QGraphicsView,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -36,6 +38,8 @@ from PySide6.QtWidgets import (
 from hanzi_app.data.models import LessonBoundary, VocabRow
 from hanzi_app.service.importer import (
     PreviewWorker,
+    RegionPageWorker,
+    RegionSaveWorker,
     VisionRepairWorker,
 )
 from hanzi_app.ui.dialog_import import DialogImport
@@ -55,6 +59,200 @@ def _sep() -> QFrame:
     line.setFrameShape(QFrame.Shape.HLine)
     line.setStyleSheet(f"color: {PALETTE['line']};")
     return line
+
+
+class RegionView(QGraphicsView):
+    """Scene units are pixels of the 125 DPI full page, independent of zoom."""
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.anchor = None
+        self.outline = None
+
+    def set_box(self, rect):
+        if self.outline is not None:
+            self.scene().removeItem(self.outline)
+        pen = QPen(QColor(PALETTE["accent"]), 2)
+        pen.setCosmetic(True)
+        self.outline = self.scene().addRect(rect, pen) if not rect.isEmpty() else None
+        self.changed.emit()
+
+    def mousePressEvent(self, event):
+        point = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and self.sceneRect().contains(point):
+            self.anchor = point
+            self.set_box(QRectF())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.anchor is None:
+            return super().mouseMoveEvent(event)
+        point = self.mapToScene(event.position().toPoint())
+        self.set_box(QRectF(self.anchor, point).normalized().intersected(self.sceneRect()))
+
+    def mouseReleaseEvent(self, event):
+        if self.anchor is not None:
+            self.mouseMoveEvent(event)
+            self.anchor = None
+            return
+        super().mouseReleaseEvent(event)
+
+
+class DialogReviewRegion(QDialog):
+    def __init__(self, db, book, lesson, parent=None):
+        super().__init__(parent)
+        self.db, self.book, self.lesson = db, book, lesson
+        self.loaders = set()
+        self.loader = self.saver = None
+        self.closing = None
+        self.committed = False
+        self.setWindowTitle(f"Duyệt khung từ mới · Bài {lesson['index_no']}")
+        self.resize(920, 740)
+        layout = QVBoxLayout(self)
+        toolbar = QHBoxLayout()
+        layout.addLayout(toolbar)
+        toolbar.addWidget(QLabel("Trang PDF"))
+        self.page = QSpinBox()
+        self.page.setRange(lesson["page_start"] + 1, lesson["page_end"] + 1)
+        blocks = db.get_import_blocks(lesson["id"])
+        pending = next((r for r in blocks if r["region_decision"] == "review"), None)
+        if pending or blocks:
+            self.page.setValue((pending or blocks[0])["page_index"] + 1)
+        toolbar.addWidget(self.page)
+        self.blocks = QComboBox()
+        toolbar.addWidget(self.blocks)
+        self.view = RegionView(self)
+        for label, factor in (("Thu nhỏ", 0.8), ("Phóng to", 1.25)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, f=factor: self.view.scale(f, f))
+            toolbar.addWidget(button)
+        layout.addWidget(self.view, 1)
+        self.message = QLabel()
+        layout.addWidget(self.message)
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        self.save = QPushButton("Xác nhận khung")
+        self.skip = QPushButton("Bỏ qua vùng")
+        self.cancel = QPushButton("Đóng")
+        for btn in (self.save, self.skip, self.cancel):
+            actions.addWidget(btn)
+        self.page.valueChanged.connect(self.load_page)
+        self.blocks.currentIndexChanged.connect(self.select_box)
+        self.view.changed.connect(self.update_actions)
+        self.save.clicked.connect(lambda: self.save_box("accepted"))
+        self.skip.clicked.connect(lambda: self.save_box("skipped"))
+        self.cancel.clicked.connect(self.reject)
+        self.load_page()
+
+    def load_page(self):
+        self.view.outline = self.view.anchor = None
+        self.view.scene().clear()
+        self.view.setSceneRect(QRectF())
+        self.view.setEnabled(False)
+        self.message.setText("Đang tải trang…")
+        page_index = self.page.value() - 1
+        records = self.db.get_import_blocks(self.lesson["id"])
+        self.blocks.blockSignals(True)
+        self.blocks.clear()
+        labels = {"review": "cần duyệt", "auto": "tự động", "accepted": "đã duyệt", "skipped": "đã bỏ qua"}
+        for r in records:
+            if r["page_index"] == page_index:
+                self.blocks.addItem(f"Khung {r['block_no']} · {labels[r['region_decision']]}", r)
+        self.blocks.addItem("Vẽ khung mới", None)
+        self.blocks.blockSignals(False)
+        worker = RegionPageWorker(self.book["file_path"], page_index, self)
+        self.loader = worker
+        self.loaders.add(worker)
+        self.update_actions()
+        worker.loaded.connect(self.show_page)
+        worker.failed.connect(self.show_error)
+        worker.finished.connect(self.worker_finished)
+        worker.start()
+
+    def show_page(self, data):
+        if self.sender() != self.loader:
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(data, "PNG"):
+            self.message.setText("Không mở được ảnh trang")
+            return
+        self.view.scene().addPixmap(pix)
+        self.view.setSceneRect(QRectF(pix.rect()))
+        self.view.fitInView(self.view.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.view.setEnabled(True)
+        self.select_box()
+
+    def select_box(self):
+        record = self.blocks.currentData()
+        rect = QRectF()
+        if record and self.view.isEnabled():
+            x, y, right, bottom = record["bbox"]
+            rect = QRectF(x / 2, y / 2, (right - x) / 2, (bottom - y) / 2)
+        if self.view.isEnabled():
+            self.message.setText(
+                "Chưa xác định được số dòng của bảng. Kiểm tra hai mép rồi xác nhận hoặc bỏ qua."
+                if record and record["region_decision"] == "review"
+                else "Kéo từ một góc tới góc đối diện của bảng để đặt khung."
+            )
+        self.view.set_box(rect)
+
+    def update_actions(self):
+        enabled = self.saver is None and self.view.isEnabled()
+        self.save.setEnabled(enabled and self.view.outline is not None)
+        self.skip.setEnabled(enabled and self.blocks.currentData() is not None)
+
+    def save_box(self, decision):
+        record = self.blocks.currentData()
+        if decision == "skipped":
+            bbox = tuple(record["bbox"])
+        else:
+            rect = self.view.outline.rect()
+            bbox = tuple(2 * value for value in (rect.left(), rect.top(), rect.right(), rect.bottom()))
+        self.saver = RegionSaveWorker(self.db.path, self.book, self.lesson["id"], self.page.value() - 1,
+                                      bbox, record, decision, self)
+        self.page.setEnabled(False)
+        self.blocks.setEnabled(False)
+        self.view.setEnabled(False)
+        self.update_actions()
+        self.message.setText("Đang lưu quyết định…" if decision == "skipped" else "Đang đọc bảng đã chọn bằng OCR…")
+        self.saver.saved.connect(self.saved)
+        self.saver.failed.connect(self.show_error)
+        self.saver.finished.connect(self.worker_finished)
+        self.saver.start()
+
+    def saved(self):
+        self.committed = True
+        self.closing = QDialog.DialogCode.Accepted
+
+    def show_error(self, message):
+        if self.sender() in (self.loader, self.saver):
+            self.message.setText(message)
+
+    def worker_finished(self):
+        worker = self.sender()
+        self.loaders.discard(worker)
+        if worker == self.saver:
+            self.saver = None
+            self.page.setEnabled(True)
+            self.blocks.setEnabled(True)
+            self.view.setEnabled(True)
+            self.update_actions()
+        if worker == self.loader:
+            self.loader = None
+        worker.deleteLater()
+        if self.closing is not None and not self.loaders and self.saver is None:
+            super().done(self.closing)
+
+    def done(self, result):
+        if self.loaders or self.saver is not None:
+            self.closing = result
+            self.setEnabled(False)
+            return
+        super().done(result)
 
 
 class DialogEditVocab(QDialog):
@@ -303,6 +501,9 @@ class DialogReviewBook(QDialog):
         boundary.addWidget(QLabel("đến"))
         boundary.addWidget(self.end_spin)
         right_lay.addLayout(boundary)
+        self.btn_regions = QPushButton("Duyệt khung trên trang PDF")
+        self.btn_regions.clicked.connect(self._review_regions)
+        right_lay.addWidget(self.btn_regions)
 
         content = QSplitter(Qt.Orientation.Vertical)
         self.table = QTableWidget(0, len(self._HEADERS))
@@ -539,6 +740,7 @@ class DialogReviewBook(QDialog):
                             extract_by=word.get("extract_by") or "manual",
                             needs_review=bool(word.get("needs_review")),
                             review_reason=None,
+                            source_block_id=word.get("source_block_id"),
                         )
                     )
                     continue
@@ -569,6 +771,7 @@ class DialogReviewBook(QDialog):
                         extract_by="manual",
                         needs_review=False,
                         review_reason=None,
+                        source_block_id=word.get("source_block_id"),
                     )
                 )
             rows_by_lesson[lesson_id] = saved_rows
@@ -675,6 +878,8 @@ class DialogReviewBook(QDialog):
                 self._show_review_source(row, column)
 
     def _finish_reviewed_book(self) -> None:
+        if self.user_db.get_book(self.book["id"])["import_state"] == "incomplete":
+            return
         remaining = sum(
             int(word.get("needs_review") or 0)
             for lesson in self.user_db.get_lessons(self.book["id"])
@@ -689,6 +894,16 @@ class DialogReviewBook(QDialog):
             return
         self.user_db.set_import_state(self.book["id"], "ready")
         self.accept()
+
+    def _review_regions(self):
+        if self.current_lesson is None:
+            return
+        dialog = DialogReviewRegion(self.user_db, self.book, self.current_lesson, self)
+        dialog.exec()
+        if dialog.committed:
+            self.book = self.user_db.get_book(self.book["id"])
+            self._reload_review_queue()
+            self._load_selected(self.list_lessons.currentItem())
 
     def _load_selected(self, current, _previous=None) -> None:
         if current is None:
@@ -715,6 +930,7 @@ class DialogReviewBook(QDialog):
                 block
                 for block in blocks
                 if block["status"] not in {"local_ok", "ai_ok", "manual"}
+                and block["region_decision"] != "skipped"
             ),
             None,
         )
@@ -732,7 +948,7 @@ class DialogReviewBook(QDialog):
         )
         self._populate_rows(words)
         has_incomplete_block = self.current_block_id is not None
-        self.btn_confirm_block_manual.setVisible(has_incomplete_block)
+        self.btn_confirm_block_manual.setVisible(has_incomplete_block and self.current_block["region_decision"] != "review")
         self.btn_save_current.setVisible(not has_incomplete_block)
         self.btn_confirm_all.setVisible(
             self.book.get("import_state") != "incomplete"
@@ -839,6 +1055,8 @@ class DialogReviewBook(QDialog):
                 continue
             order = int(value(0)) if value(0).isdigit() else len(rows) + 1
             page = int(value(6)) if value(6).isdigit() else self.start_spin.value() + 1
+            order_item = self.table.item(row, 0)
+            metadata = order_item.data(Qt.ItemDataRole.UserRole) if order_item else None
             rows.append(
                 VocabRow(
                     order_no=order,
@@ -851,6 +1069,7 @@ class DialogReviewBook(QDialog):
                     extract_by="manual",
                     needs_review=False,
                     review_reason=None,
+                    source_block_id=(metadata or {}).get("source_block_id"),
                 )
             )
         return rows
@@ -986,6 +1205,8 @@ class DialogReviewBook(QDialog):
         worker.deleteLater()
 
     def _confirm_all(self) -> None:
+        if self.user_db.get_book(self.book["id"])["import_state"] == "incomplete":
+            return
         if not self._save_current():
             return
         lessons = self.user_db.get_lessons(self.book["id"])

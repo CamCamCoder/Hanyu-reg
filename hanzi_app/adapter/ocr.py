@@ -13,12 +13,9 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+import fitz
 
 from hanzi_app.data.models import TextSpan
-
-if TYPE_CHECKING:
-    import fitz
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +95,8 @@ class OcrAdapter:
                     for span in line.get("spans", []):
                         text = span.get("text", "").strip()
                         if text:
-                            bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
+                            rect = fitz.Rect(span["bbox"]) * page.rotation_matrix
+                            bbox = tuple(value * 250 / 72 for value in rect)
                             font_size = float(span.get("size", 12.0))
                             spans.append(
                                 TextSpan(
@@ -156,6 +154,8 @@ class OcrAdapter:
                 errors="replace",
                 timeout=45,
                 check=False,
+                # A windowed EXE has no console for PowerShell to inherit.
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
 
         if completed.returncode != 0:
