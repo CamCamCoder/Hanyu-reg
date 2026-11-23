@@ -50,13 +50,18 @@ Thông tin trang:
 """
 
 # Prompt cho bóc tách từ vựng từ ảnh/text trang sách
-PROMPT_EXTRACT_VOCAB = """Bạn là chuyên gia bóc tách từ vựng từ giáo trình tiếng Trung (bảng 生词表).
-Ảnh đầu vào đã được crop chỉ còn vùng bảng. Hãy CHÉP NGUYÊN VĂN từng ô,
-không dịch, không bổ sung và không suy đoán nội dung bị khuất. Trả về KẾT QUẢ
-DUY NHẤT dưới dạng CHUỖI JSON như sau:
+PROMPT_EXTRACT_VOCAB = """You extract Chinese textbook vocabulary rows from images.
+The input image may be either a clean crop of one vocabulary table or a full-page
+recovery fallback. Use the validator context, when present, to identify the target
+block/order range. Extract only vocabulary rows from sinh ci / new words tables.
+Ignore dialogues, grammar notes, exercises, headers, footers, page numbers, and
+reference tables such as part-of-speech lists.
+
+Copy the visible cell text exactly. Do not translate, complete, or invent hidden
+content. Return only a JSON array using this schema:
 
 [
-  {{
+  {
     "order_no": 1,
     "word": "你好",
     "pinyin": "nǐhǎo",
@@ -64,10 +69,25 @@ DUY NHẤT dưới dạng CHUỖI JSON như sau:
     "hanviet": "nhĩ hảo",
     "meaning_en": "hello",
     "meaning_vi": "xin chào"
-  }}
+  }
 ]
 
-Không kèm theo lời giải thích nào khác ngoài JSON.
+If the target block has an order range, return only rows in that range. If an order
+number is not printed but the visible rows clearly belong to the target block, infer
+the sequential order numbers for those rows. Do not return explanatory text.
+"""
+
+
+PROMPT_SPLIT_LESSONS_IMAGE = """You identify lesson boundaries in a Chinese-language textbook.
+Read the supplied contact-sheet image and reconcile it with the local evidence below.
+Return only a JSON list. Every item must contain a positive integer `index_no`,
+an optional `title`, and a zero-based integer `page_start`. Do not invent pages.
+
+Local evidence:
+{evidence_text}
+
+Validator issues from the preceding attempt:
+{issue_context}
 """
 
 
@@ -89,19 +109,43 @@ class AiClient:
         response_text = self._call_llm_text(prompt)
         return self._parse_json_list(response_text)
 
+    def split_lessons_from_image(
+        self,
+        image_bytes: bytes,
+        evidence_text: str,
+        issue_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ask Vision to resolve only lesson boundaries local evidence cannot prove."""
+        if not self.api_key or not image_bytes:
+            return []
+
+        prompt = PROMPT_SPLIT_LESSONS_IMAGE.format(
+            evidence_text=evidence_text,
+            issue_context=issue_context or "None.",
+        )
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return self._parse_json_list(self._call_llm_vision(prompt, image_b64))
+
     def extract_vocab(self, page_text: str) -> list[dict[str, Any]]:
         """Gửi văn bản trang cho LLM để bóc tách từ vựng."""
-        prompt = PROMPT_EXTRACT_VOCAB.format(page_text=page_text)
+        prompt = PROMPT_EXTRACT_VOCAB + "\n\nPage text:\n" + page_text
         response_text = self._call_llm_text(prompt)
         return self._parse_json_list(response_text)
 
-    def extract_vocab_from_image(self, image_bytes: bytes) -> list[dict[str, Any]]:
-        """Sử dụng Vision AI đọc trực tiếp ảnh trang sách quét để bóc tách từ vựng."""
+    def extract_vocab_from_image(
+        self,
+        image_bytes: bytes,
+        issue_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read one vocabulary crop with optional validator guidance."""
         if not self.api_key or not image_bytes:
             return []
-        
+
+        prompt = PROMPT_EXTRACT_VOCAB
+        if issue_context:
+            prompt += f"\n\nValidator context:\n{issue_context}"
         b64_data = base64.b64encode(image_bytes).decode("utf-8")
-        response_text = self._call_llm_vision(PROMPT_EXTRACT_VOCAB, b64_data)
+        response_text = self._call_llm_vision(prompt, b64_data)
         return self._parse_json_list(response_text)
 
     def _call_llm_text(self, prompt: str) -> str:

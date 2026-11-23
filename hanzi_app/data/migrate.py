@@ -15,7 +15,7 @@ Tầng data không import bất cứ thứ gì của Qt.
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 _TAO_BANG_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -137,6 +137,51 @@ _BAC_2 = (
 )
 
 
+# Bậc 3: manifest block nhập từ mới.
+#
+# lesson_word ở bậc 1 có UNIQUE (lesson_id, word), nhưng một từ có thể xuất hiện
+# hợp lệ ở hai block khác nhau của cùng một bài. SQLite không hỗ trợ bỏ riêng
+# một ràng buộc UNIQUE, nên dựng lại bảng. progress.source_lw_id trỏ tới bảng
+# cũ; lưu mapping tạm trước khi DROP rồi khôi phục sau khi các id được chép y
+# nguyên sang bảng mới.
+_TAO_IMPORT_BLOCK = """
+CREATE TABLE import_block (
+    id            INTEGER PRIMARY KEY,
+    lesson_id     INTEGER NOT NULL REFERENCES lesson(id) ON DELETE CASCADE,
+    block_no      INTEGER NOT NULL,
+    page_index    INTEGER NOT NULL,
+    bbox_x0       REAL NOT NULL,
+    bbox_y0       REAL NOT NULL,
+    bbox_x1       REAL NOT NULL,
+    bbox_y1       REAL NOT NULL,
+    crop_path     TEXT,
+    expected_rows INTEGER,
+    first_order   INTEGER,
+    last_order    INTEGER,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    ai_attempts   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (lesson_id, block_no)
+)
+"""
+
+_TAO_LESSON_WORD_MOI = """
+CREATE TABLE lesson_word_new (
+    id              INTEGER PRIMARY KEY,
+    lesson_id       INTEGER NOT NULL REFERENCES lesson(id) ON DELETE CASCADE,
+    order_no        INTEGER,
+    word            TEXT NOT NULL,
+    pos             TEXT,
+    pinyin_src      TEXT,
+    hanviet_src     TEXT,
+    meaning_src     TEXT,
+    source_page     INTEGER,
+    extract_by      TEXT,
+    needs_review    INTEGER DEFAULT 0,
+    source_block_id INTEGER REFERENCES import_block(id) ON DELETE SET NULL
+)
+"""
+
+
 def _len_bac_1(conn: sqlite3.Connection) -> None:
     for cau_lenh in _BAC_1:
         conn.execute(cau_lenh)
@@ -147,10 +192,50 @@ def _len_bac_2(conn: sqlite3.Connection) -> None:
         conn.execute(cau_lenh)
 
 
+def _len_bac_3(conn: sqlite3.Connection) -> None:
+    conn.execute(_TAO_IMPORT_BLOCK)
+    conn.execute(
+        "CREATE TEMP TABLE progress_source_lw_map AS "
+        "SELECT word, source_lw_id FROM progress "
+        "WHERE source_lw_id IS NOT NULL"
+    )
+    conn.execute(_TAO_LESSON_WORD_MOI)
+    conn.execute(
+        "INSERT INTO lesson_word_new ("
+        "id, lesson_id, order_no, word, pos, pinyin_src, hanviet_src, "
+        "meaning_src, source_page, extract_by, needs_review"
+        ") "
+        "SELECT id, lesson_id, order_no, word, pos, pinyin_src, hanviet_src, "
+        "meaning_src, source_page, extract_by, needs_review "
+        "FROM lesson_word"
+    )
+    conn.execute("DROP TABLE lesson_word")
+    conn.execute("ALTER TABLE lesson_word_new RENAME TO lesson_word")
+    conn.execute("CREATE INDEX idx_lw_lesson ON lesson_word(lesson_id)")
+    conn.execute("CREATE INDEX idx_lw_word ON lesson_word(word)")
+    conn.execute("CREATE INDEX idx_lw_lesson_word ON lesson_word(lesson_id, word)")
+    conn.execute(
+        "UPDATE progress SET source_lw_id = ("
+        "SELECT source_lw_id FROM progress_source_lw_map "
+        "WHERE progress_source_lw_map.word = progress.word"
+        ") WHERE word IN (SELECT word FROM progress_source_lw_map)"
+    )
+    conn.execute("DROP TABLE progress_source_lw_map")
+
+
+def _len_bac_4(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE import_block ADD COLUMN region_decision TEXT NOT NULL "
+                 "DEFAULT 'auto' CHECK(region_decision IN ('auto','review','accepted','skipped'))")
+    conn.execute("ALTER TABLE import_block ADD COLUMN region_revision INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE import_block SET region_decision='accepted' WHERE status='manual'")
+
+
 # Bậc n chạy khi tệp đang ở bậc n-1. Bản sau chỉ thêm một dòng vào đây.
 _CAC_BAC = {
     1: _len_bac_1,
     2: _len_bac_2,
+    3: _len_bac_3,
+    4: _len_bac_4,
 }
 
 

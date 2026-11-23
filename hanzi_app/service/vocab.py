@@ -11,10 +11,17 @@ import time
 import unicodedata
 from dataclasses import replace
 from itertools import product
+from math import ceil
 from typing import TYPE_CHECKING
 
-from hanzi_app.adapter.aiclient import AiRateLimitError
-from hanzi_app.data.models import TextSpan, VocabRow
+from hanzi_app.adapter.aiclient import AiClientError, AiRateLimitError
+from hanzi_app.data.models import (
+    BlockCoverage,
+    ExtractionResult,
+    TextSpan,
+    VocabBlock,
+    VocabRow,
+)
 
 if TYPE_CHECKING:
     from hanzi_app.adapter.aiclient import AiClient
@@ -56,12 +63,957 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
+def _line_groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
+    """Group spans into visual rows without relying on a textbook template."""
+    lines: list[list[TextSpan]] = []
+    for span in sorted(
+        spans, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0])
+    ):
+        center_y = (span.bbox[1] + span.bbox[3]) / 2
+        if not lines:
+            lines.append([span])
+            continue
+        previous_y = sum(
+            (item.bbox[1] + item.bbox[3]) / 2 for item in lines[-1]
+        ) / len(lines[-1])
+        if abs(center_y - previous_y) <= 12:
+            lines[-1].append(span)
+        else:
+            lines.append([span])
+    return lines
+
+
+def _compact_line(spans: list[TextSpan]) -> str:
+    return re.sub(r"\s+", "", " ".join(span.text for span in spans)).lower()
+
+
+_VOCAB_HEADING_MARKERS = (
+    "newwords",
+    "vocabulary",
+    "词语表",
+    "生词",
+    "新词",
+    "từmới",
+)
+_NON_VOCAB_REFERENCE_TERMS = frozenset({
+    "名词", "动词", "形容", "形容词", "代词", "量词", "助动", "助动词",
+    "数量", "来自本册", "新词", "汉字", "拼音", "词类", "词性", "简称",
+    "副词", "介词", "连词", "助词", "数词", "拟声词",
+})
+MAX_AI_ATTEMPTS_PER_BLOCK = 4
+FULL_PAGE_RECOVERY_START_ATTEMPT = 2
+
+_PINYIN_INITIALS = (
+    "",
+    "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
+    "j", "q", "x", "zh", "ch", "sh", "r", "z", "c", "s", "y", "w",
+)
+_PINYIN_FINALS = (
+    "a", "ai", "an", "ang", "ao", "e", "ei", "en", "eng", "er",
+    "i", "ia", "ian", "iang", "iao", "ie", "in", "ing", "iong", "iu",
+    "o", "ong", "ou", "u", "ua", "uai", "uan", "uang", "ui", "un", "uo",
+    "v", "ve", "van", "vn",
+)
+_PINYIN_SYLLABLES = frozenset(
+    initial + final
+    for initial in _PINYIN_INITIALS
+    for final in _PINYIN_FINALS
+)
+
+
+def _ascii_fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFD", text.lower())
+    return "".join(
+        character for character in decomposed
+        if not unicodedata.combining(character)
+    )
+
+
+def _line_has_translated_vocab_marker(spans: list[TextSpan]) -> bool:
+    text = _ascii_fold(" ".join(span.text for span in spans if span.text.strip()))
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    has_dich = "dich" in compact or "dch" in compact
+    has_nghia = "nghia" in compact or "nghla" in compact or "ngh" in compact
+    has_moi = "moi" in compact or "m6i" in compact
+    return has_moi and (has_dich or has_nghia)
+
+
+def _line_has_vocab_heading(spans: list[TextSpan]) -> bool:
+    if all(hasattr(span, "bbox") for span in spans):
+        spans = sorted(spans, key=lambda span: span.bbox[0])
+    compact = _compact_line(spans)
+    if any(
+        compact.startswith(marker) and len(compact) <= len(marker) + 24
+        for marker in _VOCAB_HEADING_MARKERS
+    ):
+        return True
+    if _line_has_translated_vocab_marker(spans):
+        return True
+    parts = [
+        re.sub(r"\s+", "", span.text).lower()
+        for span in spans
+        if span.text.strip()
+    ]
+    for start in range(len(parts)):
+        joined = ""
+        for part in parts[start:start + 3]:
+            joined += part
+            if joined in _VOCAB_HEADING_MARKERS:
+                return True
+    return False
+
+
+def _has_vocab_heading(spans: list[TextSpan]) -> bool:
+    if spans and any(not hasattr(span, "bbox") for span in spans):
+        return _line_has_vocab_heading(spans)
+    return any(_line_has_vocab_heading(line) for line in _line_groups(spans))
+
+
+def _main_vocab_table(
+    spans: list[TextSpan], continuation: bool
+) -> tuple[tuple[float, float, float, float] | None, bool]:
+    """Follow a labelled multilingual word list until the next section banner."""
+    if not spans:
+        return None, False
+    lines = [sorted(line, key=lambda span: span.bbox[0]) for line in _line_groups(spans)]
+    labels = [_ascii_fold(_compact_line(line)) for line in lines]
+    title = next((i for i, label in enumerate(labels)
+                  if "newwordsandexpressions" in label), None)
+    first_data_line = 0
+    if title is not None:
+        header = next((i for i in range(title + 1, min(title + 5, len(labels)))
+                       if "stt" in labels[i] and ("pinyin" in labels[i] or "nghia" in labels[i])), None)
+        if header is None:
+            return None, False
+        first_data_line = header + 1
+    elif not continuation:
+        return None, False
+
+    width = max(span.bbox[2] for span in spans)
+    height = max(span.bbox[3] for span in spans)
+    section_markers = ("propernouns", "专有名词", "languagepoints", "语法点",
+                       "exercisesinclass", "chuthich", "注释", "diemng", "danhturieng",
+                       "extendedreading", "docmorong", "扩展阅读")
+    body = []
+    data = []
+    continues = True
+    for i in range(title or 0, len(lines)):
+        line, label = lines[i], labels[i]
+        if label in {"note", "notes", "exercises"} or any(marker in label for marker in section_markers):
+            continues = False
+            break
+        y = min(span.bbox[1] for span in line)
+        if y > height * 0.9 and ("课本" in label or "初级" in label or "第三版" in label):
+            break
+        if title is None and not body:
+            if y < height * 0.13 and ("博雅" in label or "boya" in label or
+                                       not any(s.bbox[0] > width * 0.5 for s in line)):
+                continue
+        body.extend(line)
+        if i >= first_data_line:
+            data.extend(line)
+
+    # A continuation has both headwords on the left and glosses on the right.
+    if not any(s.bbox[0] < width * 0.35 and RE_CJK_WORD.search(s.text) for s in data):
+        return None, False
+    if not any(s.bbox[0] > width * 0.55 and re.search("[a-zA-Z]", s.text) for s in data):
+        return None, False
+    # Printed columns occasionally extend beyond the last recognised word.
+    # Include their margins, keeping the vertical cut inside this section.
+    margin = width * 0.075
+    box = (max(0, min(s.bbox[0] for s in body) - margin),
+           max(0, min(s.bbox[1] for s in body) - 12),
+           max(s.bbox[2] for s in body) + margin, max(s.bbox[3] for s in body) + 12)
+    return box, continues
+
+
+_NON_VOCAB_CONTEXT_CJK = (
+    "句型", "语法", "语调", "祈使句", "本义", "繁体", "简体",
+    "汉字的", "笔画", "部首", "结构", "图片", "描述", "对话",
+    "表示", "例如",
+)
+_NON_VOCAB_CONTEXT_ASCII_PATTERNS = (
+    ("cau", "truc"),
+    ("dich", "nghia"),
+    ("dich", "nghla"),
+    ("dong", "vai"),
+)
+
+
+def _looks_like_non_vocab_study_region(spans: list[TextSpan]) -> bool:
+    """Reject grammar/dialogue/hanzi-study regions that only imitate tables."""
+    lines = _line_groups(spans)
+    if _has_vocab_heading(spans):
+        return False
+    line_texts = [
+        "".join(
+            re.sub(r"\s+", "", span.text.strip())
+            for span in sorted(line, key=lambda item: item.bbox[0])
+            if span.text.strip()
+        )
+        for line in lines
+    ]
+    joined = "".join(line_texts)
+    ascii_lines = [
+        _ascii_fold(" ".join(span.text for span in line if span.text.strip()))
+        for line in lines
+    ]
+    ascii_joined = " ".join(ascii_lines)
+    speaker_lines = sum(
+        1 for line in line_texts
+        if line.startswith(("A:", "B:", "A：", "B："))
+        or "A:" in line or "B:" in line or "A：" in line or "B：" in line
+    )
+    has_context_term = any(term in joined for term in _NON_VOCAB_CONTEXT_CJK)
+    if (
+        ("本课" in joined and "词语" in joined)
+        or ("图" in joined and "描述" in joined and "词语" in joined)
+        or ("表示" in joined and "例如" in joined)
+    ):
+        has_context_term = True
+    has_ascii_context = any(
+        all(part in ascii_joined for part in pattern)
+        for pattern in _NON_VOCAB_CONTEXT_ASCII_PATTERNS
+    )
+
+    question_marks = joined.count("?") + joined.count("？")
+    if question_marks >= 3:
+        return True
+    if has_context_term or has_ascii_context:
+        return True
+    if speaker_lines >= 2:
+        return True
+    numbered_example_lines = sum(
+        1 for line in lines
+        if any(re.fullmatch(r"\d{1,3}", span.text.strip()) for span in line)
+        and any(RE_CJK_WORD.search(span.text) for span in line)
+        and any(marker in "".join(span.text for span in line) for marker in ("（", "）", "?", "？", "。"))
+    )
+    return numbered_example_lines >= 2
+
+def _looks_like_non_vocab_reference_region(spans: list[TextSpan]) -> bool:
+    lines = _line_groups(spans)
+    texts = [
+        re.sub(r"\s+", "", span.text.strip())
+        for line in lines
+        for span in sorted(line, key=lambda item: item.bbox[0])
+        if span.text.strip()
+    ]
+    line_texts = [
+        "".join(
+            re.sub(r"\s+", "", span.text.strip())
+            for span in sorted(line, key=lambda item: item.bbox[0])
+            if span.text.strip()
+        )
+        for line in lines
+    ]
+    joined = "".join(texts)
+    term_hits = sum(
+        1 for term in _NON_VOCAB_REFERENCE_TERMS
+        if term in joined
+        or any(term == text for text in texts)
+        or any(term in line_text for line_text in line_texts)
+    )
+    if "来自本册" in joined or any("来自本册" in line for line in line_texts):
+        return True
+    if (
+        ("词性" in joined and "简称" in joined)
+        or any("词性" in line and "简称" in line for line in line_texts)
+        or any("词性对照表" in line for line in line_texts)
+    ):
+        return True
+    if term_hits < 2:
+        return False
+    pinyin_rows = sum(
+        1 for line in lines
+        if any(RE_CJK_WORD.search(span.text) for span in line)
+        and any(_is_pinyin_text(span.text) for span in line)
+    )
+    vocab_like_rows = [
+        line for line in lines
+        if any(RE_CJK_WORD.search(span.text) for span in line)
+        and not all(
+            re.sub(r"\s+", "", span.text.strip()) in _NON_VOCAB_REFERENCE_TERMS
+            or re.fullmatch(r"\d{1,3}", span.text.strip())
+            for span in line
+            if span.text.strip()
+        )
+    ]
+    return pinyin_rows < 2 and len(vocab_like_rows) <= term_hits + 1
+
+
+def _segment_plain_pinyin(value: str) -> tuple[str, ...] | None:
+    paths: dict[int, tuple[str, ...]] = {0: ()}
+    for start in range(len(value)):
+        if start not in paths:
+            continue
+        for end in range(start + 1, min(len(value), start + 6) + 1):
+            syllable = value[start:end]
+            if syllable in _PINYIN_SYLLABLES and end not in paths:
+                paths[end] = paths[start] + (syllable,)
+    if len(value) in paths:
+        return paths[len(value)]
+    if value.endswith("r") and len(value) - 1 in paths:
+        return paths[len(value) - 1]
+    return None
+
+
+def _can_segment_numbered_pinyin(value: str) -> bool:
+    reachable = {0}
+    for start in range(len(value)):
+        if start not in reachable or value[start].isdigit():
+            continue
+        for end in range(start + 1, min(len(value), start + 6) + 1):
+            if value[end - 1].isdigit():
+                break
+            syllable = _plain_pinyin(value[start:end])
+            if syllable not in _PINYIN_SYLLABLES:
+                continue
+            next_index = end
+            if next_index < len(value) and value[next_index] in "012345":
+                next_index += 1
+            reachable.add(next_index)
+    return len(value) in reachable
+
+
+def _is_distinctive_plain_syllable(syllable: str) -> bool:
+    distinctive_initials = {"zh", "ch", "sh", "q", "x", "z", "c"}
+    distinctive_finals = {
+        "ai", "ao", "ang", "eng", "ong", "ian", "iang", "iao",
+        "iong", "iu", "ua", "uai", "uan", "uang", "ui", "uo",
+        "v", "ve", "van", "vn",
+    }
+    initial = max(
+        (
+            candidate
+            for candidate in _PINYIN_INITIALS
+            if syllable.startswith(candidate)
+            and syllable[len(candidate):] in _PINYIN_FINALS
+        ),
+        key=len,
+        default="",
+    )
+    final = syllable[len(initial):]
+    return initial in distinctive_initials or final in distinctive_finals
+
+
+def _pinyin_evidence_strength(text: str) -> int:
+    value = text.strip()
+    if not value or not re.fullmatch(
+        r"[A-Za-züÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ0-5:'’ -]+",
+        value,
+    ):
+        return 0
+    raw_tokens = [
+        token for token in re.split(r"[\s'’-]+", value) if token
+    ]
+    segmentations: list[tuple[str, ...]] = []
+    has_number = any(character.isdigit() for character in value)
+    for token in raw_tokens:
+        if any(character.isdigit() for character in token):
+            if not _can_segment_numbered_pinyin(token):
+                return 0
+            continue
+        segmentation = _segment_plain_pinyin(_plain_pinyin(token))
+        if segmentation is None:
+            return 0
+        segmentations.append(segmentation)
+
+    has_tone_mark = any(character in PINYIN_VOWELS for character in value)
+    has_u_colon = "u:" in value.lower()
+    boundary_is_syllabic = (
+        len(raw_tokens) >= 2
+        and all(len(segmentation) == 1 for segmentation in segmentations)
+    )
+    if has_number or has_tone_mark or has_u_colon or boundary_is_syllabic:
+        return 2
+    distinctive_plain = any(
+        _is_distinctive_plain_syllable(syllable)
+        for segmentation in segmentations
+        for syllable in segmentation
+    )
+    return 1 if distinctive_plain else 0
+
+
+def _is_pinyin_text(text: str) -> bool:
+    return _pinyin_evidence_strength(text) > 0
+
+def _numeric_column_clusters(
+    spans: list[TextSpan],
+) -> list[list[tuple[int, float, list[TextSpan]]]]:
+    candidates: list[tuple[int, float, list[TextSpan]]] = []
+    for line in _line_groups(spans):
+        for span in line:
+            if re.fullmatch(r"\d{1,3}", span.text.strip()) and int(span.text.strip()) >= 1:
+                candidates.append(
+                    (
+                        int(span.text.strip()),
+                        (span.bbox[0] + span.bbox[2]) / 2,
+                        line,
+                    )
+                )
+    clusters: list[list[tuple[int, float, list[TextSpan]]]] = []
+    for candidate in sorted(candidates, key=lambda item: item[1]):
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        center = sum(item[1] for item in clusters[-1]) / len(clusters[-1])
+        if abs(candidate[1] - center) <= 35:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    return [
+        cluster
+        for cluster in clusters
+        if len({round((item[2][0].bbox[1] + item[2][0].bbox[3]) / 2) for item in cluster}) >= 2
+    ]
+
+
+def _repeated_cjk_column_lines(
+    lines: list[list[TextSpan]],
+) -> list[list[TextSpan]]:
+    candidates: list[tuple[float, list[TextSpan]]] = []
+    for line in lines:
+        cjk = [span for span in line if RE_CJK_WORD.search(span.text)]
+        if not cjk:
+            continue
+        if _line_has_vocab_heading(line):
+            cjk_text = "".join(
+                character
+                for span in cjk
+                for character in span.text
+                if RE_CJK_ONLY.match(character)
+            )
+            if cjk_text in _VOCAB_HEADING_MARKERS:
+                continue
+        first = min(cjk, key=lambda span: span.bbox[0])
+        candidates.append(((first.bbox[0] + first.bbox[2]) / 2, line))
+
+    clusters: list[list[tuple[float, list[TextSpan]]]] = []
+    for candidate in sorted(candidates, key=lambda item: item[0]):
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        center = statistics.median(item[0] for item in clusters[-1])
+        if abs(candidate[0] - center) <= 35:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    repeated = [
+        cluster for cluster in clusters
+        if len({id(line) for _center, line in cluster}) >= 2
+    ]
+    heading_spans = [
+        span
+        for line in lines
+        if _line_has_vocab_heading(line)
+        for span in line
+    ]
+    heading_center = (
+        statistics.median(
+            (span.bbox[0] + span.bbox[2]) / 2 for span in heading_spans
+        )
+        if heading_spans
+        else None
+    )
+
+    def cluster_key(cluster: list[tuple[float, list[TextSpan]]]):
+        center = statistics.median(item[0] for item in cluster)
+        if heading_center is not None:
+            return (-abs(center - heading_center), len(cluster), -center)
+        return (len(cluster), 0, -center)
+
+    best = max(repeated, key=cluster_key, default=[])
+    result: list[list[TextSpan]] = []
+    for _center, line in sorted(
+        best, key=lambda item: min(span.bbox[1] for span in item[1])
+    ):
+        if line not in result:
+            result.append(line)
+    return result
+
+
+def _region_evidence(
+    spans: list[TextSpan],
+) -> tuple[
+    list[list[TextSpan]],
+    list[list[TextSpan]],
+    list[int],
+    bool,
+    bool,
+    int,
+]:
+    lines = _line_groups(spans)
+    has_heading = _has_vocab_heading(spans)
+    columnar_lines = _repeated_cjk_column_lines(lines) if has_heading else []
+    row_lines: list[list[TextSpan]] = []
+    cjk_centers: list[float] = []
+    pinyin_centers: list[float] = []
+    third_centers: list[float] = []
+    strong_pinyin_rows = 0
+    for line in lines:
+        numeric = [
+            span for span in line
+            if re.fullmatch(r"\d{1,3}", span.text.strip())
+        ]
+        cjk = [span for span in line if RE_CJK_WORD.search(span.text)]
+        pinyin_evidence = [
+            (span, _pinyin_evidence_strength(span.text))
+            for span in line
+            if _pinyin_evidence_strength(span.text) > 0
+        ]
+        pinyin = [span for span, _strength in pinyin_evidence]
+        if cjk and pinyin:
+            row_lines.append(line)
+            if any(strength >= 2 for _span, strength in pinyin_evidence):
+                strong_pinyin_rows += 1
+            cjk_centers.append((cjk[0].bbox[0] + cjk[0].bbox[2]) / 2)
+            pinyin_centers.append((pinyin[0].bbox[0] + pinyin[0].bbox[2]) / 2)
+            other = [
+                span for span in line
+                if span not in numeric and span not in cjk and span not in pinyin
+            ]
+            if other:
+                third_centers.append((other[0].bbox[0] + other[0].bbox[2]) / 2)
+
+    if columnar_lines:
+        row_lines = list(columnar_lines)
+        strong_pinyin_rows = sum(
+            any(
+                _pinyin_evidence_strength(span.text) >= 2
+                for span in line
+            )
+            for line in row_lines
+        )
+    row_lines.sort(key=lambda line: min(span.bbox[1] for span in line))
+
+    clusters = _numeric_column_clusters(spans)
+    aligned_orders = max(
+        clusters,
+        key=lambda cluster: (len(cluster), -min(item[1] for item in cluster)),
+        default=[],
+    )
+    unique_orders = sorted({candidate[0] for candidate in aligned_orders})
+    order_lines: list[list[TextSpan]] = []
+    for _value, _center, line in aligned_orders:
+        if line not in order_lines:
+            order_lines.append(line)
+    if not aligned_orders and has_heading:
+        parallel: list[tuple[list[int], list[TextSpan]]] = []
+        for line in lines:
+            values = sorted({
+                int(span.text.strip())
+                for span in line
+                if re.fullmatch(r"\d{1,3}", span.text.strip())
+                and int(span.text.strip()) >= 1
+            })
+            if len(values) >= 2 and any(
+                right == left + 1
+                for left, right in zip(values, values[1:])
+            ):
+                parallel.append((values, line))
+        if parallel:
+            unique_orders, parallel_line = max(
+                parallel,
+                key=lambda item: (
+                    len(item[0]),
+                    -min(span.bbox[1] for span in item[1]),
+                ),
+            )
+            order_lines = [parallel_line]
+    sequential = len(unique_orders) >= 2 and all(
+        right == left + 1
+        for left, right in zip(unique_orders, unique_orders[1:])
+    )
+    aligned = len(columnar_lines) >= 2 or (
+        len(row_lines) >= 2
+        and len(third_centers) >= 2
+        and max(cjk_centers) - min(cjk_centers) <= 35
+        and max(pinyin_centers) - min(pinyin_centers) <= 35
+        and max(third_centers) - min(third_centers) <= 35
+    )
+    return (
+        row_lines,
+        order_lines,
+        unique_orders,
+        sequential,
+        aligned,
+        strong_pinyin_rows,
+    )
+
+def _signal_line(line: list[TextSpan]) -> bool:
+    if _line_has_vocab_heading(line):
+        return True
+    if any(re.fullmatch(r"\d{1,3}", span.text.strip()) for span in line):
+        return True
+    return (
+        any(RE_CJK_WORD.search(span.text) for span in line)
+        and any(_is_pinyin_text(span.text) for span in line)
+    )
+
+
+
+_NEXT_STUDY_SECTION_CJK = (
+    "课文", "朗读对话", "角色朗读", "练习", "语法", "语言点", "讲堂",
+)
+_NEXT_STUDY_SECTION_ASCII = (
+    "roleplay", "readthedialogue", "languagepoints", "exercise",
+)
+
+
+def _line_looks_like_next_study_section(line: list[TextSpan]) -> bool:
+    compact = _compact_line(line)
+    ascii_compact = re.sub(
+        r"[^a-z0-9]+", "", _ascii_fold(" ".join(span.text for span in line))
+    )
+    return any(term in compact for term in _NEXT_STUDY_SECTION_CJK) or any(
+        term in ascii_compact for term in _NEXT_STUDY_SECTION_ASCII
+    )
+
+
+def _expand_heading_band(
+    all_lines: list[list[TextSpan]], band_lines: list[list[TextSpan]]
+) -> list[list[TextSpan]]:
+    if not any(_line_has_vocab_heading(line) for line in band_lines):
+        return band_lines
+    selected = {id(line): line for line in band_lines}
+    top = min(span.bbox[1] for line in band_lines for span in line)
+    bottom = max(span.bbox[3] for line in band_lines for span in line)
+    heading_bottom = max(
+        span.bbox[3]
+        for line in band_lines
+        if _line_has_vocab_heading(line)
+        for span in line
+    )
+    found_data = any(
+        min(span.bbox[1] for span in line) > heading_bottom
+        and any(RE_CJK_WORD.search(span.text) for span in line)
+        and not _line_has_vocab_heading(line)
+        for line in band_lines
+    )
+    last_bottom = bottom
+    for line in all_lines:
+        line_top = min(span.bbox[1] for span in line)
+        line_bottom = max(span.bbox[3] for span in line)
+        if line_bottom < top or line_top <= heading_bottom:
+            continue
+        if line_top <= bottom:
+            selected[id(line)] = line
+            if any(RE_CJK_WORD.search(span.text) for span in line):
+                found_data = True
+            last_bottom = max(last_bottom, line_bottom)
+            continue
+        gap = line_top - last_bottom
+        if found_data and (
+            gap > 180.0
+            or _line_has_vocab_heading(line)
+            or _line_looks_like_next_study_section(line)
+        ):
+            break
+        if not found_data and gap > 360.0:
+            break
+        selected[id(line)] = line
+        if any(RE_CJK_WORD.search(span.text) for span in line):
+            found_data = True
+        last_bottom = line_bottom
+    return sorted(selected.values(), key=lambda line: min(span.bbox[1] for span in line))
+
+def _split_page_regions(spans: list[TextSpan]) -> list[list[TextSpan]]:
+    lines = _line_groups(spans)
+    columnar_ids = {id(line) for line in _repeated_cjk_column_lines(lines)}
+    signal_lines = [
+        line for line in lines
+        if _signal_line(line) or id(line) in columnar_ids
+    ]
+    if not signal_lines:
+        return []
+    heights = [
+        max(span.bbox[3] for span in line) - min(span.bbox[1] for span in line)
+        for line in signal_lines
+    ]
+    gap_limit = max(72.0, statistics.median(heights) * 5)
+    heading_gap_limit = max(280.0, statistics.median(heights) * 12)
+    vertical_bands: list[list[list[TextSpan]]] = []
+    for line in signal_lines:
+        if not vertical_bands:
+            vertical_bands.append([line])
+            continue
+        previous_bottom = max(
+            span.bbox[3] for previous in vertical_bands[-1] for span in previous
+        )
+        current_top = min(span.bbox[1] for span in line)
+        if current_top - previous_bottom > gap_limit:
+            previous_region = [
+                span for previous in vertical_bands[-1] for span in previous
+            ]
+            previous_rows = _region_evidence(previous_region)[0]
+            heading_lines = [
+                previous
+                for previous in _line_groups(previous_region)
+                if _line_has_vocab_heading(previous)
+            ]
+            heading_bottom = max(
+                (span.bbox[3] for previous in heading_lines for span in previous),
+                default=float("-inf"),
+            )
+            has_row_below_heading = any(
+                min(span.bbox[1] for span in row) > heading_bottom
+                for row in previous_rows
+            )
+            detached_heading = (
+                bool(heading_lines)
+                and not has_row_below_heading
+                and current_top - previous_bottom <= heading_gap_limit
+            )
+            if detached_heading:
+                vertical_bands[-1].append(line)
+            else:
+                vertical_bands.append([line])
+        else:
+            vertical_bands[-1].append(line)
+
+    regions: list[list[TextSpan]] = []
+    for band_lines in vertical_bands:
+        band_lines = _expand_heading_band(lines, band_lines)
+        band = [span for line in band_lines for span in line]
+        numeric_clusters = _numeric_column_clusters(band)
+        if len(numeric_clusters) >= 2:
+            seeds = sorted(
+                sum(item[1] for item in cluster) / len(cluster)
+                for cluster in numeric_clusters
+            )
+        else:
+            heading_centers = sorted(
+                (span.bbox[0] + span.bbox[2]) / 2
+                for span in band
+                if _line_has_vocab_heading([span])
+            )
+            seeds = heading_centers if len(heading_centers) >= 2 else []
+        if len(seeds) < 2:
+            regions.append(band)
+            continue
+        cuts = [
+            (left + right) / 2 for left, right in zip(seeds, seeds[1:])
+        ]
+        for index in range(len(seeds)):
+            left = cuts[index - 1] if index else float("-inf")
+            right = cuts[index] if index < len(cuts) else float("inf")
+            region = [
+                span for span in band
+                if left <= (span.bbox[0] + span.bbox[2]) / 2 < right
+            ]
+            if region:
+                regions.append(region)
+    return regions
+
+def render_block_crop(pdf: PdfSource, block: VocabBlock, dpi: int = 250) -> bytes:
+    """Render exactly the persisted page and rectangle of one vocabulary block."""
+    return pdf.get_page_crop_image_bytes(
+        block.page_index, block.bbox, dpi=dpi
+    )
+
+
+def render_block_recovery_page(pdf: PdfSource, block: VocabBlock, dpi: int = 200) -> bytes:
+    """Render the full source page when the persisted block crop keeps failing."""
+    return pdf.get_page_image_bytes(block.page_index, dpi=dpi)
+
+
+
+def _local_rows_look_like_ocr_noise(
+    local_rows: list[VocabRow], ai_rows: list[VocabRow], final_rows: list[VocabRow]
+) -> bool:
+    if ai_rows or not final_rows:
+        return False
+    if any(row.extract_by != "regex" for row in final_rows):
+        return False
+    if len(local_rows) != len(final_rows):
+        return False
+    suspicious = 0
+    for row in final_rows:
+        word = row.word.strip()
+        weak_payload = not row.pinyin_src and not row.meaning_src
+        tiny_reviewed = len(word) <= 1 and row.needs_review
+        heading_fragment = word in {"生", "词", "新", "课"}
+        if weak_payload or tiny_reviewed or heading_fragment:
+            suspicious += 1
+    return suspicious >= ceil(len(final_rows) * 0.6)
+
 class VocabExtractor:
     """Bóc tách từ vựng từ bài học theo kiến trúc 2 Lớp sạch sẽ, minh bạch."""
 
     def __init__(self, dict_db=None) -> None:
         self.dict_db = dict_db
+        self.lesson_ai_attempts = 0
 
+    def locate_blocks(
+        self, pdf: PdfSource, lesson: LessonBoundary
+    ) -> list[VocabBlock]:
+        """Locate every independent vocabulary table region inside a lesson."""
+        candidates: list[tuple[
+            int,
+            float,
+            float,
+            tuple[float, float, float, float],
+            int | None,
+            int | None,
+            int | None,
+        ]] = []
+        page_count = pdf.page_count()
+        start = max(0, lesson.page_start)
+        end = min(lesson.page_end, page_count - 1)
+        main_tables = []
+        continuation = False
+        for page_index in range(start, end + 1):
+            spans = list(pdf.spans(page_index))
+            bbox, continuation = _main_vocab_table(spans, continuation)
+            if bbox is not None:
+                main_tables.append(VocabBlock(
+                    None, None, len(main_tables) + 1, page_index, bbox,
+                    None, None, None, None,
+                ))
+            if main_tables:
+                continue
+            for region in _split_page_regions(spans):
+                (
+                    row_lines,
+                    order_lines,
+                    orders,
+                    sequential_orders,
+                    aligned_columns,
+                    strong_pinyin_rows,
+                ) = _region_evidence(region)
+                region_lines = _line_groups(region)
+                has_data_text = any(
+                    any(RE_CJK_WORD.search(span.text) for span in line)
+                    and not _line_has_vocab_heading(line)
+                    for line in region_lines
+                )
+                if not has_data_text:
+                    continue
+                if _looks_like_non_vocab_reference_region(region):
+                    continue
+                if _looks_like_non_vocab_study_region(region):
+                    continue
+                has_heading = _has_vocab_heading(region)
+                has_translated_heading = any(
+                    _line_has_translated_vocab_marker(line)
+                    for line in region_lines
+                )
+                heading_data_fallback = (
+                    has_heading
+                    and has_data_text
+                    and len(region_lines) >= 2
+                )
+                has_rows = (
+                    len(row_lines) >= 2 and (
+                        strong_pinyin_rows >= 1
+                        or has_heading
+                        or sequential_orders
+                    )
+                ) or (has_translated_heading and len(row_lines) >= 1) or heading_data_fallback
+                signals = (
+                    has_heading,
+                    has_rows,
+                    sequential_orders or aligned_columns,
+                )
+                if sum(signals) < 2:
+                    continue
+
+                region_lines = _line_groups(region)
+                heading_lines = [
+                    line for line in region_lines
+                    if _line_has_vocab_heading(line)
+                ]
+                relevant_lines = list(row_lines)
+                relevant_lines.extend(order_lines)
+                relevant_lines.extend(heading_lines)
+                if heading_data_fallback and len(row_lines) < 2 and heading_lines:
+                    heading_bottom = max(
+                        span.bbox[3]
+                        for line in heading_lines
+                        for span in line
+                    )
+                    relevant_lines = [
+                        line for line in region_lines
+                        if _line_has_vocab_heading(line)
+                        or min(span.bbox[1] for span in line) > heading_bottom
+                    ]
+                if sequential_orders and heading_lines:
+                    heading_bottom = max(
+                        span.bbox[3]
+                        for line in heading_lines
+                        for span in line
+                    )
+                    has_data_below = any(
+                        min(span.bbox[1] for span in line) > heading_bottom
+                        for line in row_lines
+                    )
+                    if not has_data_below:
+                        continuation = next((
+                            line
+                            for line in region_lines
+                            if min(span.bbox[1] for span in line) > heading_bottom
+                            and any(
+                                RE_CJK_WORD.search(span.text) for span in line
+                            )
+                            and any(
+                                _is_pinyin_text(span.text) for span in line
+                            )
+                        ), None)
+                        if continuation is not None:
+                            relevant_lines.append(continuation)
+                relevant = [span for line in relevant_lines for span in line]
+                bbox = (
+                    max(0.0, min(span.bbox[0] for span in relevant) - 8.0),
+                    max(0.0, min(span.bbox[1] for span in relevant) - 8.0),
+                    max(span.bbox[2] for span in relevant) + 8.0,
+                    max(span.bbox[3] for span in relevant) + 8.0,
+                )
+                expected_rows = (
+                    len(orders)
+                    if sequential_orders and orders
+                    else len(row_lines)
+                    if aligned_columns or (has_translated_heading and row_lines)
+                    else None
+                )
+                candidates.append(
+                    (
+                        page_index,
+                        bbox[1],
+                        bbox[0],
+                        bbox,
+                        expected_rows or None,
+                        orders[0] if sequential_orders else None,
+                        orders[-1] if sequential_orders else None,
+                    )
+                )
+
+        if main_tables:
+            return main_tables
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [
+            VocabBlock(
+                id=None,
+                lesson_id=None,
+                block_no=block_no,
+                page_index=page_index,
+                bbox=bbox,
+                crop_path=None,
+                expected_rows=expected_rows,
+                first_order=first_order,
+                last_order=last_order,
+                region_decision="review" if expected_rows is None and first_order is None else "auto",
+            )
+            for block_no, (
+                page_index,
+                _y_start,
+                _x_start,
+                bbox,
+                expected_rows,
+                first_order,
+                last_order,
+            ) in enumerate(candidates, start=1)
+        ]
     def extract_by_llm(
         self, text_content: str, ai_client: AiClient, source_page: int
     ) -> list[VocabRow]:
@@ -100,47 +1052,42 @@ class VocabExtractor:
         return rows
 
     def extract_by_llm_image(
-        self, image_bytes: bytes, ai_client: AiClient, source_page: int
+        self,
+        image_bytes: bytes,
+        ai_client: AiClient,
+        source_page: int,
+        issue_context: str | None = None,
     ) -> list[VocabRow]:
-        """Sử dụng Vision AI đọc ảnh trang sách bóc tách từ vựng (kèm thử lại khi bận)."""
-        raw_list = []
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            try:
+        """Issue one Vision request; retry budgeting belongs to the orchestrator."""
+        try:
+            if issue_context is None:
                 raw_list = ai_client.extract_vocab_from_image(image_bytes)
-                if raw_list:
-                    break
-            except Exception as err:
-                last_error = err
-                if not isinstance(err, AiRateLimitError):
-                    break
-            if attempt < 3:
-                retry_after = getattr(last_error, "retry_after", None)
-                time.sleep(retry_after or 5 * attempt)
-
+            else:
+                raw_list = ai_client.extract_vocab_from_image(
+                    image_bytes, issue_context=issue_context
+                )
+        except (AiRateLimitError, AiClientError):
+            raise
+        except Exception:
+            return []
         if not raw_list:
-            if isinstance(last_error, AiRateLimitError):
-                raise last_error
-            if last_error is not None:
-                return []
             raise RuntimeError("Vision không trả về dữ liệu từ mới")
 
         rows: list[VocabRow] = []
         seen_words: set[str] = set()
         for item in raw_list:
-            w = _optional_text(item.get("word")) or ""
-            if not w or w in seen_words:
+            word = _optional_text(item.get("word")) or ""
+            if not word or word in seen_words:
                 continue
-            seen_words.add(w)
-
+            seen_words.add(word)
             rows.append(
                 VocabRow(
-                    order_no=len(rows) + 1,
-                    word=w,
+                    order_no=int(item.get("order_no") or len(rows) + 1),
+                    word=word,
                     pinyin_src=_optional_text(item.get("pinyin")),
                     pos=_optional_text(item.get("pos")),
                     meaning_src=_optional_text(
-                        item.get("meaning_vi", item.get("meaning"))
+                        item.get("meaning_vi", item.get("meaning_en", item.get("meaning")))
                     ),
                     source_page=source_page,
                     extract_by="vision",
@@ -149,6 +1096,8 @@ class VocabExtractor:
                     hanviet_src=_optional_text(item.get("hanviet")),
                 )
             )
+        if not rows:
+            raise RuntimeError("Vision không trả về dữ liệu từ mới")
         return rows
 
     def extract_spans(self, spans: list[TextSpan], source_page: int) -> list[VocabRow]:
@@ -222,16 +1171,8 @@ class VocabExtractor:
 
     @staticmethod
     def is_vocab_page(spans: list[TextSpan]) -> bool:
-        """Nhận diện trang bắt đầu bảng từ mới, không quét mù toàn bài."""
-        compact = re.sub(r"\s+", "", " ".join(s.text for s in spans)).lower()
-        head = re.sub(r"\s+", "", " ".join(s.text for s in spans[:80])).lower()
-        return (
-            "newwords" in compact
-            or "\u8bcd\u8bed\u8868" in compact
-            or "\u751f\u8bcd" in head
-            or "từmới" in compact
-        )
-
+        """Nhận diện tiêu đề bảng từ mới bằng các mẫu ngôn ngữ tổng quát."""
+        return _has_vocab_heading(spans)
     @staticmethod
     def _join_cell(spans: list[TextSpan]) -> str | None:
         text = " ".join(s.text.strip() for s in sorted(spans, key=lambda x: x.bbox[0]))
@@ -283,24 +1224,277 @@ class VocabExtractor:
             return []
 
         width = max((s.bbox[2] for s in spans), default=0.0)
-        header = next((s for s in spans if s.text.strip().upper() == "STT"), None)
-        header_y = header.bbox[1] if header else 80.0
-        stop_candidates = [
-            s.bbox[1]
-            for s in spans
-            if s.bbox[1] > header_y + 80
-            and s.bbox[0] > width * 0.72
-            and s.text.strip().lower() in {"proper", "language", "note", "exercise", "exercises"}
+        aliases = {
+            "order": {"stt", "no.", "序号", "编号"},
+            "word": {"chữhán", "hanzi", "汉字", "chữtrung"},
+            "pinyin": {"pinyin", "拼音"},
+            "pos": {"từloại", "词性", "pos"},
+            "hanviet": {"hán-việt", "hánviệt", "han-viet"},
+            "meaning_en": {"english", "nghĩaanh", "英语"},
+            "meaning_vi": {"nghĩaviệt", "nghĩa", "vietnamese", "越南语"},
+        }
+
+        def header_role(span: TextSpan) -> str | None:
+            label = re.sub(r"\s+", "", span.text.strip().lower())
+            return next(
+                (
+                    role
+                    for role, labels in aliases.items()
+                    if label in labels
+                ),
+                None,
+            )
+
+        lines = _line_groups(spans)
+        header_line = max(
+            lines,
+            key=lambda line: sum(header_role(span) is not None for span in line),
+            default=[],
+        )
+        if not any(header_role(span) is not None for span in header_line):
+            header_line = []
+        header_roles = {
+            role: (span.bbox[0] + span.bbox[2]) / 2
+            for span in header_line
+            if (role := header_role(span)) is not None
+        }
+        table_end = float("inf")
+        if header_line:
+            header_y = min(span.bbox[1] for span in header_line)
+            stop_candidates = [
+                span.bbox[1]
+                for span in spans
+                if span.bbox[1] > header_y + 80
+                and span.bbox[0] > width * 0.72
+                and span.text.strip().lower()
+                in {"proper", "language", "note", "exercise", "exercises"}
+            ]
+            if stop_candidates:
+                table_end = min(stop_candidates) - 10
+        body_lines = [
+            line
+            for line in lines
+            if line is not header_line
+            and min(span.bbox[1] for span in line) < table_end
+            and any(RE_CJK_WORD.search(span.text) for span in line)
         ]
-        table_end = min(stop_candidates) if stop_candidates else float("inf")
-        body = [
-            s
-            for s in spans
-            if header_y + 20 < s.bbox[1] < table_end - 10
-        ]
+        body = [span for line in body_lines for span in line]
         if width <= 0 or not body:
             return []
 
+        if "word" in header_roles and len(header_roles) >= 2:
+            columns = sorted(header_roles.items(), key=lambda item: item[1])
+            cuts = [
+                (left[1] + right[1]) / 2
+                for left, right in zip(columns, columns[1:])
+            ]
+            roles = [role for role, _center in columns]
+            rows: list[VocabRow] = []
+            for line in body_lines:
+                cells = {role: [] for role in roles}
+                for span in line:
+                    center = (span.bbox[0] + span.bbox[2]) / 2
+                    cells[roles[sum(center >= cut for cut in cuts)]].append(
+                        span
+                    )
+                word = "".join(
+                    ch
+                    for span in sorted(
+                        cells.get("word", []), key=lambda item: item.bbox[0]
+                    )
+                    for ch in span.text
+                    if RE_CJK_ONLY.match(ch)
+                )
+                if not word:
+                    continue
+                raw_order = self._join_cell(cells.get("order", [])) or ""
+                match = re.search(r"\d+", raw_order)
+                pinyin = self._join_cell(cells.get("pinyin", []))
+                rows.append(VocabRow(
+                    int(match.group()) if match else len(rows) + 1,
+                    word,
+                    pinyin,
+                    self._join_cell(cells.get("pos", [])),
+                    self._join_cell(cells.get("meaning_vi", []))
+                    or self._join_cell(cells.get("meaning_en", [])),
+                    source_page,
+                    "regex",
+                    pinyin is None,
+                    "không đọc được pinyin" if pinyin is None else None,
+                    self._join_cell(cells.get("hanviet", [])),
+                ))
+            return rows
+
+        tolerance = max(12.0, width * 0.02)
+        clusters: list[list[TextSpan]] = []
+        for span in sorted(body, key=lambda item: item.bbox[0]):
+            if not clusters:
+                clusters.append([span])
+                continue
+            center = statistics.median(
+                item.bbox[0] for item in clusters[-1]
+            )
+            if abs(span.bbox[0] - center) <= tolerance:
+                clusters[-1].append(span)
+            else:
+                clusters.append([span])
+        repeated = [
+            cluster
+            for cluster in clusters
+            if len({
+                round((span.bbox[1] + span.bbox[3]) / 2)
+                for span in cluster
+            }) >= 2
+        ]
+        if 2 <= len(repeated) <= 7:
+            centers = [
+                statistics.median(span.bbox[0] for span in cluster)
+                for cluster in repeated
+            ]
+            cjk_counts = [
+                sum(
+                    bool(RE_CJK_ONLY.fullmatch(span.text.strip()))
+                    for span in cluster
+                )
+                for cluster in repeated
+            ]
+            word_column = max(
+                range(len(repeated)), key=lambda index: cjk_counts[index]
+            )
+            if cjk_counts[word_column]:
+                required_rows = ceil(len(body_lines) * 0.6)
+                digit_counts = [
+                    sum(
+                        bool(re.fullmatch(r"\d{1,3}", span.text.strip()))
+                        for span in cluster
+                    )
+                    for cluster in repeated
+                ]
+                order_candidates = [
+                    index
+                    for index, count in enumerate(digit_counts)
+                    if index != word_column and count >= required_rows
+                ]
+                order_column = min(
+                    order_candidates,
+                    key=lambda index: (-digit_counts[index], centers[index]),
+                    default=None,
+                )
+                pos_counts = [
+                    sum(bool(RE_POS.fullmatch(span.text.strip())) for span in cluster)
+                    for cluster in repeated
+                ]
+                pos_candidates = [
+                    index
+                    for index, count in enumerate(pos_counts)
+                    if index not in {word_column, order_column}
+                    and count >= required_rows
+                ]
+                pos_column = min(
+                    pos_candidates,
+                    key=lambda index: (-pos_counts[index], centers[index]),
+                    default=None,
+                )
+
+                def is_unambiguous_pinyin(value: str) -> bool:
+                    if not _pinyin_evidence_strength(value):
+                        return False
+                    lower = value.lower()
+                    if any(
+                        character in "üāǎēěīǐōǒūǔǖǘǚǜ"
+                        for character in lower
+                    ) or "u:" in lower or any(
+                        character.isdigit() for character in lower
+                    ):
+                        return True
+                    return " " not in lower and _pinyin_evidence_strength(value) == 1
+
+                pinyin_counts = [
+                    sum(is_unambiguous_pinyin(span.text) for span in cluster)
+                    for cluster in repeated
+                ]
+                pinyin_candidates = [
+                    index
+                    for index, count in enumerate(pinyin_counts)
+                    if index not in {word_column, order_column, pos_column}
+                    and count >= required_rows
+                    and count == len(repeated[index])
+                ]
+                pinyin_column = min(
+                    pinyin_candidates,
+                    key=lambda index: (-pinyin_counts[index], centers[index]),
+                    default=None,
+                )
+                remaining = [
+                    index
+                    for index in range(len(repeated))
+                    if index not in {
+                        word_column,
+                        order_column,
+                        pos_column,
+                        pinyin_column,
+                    }
+                    and centers[index] > centers[word_column]
+                ]
+                hanviet_column = remaining[0] if len(remaining) >= 2 else None
+                meaning_column = remaining[-1] if remaining else None
+                inferred_rows: list[VocabRow] = []
+                for line in body_lines:
+                    cells: list[list[TextSpan]] = [
+                        [] for _center in centers
+                    ]
+                    for span in line:
+                        column = min(
+                            range(len(centers)),
+                            key=lambda index: abs(
+                                span.bbox[0] - centers[index]
+                            ),
+                        )
+                        cells[column].append(span)
+                    word = "".join(
+                        ch
+                        for span in sorted(
+                            cells[word_column],
+                            key=lambda item: item.bbox[0],
+                        )
+                        for ch in span.text
+                        if RE_CJK_ONLY.match(ch)
+                    )
+                    if not word:
+                        continue
+                    raw_order = (
+                        self._join_cell(cells[order_column])
+                        if order_column is not None
+                        else None
+                    ) or ""
+                    match = re.search(r"\d+", raw_order)
+                    pinyin = (
+                        self._join_cell(cells[pinyin_column])
+                        if pinyin_column is not None
+                        else None
+                    )
+                    if pinyin is not None and not is_unambiguous_pinyin(pinyin):
+                        pinyin = None
+                    inferred_rows.append(VocabRow(
+                        int(match.group()) if match else len(inferred_rows) + 1,
+                        word,
+                        pinyin,
+                        self._join_cell(cells[pos_column])
+                        if pos_column is not None
+                        else None,
+                        self._join_cell(cells[meaning_column])
+                        if meaning_column is not None
+                        else None,
+                        source_page,
+                        "regex",
+                        pinyin is None,
+                        "không đọc được pinyin" if pinyin is None else None,
+                        self._join_cell(cells[hanviet_column])
+                        if hanviet_column is not None
+                        else None,
+                    ))
+                if inferred_rows:
+                    return inferred_rows
         lines: list[list[TextSpan]] = []
         for span in sorted(body, key=lambda s: ((s.bbox[1] + s.bbox[3]) / 2, s.bbox[0])):
             cy = (span.bbox[1] + span.bbox[3]) / 2
@@ -417,6 +1611,413 @@ class VocabExtractor:
             )
         return rows
 
+    @staticmethod
+    def _row_key(
+        row: VocabRow,
+    ) -> tuple[str, str | None, int | None, int | None]:
+        return (
+            row.word,
+            row.pinyin_src,
+            row.source_block_id,
+            row.order_no,
+        )
+
+    def merge_block_rows(
+        self,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+    ) -> list[VocabRow]:
+        """Merge evidence without collapsing repeated words in other blocks."""
+        merged: list[VocabRow] = []
+        seen: set[tuple[str, str | None, int | None, int | None]] = set()
+        for row in [*local_rows, *ai_rows]:
+            key = self._row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        return sorted(
+            merged,
+            key=lambda row: (
+                row.source_page,
+                row.source_block_id if row.source_block_id is not None else -1,
+                row.order_no if row.order_no is not None else 10**9,
+            ),
+        )
+
+    def validate_block_coverage(
+        self,
+        block: VocabBlock,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+        final_rows: list[VocabRow],
+    ) -> BlockCoverage:
+        """Reject a non-empty block when its row evidence is still incomplete."""
+        issues: list[str] = []
+        keys = [self._row_key(row) for row in final_rows]
+        duplicate_in_source = any(
+            len(source_keys) != len(set(source_keys))
+            for source_keys in (
+                [self._row_key(row) for row in local_rows],
+                [self._row_key(row) for row in ai_rows],
+            )
+        )
+        if duplicate_in_source or len(keys) != len(set(keys)):
+            issues.append("abnormal_exact_duplicates")
+        final_orders = [
+            row.order_no for row in final_rows if row.order_no is not None
+        ]
+        if len(final_orders) != len(set(final_orders)):
+            issues.append("duplicate_orders")
+        if not final_rows:
+            issues.append("zero_rows")
+        if _local_rows_look_like_ocr_noise(local_rows, ai_rows, final_rows):
+            issues.append("local_ocr_noise")
+
+        missing_orders: tuple[int, ...] = ()
+        if block.first_order is not None and block.last_order is not None:
+            observed = {
+                row.order_no for row in final_rows if row.order_no is not None
+            }
+            missing_orders = tuple(
+                order
+                for order in range(block.first_order, block.last_order + 1)
+                if order not in observed
+            )
+            if missing_orders:
+                issues.append("missing_orders")
+
+        if block.expected_rows is None:
+            sources_agree = (
+                len(local_rows) > 0
+                and len(ai_rows) > 0
+                and len(local_rows) == len(ai_rows)
+            )
+            if not sources_agree:
+                issues.append("expected_rows_unknown_needs_review")
+        else:
+            if len(final_rows) != block.expected_rows:
+                issues.append("expected_row_mismatch")
+            if len(final_rows) < ceil(block.expected_rows * 0.8):
+                issues.append("coverage_below_80_percent")
+
+        blocking = {
+            "abnormal_exact_duplicates",
+            "zero_rows",
+            "missing_orders",
+            "coverage_below_80_percent",
+            "expected_rows_unknown_needs_review",
+            "duplicate_orders",
+            "expected_row_mismatch",
+            "local_ocr_noise",
+        }
+        return BlockCoverage(
+            block.id,
+            block.expected_rows,
+            len(local_rows),
+            len(ai_rows),
+            len(final_rows),
+            missing_orders,
+            tuple(dict.fromkeys(issues)),
+            not any(issue in blocking for issue in issues),
+        )
+
+    @staticmethod
+    def _spans_in_block(
+        spans: list[TextSpan], block: VocabBlock
+    ) -> list[TextSpan]:
+        x0, y0, x1, y1 = block.bbox
+        return [
+            span
+            for span in spans
+            if x0 <= (span.bbox[0] + span.bbox[2]) / 2 <= x1
+            and y0 <= (span.bbox[1] + span.bbox[3]) / 2 <= y1
+        ]
+
+    def _extract_local_block(
+        self, pdf: PdfSource, block: VocabBlock
+    ) -> list[VocabRow]:
+        chinese = self._spans_in_block(
+            list(pdf.spans(block.page_index)), block
+        )
+        latin = (
+            self._spans_in_block(
+                list(pdf.ocr_spans(
+                    block.page_index, language="en-US", dpi=250
+                )),
+                block,
+            )
+            if hasattr(pdf, "ocr_spans")
+            else []
+        )
+        merged = self.merge_bilingual_spans(chinese, latin)
+        unique_spans = list({
+            (span.text, span.bbox, span.font_size, span.is_ocr): span
+            for span in merged
+        }.values())
+        return [
+            replace(row, source_block_id=block.id)
+            for row in self.extract_table_spans(
+                unique_spans, source_page=block.page_index + 1
+            )
+        ]
+
+    @staticmethod
+    def _renumber_ai_rows_for_known_range(
+        block: VocabBlock, rows: list[VocabRow]
+    ) -> list[VocabRow]:
+        if block.first_order is None or block.last_order is None:
+            return rows
+        expected = block.last_order - block.first_order + 1
+        if len(rows) != expected:
+            return rows
+        return [
+            replace(row, order_no=block.first_order + offset)
+            for offset, row in enumerate(rows)
+        ]
+
+    @staticmethod
+    def _ai_candidate_block(
+        block: VocabBlock, rows: list[VocabRow]
+    ) -> VocabBlock:
+        if block.first_order is not None and block.last_order is not None:
+            range_count = block.last_order - block.first_order + 1
+            if range_count > 0 and len(rows) == range_count:
+                return replace(block, expected_rows=range_count)
+            return block
+        if block.first_order is not None or block.last_order is not None:
+            return block
+        if block.expected_rows is None or len(rows) <= block.expected_rows:
+            return block
+        orders = [row.order_no for row in rows if row.order_no is not None]
+        if len(orders) != len(rows) or len(orders) != len(set(orders)):
+            return block
+        return replace(block, expected_rows=len(rows))
+
+    def _select_block_rows(
+        self,
+        block: VocabBlock,
+        local_rows: list[VocabRow],
+        ai_rows: list[VocabRow],
+    ) -> tuple[VocabBlock, list[VocabRow], BlockCoverage]:
+        if ai_rows:
+            ai_candidate = self._renumber_ai_rows_for_known_range(block, ai_rows)
+            ai_block = self._ai_candidate_block(block, ai_candidate)
+            ai_report = self.validate_block_coverage(
+                ai_block,
+                [],
+                ai_candidate,
+                ai_candidate,
+            )
+            if ai_report.passed:
+                return ai_block, ai_candidate, ai_report
+
+        final = self.merge_block_rows(local_rows, ai_rows)
+        report = self.validate_block_coverage(
+            block,
+            local_rows,
+            ai_rows,
+            final,
+        )
+        return block, final, report
+
+    def reconcile_checkpointed_block(
+        self, block: VocabBlock, rows: list[VocabRow]
+    ) -> tuple[VocabBlock, list[VocabRow]] | None:
+        local_rows = [row for row in rows if row.extract_by == "regex"]
+        ai_rows = [row for row in rows if row.extract_by != "regex"]
+        selected_block, selected_rows, report = self._select_block_rows(
+            block, local_rows, ai_rows
+        )
+        if not report.passed:
+            return None
+        status = "ai_ok" if ai_rows else "local_ok"
+        return replace(selected_block, status=status), selected_rows
+
+    @staticmethod
+    def _coverage_issue(
+        report: BlockCoverage, issue: str
+    ) -> BlockCoverage:
+        return replace(
+            report,
+            issues=tuple(dict.fromkeys((*report.issues, issue))),
+            passed=False,
+        )
+
+    @staticmethod
+    def _block_issue_context(
+        block: VocabBlock, report: BlockCoverage, *, full_page: bool = False
+    ) -> str:
+        if report.missing_orders:
+            missing = ", ".join(str(value) for value in report.missing_orders)
+            detail = f"missing order numbers {missing}"
+        else:
+            detail = ", ".join(report.issues) or "coverage is incomplete"
+        target_parts: list[str] = []
+        if block.first_order is not None and block.last_order is not None:
+            target_parts.append(
+                f"target order range {block.first_order}-{block.last_order}"
+            )
+        if block.expected_rows is not None:
+            target_parts.append(f"expected {block.expected_rows} rows")
+        target = "; ".join(target_parts) or "target vocabulary block"
+        if full_page:
+            image_note = (
+                "image is a full page recovery fallback; read only the target "
+                "vocabulary table/block and ignore dialogues, grammar notes, "
+                "exercises, headers, footers, and reference tables"
+            )
+        else:
+            image_note = (
+                "image is the persisted block crop; ignore non-vocabulary "
+                "grammar/reference text if the crop is noisy"
+            )
+        return (
+            f"Block {block.block_no}: {detail}; {target}; {image_note}. "
+            "Return every target vocabulary row visible, not only the missing rows."
+        )
+
+    def extract_blocks(
+        self,
+        pdf: PdfSource,
+        blocks: list[VocabBlock],
+        ai_client: AiClient | None = None,
+    ) -> ExtractionResult:
+        """Extract blocks with one Vision request per pending block per run."""
+        local_rows: list[list[VocabRow]] = []
+        ai_rows: list[list[VocabRow]] = []
+        final_rows: list[list[VocabRow]] = []
+        reports: list[BlockCoverage] = []
+        attempt_counts = [0 for _block in blocks]
+
+        for block in blocks:
+            local = self._extract_local_block(pdf, block)
+            final = self.merge_block_rows(local, [])
+            report = self.validate_block_coverage(block, local, [], final)
+            local_rows.append(local)
+            ai_rows.append([])
+            final_rows.append(final)
+            reports.append(report)
+
+        configured = ai_client is not None and ai_client.is_configured()
+        remaining_by_block = [
+            1
+            if configured
+            and not report.passed
+            and block.ai_attempts < MAX_AI_ATTEMPTS_PER_BLOCK
+            else 0
+            for block, report in zip(blocks, reports)
+        ]
+        queue = [
+            index
+            for index, remaining in enumerate(remaining_by_block)
+            if remaining > 0
+        ]
+        for index, report in enumerate(reports):
+            if (
+                configured
+                and not report.passed
+                and blocks[index].ai_attempts >= MAX_AI_ATTEMPTS_PER_BLOCK
+            ):
+                reports[index] = self._coverage_issue(report, "ai_exhausted")
+        attempts = 0
+        remaining = sum(remaining_by_block)
+
+        while configured and queue and attempts < remaining:
+            index = queue.pop(0)
+            block = blocks[index]
+            full_page = (block.region_decision == "auto"
+                         and block.ai_attempts >= FULL_PAGE_RECOVERY_START_ATTEMPT)
+            image = (
+                render_block_recovery_page(pdf, block)
+                if full_page
+                else render_block_crop(pdf, block)
+            )
+            if not image:
+                reports[index] = self._coverage_issue(
+                    reports[index],
+                    "page_empty" if full_page else "crop_empty",
+                )
+                continue
+
+            attempts += 1
+            attempt_counts[index] += 1
+            context = self._block_issue_context(
+                block, reports[index], full_page=full_page
+            )
+            try:
+                extracted = [
+                    replace(row, source_block_id=block.id)
+                    for row in self.extract_by_llm_image(
+                        image,
+                        ai_client,
+                        block.page_index + 1,
+                        issue_context=context,
+                    )
+                ]
+            except AiRateLimitError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "rate_limited"
+                )
+                break
+            except AiClientError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "ai_error"
+                )
+                break
+            except RuntimeError:
+                reports[index] = self._coverage_issue(
+                    reports[index], "ai_empty"
+                )
+                if (
+                    attempt_counts[index] < remaining_by_block[index]
+                    and attempts < remaining
+                ):
+                    queue.append(index)
+                continue
+
+            ai_rows[index].extend(extracted)
+            selected_block, selected_rows, selected_report = self._select_block_rows(
+                block, local_rows[index], ai_rows[index]
+            )
+            blocks[index] = selected_block
+            ai_rows[index] = [
+                row for row in selected_rows if row.extract_by != "regex"
+            ]
+            final_rows[index] = selected_rows
+            reports[index] = selected_report
+            if (
+                not reports[index].passed
+                and attempt_counts[index] < remaining_by_block[index]
+                and attempts < remaining
+            ):
+                queue.append(index)
+
+        updated: list[VocabBlock] = []
+        all_rows: list[VocabRow] = []
+        for index, block in enumerate(blocks):
+            report = reports[index]
+            status = (
+                "ai_ok" if report.passed and ai_rows[index]
+                else "local_ok" if report.passed
+                else "incomplete"
+            )
+            updated.append(replace(
+                block,
+                status=status,
+                ai_attempts=block.ai_attempts + attempt_counts[index],
+            ))
+            all_rows.extend(final_rows[index])
+
+        self.lesson_ai_attempts = sum(block.ai_attempts for block in blocks) + attempts
+        return ExtractionResult(
+            tuple(self.merge_block_rows(all_rows, [])),
+            tuple(reports),
+            tuple(updated),
+            attempts,
+            bool(blocks) and all(report.passed for report in reports),
+        )
+
     def validate_rows(self, rows: list[VocabRow]) -> list[VocabRow]:
         """Kiểm chứng đầu ra OCR/Vision bằng từ điển và âm đọc từng chữ."""
         validated: list[VocabRow] = []
@@ -462,6 +2063,7 @@ class VocabExtractor:
                     needs_review=bool(reasons),
                     review_reason="; ".join(reasons) or None,
                     hanviet_src=row.hanviet_src,
+                    source_block_id=row.source_block_id,
                 )
             )
         return validated

@@ -6,17 +6,16 @@ chưa cài Tesseract / PaddleOCR.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+import fitz
 
 from hanzi_app.data.models import TextSpan
-
-if TYPE_CHECKING:
-    import fitz
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +57,8 @@ foreach ($line in $result.Lines) {
     }
   }
 }
-ConvertTo-Json -Compress -Depth 3 -InputObject @($words)
+$json = ConvertTo-Json -Compress -Depth 3 -InputObject @($words)
+[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 """
 
 
@@ -95,7 +95,8 @@ class OcrAdapter:
                     for span in line.get("spans", []):
                         text = span.get("text", "").strip()
                         if text:
-                            bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
+                            rect = fitz.Rect(span["bbox"]) * page.rotation_matrix
+                            bbox = tuple(value * 250 / 72 for value in rect)
                             font_size = float(span.get("size", 12.0))
                             spans.append(
                                 TextSpan(
@@ -153,6 +154,8 @@ class OcrAdapter:
                 errors="replace",
                 timeout=45,
                 check=False,
+                # A windowed EXE has no console for PowerShell to inherit.
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
 
         if completed.returncode != 0:
@@ -161,8 +164,15 @@ class OcrAdapter:
             return []
 
         try:
-            data = json.loads(completed.stdout or "[]")
-        except json.JSONDecodeError:
+            encoded = completed.stdout.strip()
+            if not encoded:
+                self._windows_available = False
+                return []
+            raw_json = base64.b64decode(
+                encoded, validate=True
+            ).decode("utf-8")
+            data = json.loads(raw_json or "[]")
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
             self._windows_available = False
             return []
 

@@ -6,9 +6,18 @@ Tầng service: nhận danh sách PageSummary từ pdfsource, trả về danh s�
 from __future__ import annotations
 
 import re
+from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
-from hanzi_app.data.models import LessonBoundary, PageSummary
+from hanzi_app.data.models import (
+    BoundaryEvidence,
+    BoundaryIssue,
+    BoundaryReport,
+    LessonBoundary,
+    PageEvidence,
+    PageSummary,
+    SplitResult,
+)
 
 if TYPE_CHECKING:
     from hanzi_app.adapter.aiclient import AiClient
@@ -21,6 +30,22 @@ RE_LESSON_HEADER = re.compile(
 
 # Chữ số Hán tự sang số tự nhiên
 CN_NUMS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+ERROR_CODES = {
+    "duplicate_lesson",
+    "missing_lesson",
+    "start_not_increasing",
+    "overlap",
+    "page_out_of_range",
+    "toc_heading_conflict",
+}
+
+RE_TOC_ROW = re.compile(
+    r"^\s*(?:Lesson\s*|Bài\s*|第\s*)?(\d+)"
+    r"(?:\s*(?:Lesson|Bài|课))?\s+(.+?)\s+(\d+)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _parse_cn_num(num_str: str) -> int:
@@ -43,6 +68,9 @@ def _parse_cn_num(num_str: str) -> int:
 class Splitter:
     """Điều phối phân tách bài học trong sách."""
 
+    def __init__(self) -> None:
+        self.ai_calls_used = 0
+
     @staticmethod
     def accepts(summaries: list[PageSummary]) -> tuple[bool, str]:
         """Kiểm tra điều kiện chấp nhận sách."""
@@ -56,6 +84,406 @@ class Splitter:
             return False, "Sách không có nội dung văn bản"
 
         return True, "Hợp lệ"
+
+    @staticmethod
+    def _toc_rows(toc_text: str) -> list[tuple[int, str, int]]:
+        """Read lesson number, title and printed page from simple TOC rows."""
+        rows: list[tuple[int, str, int]] = []
+        for line in toc_text.splitlines():
+            match = RE_TOC_ROW.match(line)
+            if match:
+                lesson_no, title, printed_page = match.groups()
+                rows.append((int(lesson_no), title.strip(), int(printed_page)))
+        return rows
+
+    @staticmethod
+    def _page_offset(evidence: list[PageEvidence]) -> int | None:
+        """Infer a printed-to-PDF offset only from repeated heading-page pairs."""
+        pairs = {
+            (item.printed_page, item.pdf_page)
+            for item in evidence
+            if item.heading_lesson_no is not None and item.printed_page is not None
+        }
+        offsets = [pdf_page - printed_page for printed_page, pdf_page in pairs]
+        if len(offsets) < 2:
+            return None
+        offset, count = sorted(
+            Counter(offsets).items(), key=lambda item: (-item[1], item[0])
+        )[0]
+        return offset if count >= 2 else None
+
+    @staticmethod
+    def _total_pages(
+        summaries: list[PageSummary], evidence: list[PageEvidence]
+    ) -> int:
+        pages = [item.pdf_page for item in summaries]
+        pages.extend(item.pdf_page for item in evidence)
+        return max(pages, default=-1) + 1
+
+    def validate(
+        self,
+        boundaries: list[LessonBoundary] | tuple[LessonBoundary, ...],
+        evidence: list[BoundaryEvidence] | tuple[BoundaryEvidence, ...],
+        total_pages: int,
+    ) -> BoundaryReport:
+        """Check lesson sequence and source agreement before importing it."""
+        issues: list[BoundaryIssue] = []
+        lesson_counts = Counter(boundary.index_no for boundary in boundaries)
+
+        for lesson_no, count in sorted(lesson_counts.items()):
+            if count > 1:
+                issues.append(
+                    BoundaryIssue(
+                        "duplicate_lesson", "error", lesson_no, None,
+                        f"Lesson {lesson_no} occurs {count} times.",
+                    )
+                )
+
+        positive_numbers = {number for number in lesson_counts if number > 0}
+        if positive_numbers:
+            for lesson_no in range(1, max(positive_numbers) + 1):
+                if lesson_no not in positive_numbers:
+                    issues.append(
+                        BoundaryIssue(
+                            "missing_lesson", "error", lesson_no, None,
+                            f"Lesson {lesson_no} is missing.",
+                        )
+                    )
+
+        ordered = sorted(boundaries, key=lambda boundary: (boundary.index_no, boundary.page_start))
+        for previous, current in zip(ordered, ordered[1:]):
+            if current.page_start <= previous.page_start:
+                issues.append(
+                    BoundaryIssue(
+                        "start_not_increasing", "error", current.index_no,
+                        current.page_start,
+                        "Lesson starts must increase with lesson number.",
+                    )
+                )
+            if current.page_start <= previous.page_end:
+                issues.append(
+                    BoundaryIssue(
+                        "overlap", "error", current.index_no, current.page_start,
+                        "Lesson pages overlap.",
+                    )
+                )
+
+        for boundary in boundaries:
+            if (
+                boundary.page_start < 0
+                or boundary.page_end < 0
+                or boundary.page_start >= total_pages
+                or boundary.page_end >= total_pages
+            ):
+                issues.append(
+                    BoundaryIssue(
+                        "page_out_of_range", "error", boundary.index_no,
+                        boundary.page_start,
+                        "Lesson page lies outside the PDF.",
+                    )
+                )
+
+        pages_by_source: dict[int, dict[str, set[int]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        for item in evidence:
+            if item.lesson_no is not None and item.source in {"toc", "heading"}:
+                pages_by_source[item.lesson_no][item.source].add(item.page_index)
+        for lesson_no, sources in sorted(pages_by_source.items()):
+            toc_pages = sources.get("toc", set())
+            heading_pages = sources.get("heading", set())
+            if toc_pages and heading_pages and toc_pages != heading_pages:
+                issues.append(
+                    BoundaryIssue(
+                        "toc_heading_conflict", "error", lesson_no, None,
+                        "TOC and heading point to different lesson pages.",
+                    )
+                )
+
+        return BoundaryReport(
+            valid=not issues,
+            issues=tuple(issues),
+            missing_lesson_nos=tuple(
+                issue.lesson_no for issue in issues if issue.code == "missing_lesson"
+            ),
+        )
+
+    def propose(
+        self,
+        summaries: list[PageSummary],
+        evidence: list[PageEvidence] | tuple[PageEvidence, ...],
+        ai_client: AiClient | None = None,
+        evidence_image: bytes | None = None,
+        remaining_ai_calls: int = 2,
+    ) -> SplitResult:
+        """Fuse local TOC, heading and layout evidence into lesson boundaries."""
+        self.ai_calls_used = 0
+        page_evidence = list(evidence)
+        boundary_evidence: list[BoundaryEvidence] = []
+        offset = self._page_offset(page_evidence)
+
+        for item in page_evidence:
+            if item.heading_lesson_no is not None:
+                boundary_evidence.append(
+                    BoundaryEvidence(
+                        "heading", item.pdf_page, item.heading_lesson_no,
+                        item.heading_title, 0.8, item.top_text,
+                    )
+                )
+            if item.toc_text and offset is not None:
+                for lesson_no, title, printed_page in self._toc_rows(item.toc_text):
+                    boundary_evidence.append(
+                        BoundaryEvidence(
+                            "toc", printed_page + offset, lesson_no, title,
+                            0.75, f"printed page {printed_page}",
+                        )
+                    )
+
+        grouped: dict[int, dict[int, list[BoundaryEvidence]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for item in boundary_evidence:
+            if item.lesson_no is not None and item.lesson_no > 0:
+                grouped[item.lesson_no][item.page_index].append(item)
+
+        fingerprint_headings: dict[str, set[int]] = defaultdict(set)
+        for item in page_evidence:
+            if item.layout_fingerprint and item.heading_lesson_no is not None:
+                fingerprint_headings[item.layout_fingerprint].add(item.pdf_page)
+        confirmed_fingerprints = {
+            fingerprint
+            for fingerprint, pages in fingerprint_headings.items()
+            if len(pages) >= 2
+        }
+        for item in page_evidence:
+            if item.layout_fingerprint not in confirmed_fingerprints:
+                continue
+            for lesson_no, pages in grouped.items():
+                candidate_items = pages.get(item.pdf_page)
+                if not candidate_items:
+                    continue
+                title = next(
+                    (candidate.title for candidate in candidate_items if candidate.title),
+                    None,
+                )
+                layout = BoundaryEvidence(
+                    "layout", item.pdf_page, lesson_no, title, 0.7,
+                    item.layout_fingerprint,
+                )
+                candidate_items.append(layout)
+                boundary_evidence.append(layout)
+
+        total_pages = self._total_pages(summaries, page_evidence)
+        boundaries: list[LessonBoundary] = []
+        if grouped:
+            selected: list[tuple[int, int, list[BoundaryEvidence]]] = []
+            for lesson_no, pages in grouped.items():
+                page_index, items = min(
+                    pages.items(),
+                    key=lambda pair: (-len({item.source for item in pair[1]}), pair[0]),
+                )
+                selected.append((lesson_no, page_index, items))
+            selected.sort(key=lambda item: item[0])
+
+            for position, (lesson_no, page_start, items) in enumerate(selected):
+                sources = {item.source for item in items}
+                title = next(
+                    (item.title for item in items if item.source == "heading" and item.title),
+                    next((item.title for item in items if item.title), None),
+                )
+                page_end = (
+                    selected[position + 1][1] - 1
+                    if position + 1 < len(selected)
+                    else total_pages - 1
+                )
+                confidence = (
+                    0.65
+                    if len(sources) == 1
+                    else min(0.95, 0.55 + 0.15 * len(sources))
+                )
+                boundaries.append(
+                    LessonBoundary(
+                        lesson_no, title, page_start, page_end, confidence, "lesson"
+                    )
+                )
+        else:
+            boundaries = self.split_by_regex(summaries) or self.split_by_heuristics(summaries)
+            if not boundaries:
+                banners = [p for p in page_evidence if p.layout_fingerprint == "captioned-opening-banner"]
+                if len(banners) >= 3 and all(b.pdf_page - a.pdf_page >= 2
+                                             for a, b in zip(banners, banners[1:])):
+                    end = next((p.pdf_page for p in page_evidence if p.pdf_page > banners[-1].pdf_page
+                                and re.search(r"translation\s+of\s+the\s+texts|[il]ndex\s+of\s+word|词\s*语\s*索\s*引",
+                                              p.top_text, re.I)), total_pages)
+                    starts = [p.pdf_page for p in banners] + [end]
+                    for i, page in enumerate(banners, start=1):
+                        boundaries.append(LessonBoundary(i, page.top_text, page.pdf_page,
+                                                         starts[i] - 1, 0.55, "lesson"))
+                        boundary_evidence.append(BoundaryEvidence(
+                            "layout", page.pdf_page, i, page.top_text, 0.55,
+                            f"Kiểu trang mở bài lặp lại · kiểm tra trang {page.pdf_page + 1}",
+                        ))
+
+        report = self.validate(boundaries, boundary_evidence, total_pages)
+        local = SplitResult(
+            tuple(boundaries), tuple(boundary_evidence), report, not report.valid
+        )
+        if local.report.valid and self._has_two_source_support(local):
+            return local
+        if (
+            remaining_ai_calls <= 0
+            or not evidence_image
+            or not ai_client
+            or not ai_client.is_configured()
+        ):
+            return local
+
+        self.ai_calls_used += 1
+        raw = ai_client.split_lessons_from_image(
+            evidence_image, self._format_evidence(page_evidence)
+        )
+        merged = self._merge_ai_candidates(local, raw, total_pages)
+        if (
+            (merged.report.valid and merged.boundaries)
+            or remaining_ai_calls <= self.ai_calls_used
+        ):
+            return merged
+
+        self.ai_calls_used += 1
+        raw_retry = ai_client.split_lessons_from_image(
+            evidence_image,
+            self._format_evidence(page_evidence),
+            issue_context=self._format_issues(merged.report),
+        )
+        return self._merge_ai_candidates(merged, raw_retry, total_pages)
+
+    @staticmethod
+    def _format_evidence(evidence: list[PageEvidence]) -> str:
+        """Render local signals as compact prompt context for a bounded Vision repair."""
+        return "\n".join(
+            "page {page}: top={top!r}; bottom={bottom!r}; heading={heading!r}; "
+            "printed={printed!r}; toc={toc!r}".format(
+                page=item.pdf_page,
+                top=item.top_text,
+                bottom=item.bottom_text,
+                heading=item.heading_lesson_no,
+                printed=item.printed_page,
+                toc=item.toc_text,
+            )
+            for item in evidence
+        )
+
+    @staticmethod
+    def _format_issues(report: BoundaryReport) -> str:
+        return "; ".join(issue.message for issue in report.issues) or "No boundaries returned."
+
+    @staticmethod
+    def _has_two_source_support(result: SplitResult) -> bool:
+        """Only trust a local result automatically when every start has two sources."""
+        sources_by_lesson: dict[int, set[str]] = defaultdict(set)
+        starts = {boundary.index_no: boundary.page_start for boundary in result.boundaries}
+        for item in result.evidence:
+            if (
+                item.lesson_no in starts
+                and item.page_index == starts[item.lesson_no]
+            ):
+                sources_by_lesson[item.lesson_no].add(item.source)
+        return bool(starts) and all(
+            len(sources_by_lesson[lesson_no]) >= 2 for lesson_no in starts
+        )
+
+    def _merge_ai_candidates(
+        self,
+        previous: SplitResult,
+        raw: list[dict],
+        total_pages: int,
+    ) -> SplitResult:
+        """Normalize Vision JSON and validate it before it can replace local bounds."""
+        previous_titles = {
+            boundary.index_no: boundary.title for boundary in previous.boundaries
+        }
+        candidates: list[tuple[int, int, str | None, str]] = []
+        conversion_issues: list[BoundaryIssue] = []
+        if not isinstance(raw, list) or not raw:
+            conversion_issues.append(
+                BoundaryIssue(
+                    "empty_ai_result", "error", None, None,
+                    "Vision returned no lesson boundaries.",
+                )
+            )
+        else:
+            for item in raw:
+                try:
+                    if not isinstance(item, dict):
+                        raise TypeError
+                    lesson_no = int(item["index_no"])
+                    page_start = int(item["page_start"])
+                    title_value = item.get("title")
+                    title = (
+                        str(title_value).strip()
+                        if title_value is not None and str(title_value).strip()
+                        else previous_titles.get(lesson_no)
+                    )
+                    if lesson_no <= 0:
+                        raise ValueError
+                    candidates.append((lesson_no, page_start, title, "ai"))
+                except (KeyError, TypeError, ValueError):
+                    conversion_issues.append(
+                        BoundaryIssue(
+                            "invalid_ai_candidate", "error", None, None,
+                            "Vision returned an invalid lesson boundary.",
+                        )
+                    )
+
+        ai_lesson_nos = {lesson_no for lesson_no, _page, _title, source in candidates if source == "ai"}
+        for boundary in previous.boundaries:
+            if boundary.index_no not in ai_lesson_nos:
+                candidates.append(
+                    (
+                        boundary.index_no,
+                        boundary.page_start,
+                        boundary.title,
+                        "local",
+                    )
+                )
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        boundaries = [
+            LessonBoundary(
+                lesson_no,
+                title,
+                page_start,
+                candidates[position + 1][1] - 1
+                if position + 1 < len(candidates)
+                else total_pages - 1,
+                0.85,
+                "lesson",
+            )
+            for position, (lesson_no, page_start, title, _source) in enumerate(candidates)
+        ]
+        ai_evidence = [
+            BoundaryEvidence(
+                source, boundary.page_start, boundary.index_no, boundary.title,
+                boundary.confidence,
+                "Vision contact sheet" if source == "ai" else "Local candidate",
+            )
+            for boundary, (_lesson_no, _page_start, _title, source) in zip(
+                boundaries, candidates
+            )
+            if source == "ai"
+        ]
+        evidence = tuple((*previous.evidence, *ai_evidence))
+        report = self.validate(boundaries, evidence, total_pages)
+        issues = tuple((*report.issues, *conversion_issues))
+        validated_report = BoundaryReport(
+            valid=not issues,
+            issues=issues,
+            missing_lesson_nos=report.missing_lesson_nos,
+        )
+        return SplitResult(
+            tuple(boundaries), tuple(evidence), validated_report,
+            not validated_report.valid,
+        )
 
     def split_by_boya1_preset(self, total_pages: int) -> list[LessonBoundary]:
         """Preset ranh giới 30 bài học thực tế cho giáo trình Boya Sơ cấp 1 (270 trang scan)."""
@@ -189,30 +617,10 @@ class Splitter:
     def split(
         self, summaries: list[PageSummary], ai_client: AiClient | None = None
     ) -> list[LessonBoundary]:
-        """Phân tách bài học theo quy trình chuẩn hóa đơn giản, sạch sẽ."""
-        ok, reason = self.accepts(summaries)
+        """Compatibility wrapper for callers that only have page summaries."""
+        ok, _reason = self.accepts(summaries)
         if not ok:
             return []
 
-        total_cjk = sum(s.cjk for s in summaries)
-        total_pages = len(summaries)
-
-        # Trường hợp 1: Sách scan rỗng text native (cjk == 0) và khoảng ~270 trang (Boya 1 Sơ cấp)
-        if total_cjk == 0 and total_pages >= 200:
-            preset = self.split_by_boya1_preset(total_pages)
-            if preset:
-                return preset
-
-        # Trường hợp 2: Phân tách bằng LLM API nếu có text native
-        if ai_client and ai_client.is_configured():
-            llm_res = self.split_by_llm(summaries, ai_client)
-            if llm_res:
-                return llm_res
-
-        # Trường hợp 3: Phân tách bằng Regex tiêu đề (第X课 / Bài X)
-        regex_res = self.split_by_regex(summaries)
-        if regex_res:
-            return regex_res
-
-        # Trường hợp 4: Dự phòng theo Heuristics
-        return self.split_by_heuristics(summaries)
+        result = self.propose(summaries, (), ai_client=ai_client)
+        return list(result.boundaries) if result.report.valid else []

@@ -71,3 +71,35 @@ def test_default_client_uses_high_volume_multimodal_model():
     client = AiClient(api_key="test-key")
     with patch("urllib.request.urlopen", side_effect=urlopen):
         assert client.extract_vocab_from_image(b"image") == []
+
+
+def test_image_lesson_split_uses_vision_and_includes_retry_context():
+    """Boundary repair must send the evidence image through the one Vision path."""
+    client = AiClient(api_key="test-key")
+
+    with patch.object(
+        client,
+        "_call_llm_vision",
+        return_value='[{"index_no": 1, "title": "Lesson 1", "page_start": 0}]',
+    ) as vision:
+        result = client.split_lessons_from_image(
+            b"contact-sheet", "page 1: Lesson 1", issue_context="Lesson 2 missing",
+        )
+
+    assert result == [{"index_no": 1, "title": "Lesson 1", "page_start": 0}]
+    prompt, image_b64 = vision.call_args.args
+    assert "page 1: Lesson 1" in prompt
+    assert "Lesson 2 missing" in prompt
+    assert image_b64
+
+def test_vocab_image_prompt_includes_issue_context():
+    client = AiClient(api_key="test-key")
+
+    with patch.object(client, "_call_llm_vision", return_value="[]") as vision:
+        client.extract_vocab_from_image(
+            b"crop", issue_context="Block 2: thiếu STT 8-12"
+        )
+
+    prompt, image_b64 = vision.call_args.args
+    assert "Block 2: thiếu STT 8-12" in prompt
+    assert image_b64

@@ -5,6 +5,7 @@ Tầng adapter duy nhất trực tiếp tương tác với PyMuPDF (fitz).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,10 +13,20 @@ from typing import TYPE_CHECKING
 import fitz
 
 from hanzi_app.adapter.ocr import OcrAdapter
-from hanzi_app.data.models import PageSummary, TextSpan
+from hanzi_app.data.models import PageEvidence, PageSummary, TextSpan
 
 # Biểu thức chính quy phát hiện ký tự CJK (chữ Hán).
 RE_CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+RE_FOLIO = re.compile(r"\b(\d{1,4})\b")
+RE_LESSON_HEADER = re.compile(
+    r"(?:第\s*(\d+|[一二三四五六七八九十百]+)\s*课|^Bài\s+(\d+)|^Lesson\s+(\d+))",
+    re.IGNORECASE,
+)
+CN_NUMS = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+TOC_MARKERS = ("contents", "table of contents", "mục lục", "目录", "目錄")
 
 
 class PdfSource:
@@ -31,6 +42,7 @@ class PdfSource:
 
         self._doc = fitz.open(str(self.path))
         self._ocr = ocr_adapter or OcrAdapter()
+        self._band_ocr_cache: dict[tuple[int, str], tuple[TextSpan, ...]] = {}
 
     def page_count(self) -> int:
         """Tổng số trang của tệp PDF."""
@@ -183,6 +195,193 @@ class PdfSource:
         # Ngược lại: tự động gọi OCR
         return self._ocr.ocr_page(page)
 
+    def _band_text(self, page_index: int, band: str) -> str:
+        """OCR the top or bottom 22% of a page at low resolution."""
+        page = self._doc[page_index]
+        band_height = page.rect.height * 0.22
+        if band == "top":
+            clip = fitz.Rect(page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y0 + band_height)
+        else:
+            clip = fitz.Rect(page.rect.x0, page.rect.y1 - band_height, page.rect.x1, page.rect.y1)
+        pix = page.get_pixmap(dpi=110, clip=clip, alpha=False)
+        spans = tuple(self._ocr.ocr_png_bytes(pix.tobytes("png")))
+        self._band_ocr_cache[(page_index, band)] = spans
+        return " ".join(span.text for span in spans)
+
+    def _full_ocr_text(self, page_index: int) -> str:
+        """OCR one explicitly selected TOC page at a modest resolution."""
+        page = self._doc[page_index]
+        pix = page.get_pixmap(dpi=140, alpha=False)
+        return " ".join(span.text for span in self._ocr.ocr_png_bytes(pix.tobytes("png")))
+
+    def page_census(self) -> list[PageEvidence]:
+        """Collect lightweight page signals before lesson splitting or extraction."""
+        basic: list[dict[str, object]] = []
+        toc_pages: set[int] = set()
+
+        for page_index in range(len(self._doc)):
+            page = self._doc[page_index]
+            top_text = self._band_text(page_index, "top")
+            bottom_text = self._band_text(page_index, "bottom")
+            native_text = page.get_text("text").strip()
+            has_useful_native_text = len(re.sub(r"\s+", "", native_text)) >= 20
+            has_images = bool(page.get_images(full=True))
+            lesson_no, title = self._heading(top_text)
+            is_toc_candidate = self._is_toc_candidate(top_text)
+            if is_toc_candidate:
+                toc_pages.add(page_index)
+
+            basic.append(
+                {
+                    "pdf_page": page_index,
+                    "page_kind": self._page_kind(has_useful_native_text, has_images),
+                    "top_text": top_text,
+                    "bottom_text": bottom_text,
+                    "printed_page": self._printed_page(bottom_text),
+                    "heading_lesson_no": lesson_no,
+                    "heading_title": title,
+                    "is_toc_candidate": is_toc_candidate,
+                    "layout_fingerprint": (
+                        "captioned-opening-banner" if self._is_opening_banner(page, top_text)
+                        else self._layout_fingerprint(
+                            page, self._band_ocr_cache.get((page_index, "top"), ()),
+                        )
+                    ),
+                }
+            )
+
+        toc_ocr_pages = {
+            page_index + offset
+            for page_index in toc_pages
+            for offset in range(4)
+            if page_index + offset < len(self._doc)
+        }
+        toc_texts = {page_index: self._full_ocr_text(page_index) for page_index in toc_ocr_pages}
+
+        return [
+            PageEvidence(toc_text=toc_texts.get(item["pdf_page"]), **item)
+            for item in basic
+        ]
+
+    def boundary_contact_sheet(self, evidence: list[PageEvidence]) -> bytes:
+        """Render selected evidence pages in a four-column sheet no wider than 1200 px."""
+        pages = [item.pdf_page for item in evidence if 0 <= item.pdf_page < len(self._doc)]
+        if not pages:
+            return b""
+
+        columns = 4
+        cell_width = 300.0
+        cell_height = max(
+            cell_width * self._doc[page_index].rect.height / self._doc[page_index].rect.width
+            for page_index in pages
+        )
+        rows = (len(pages) + columns - 1) // columns
+        sheet = fitz.open()
+        try:
+            output = sheet.new_page(width=columns * cell_width, height=rows * cell_height)
+            for index, page_index in enumerate(pages):
+                row, column = divmod(index, columns)
+                source = self._doc[page_index].rect
+                scale = min(cell_width / source.width, cell_height / source.height)
+                width = source.width * scale
+                height = source.height * scale
+                left = column * cell_width + (cell_width - width) / 2
+                top = row * cell_height + (cell_height - height) / 2
+                output.show_pdf_page(
+                    fitz.Rect(left, top, left + width, top + height),
+                    self._doc,
+                    page_index,
+                    keep_proportion=True,
+                )
+            return output.get_pixmap(dpi=72, alpha=False).tobytes("png")
+        finally:
+            sheet.close()
+
+    @staticmethod
+    def _page_kind(has_useful_native_text: bool, has_images: bool) -> str:
+        if has_useful_native_text and has_images:
+            return "mixed"
+        if has_useful_native_text:
+            return "native"
+        return "scan"
+
+    @staticmethod
+    def _printed_page(bottom_text: str) -> int | None:
+        match = RE_FOLIO.search(bottom_text)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _is_toc_candidate(top_text: str) -> bool:
+        normalized = top_text.casefold()
+        return any(marker in normalized for marker in TOC_MARKERS)
+
+    @staticmethod
+    def _heading(top_text: str) -> tuple[int | None, str | None]:
+        match = RE_LESSON_HEADER.search(top_text.strip())
+        if not match:
+            return None, None
+        number = next(group for group in match.groups() if group is not None)
+        return PdfSource._lesson_number(number), top_text.strip()
+
+    @staticmethod
+    def _lesson_number(value: str) -> int:
+        if value.isdigit():
+            return int(value)
+        if value in CN_NUMS:
+            return CN_NUMS[value]
+        if "十" in value:
+            tens, _, ones = value.partition("十")
+            return CN_NUMS.get(tens, 1) * 10 + CN_NUMS.get(ones, 0)
+        return 1
+
+    @staticmethod
+    def _is_opening_banner(page: fitz.Page, caption: str) -> bool:
+        """A short uppercase caption on a coloured band with a pale number badge."""
+        letters = [c for c in caption if c.isalpha() and c.lower() != c.upper()]
+        if not letters or len(caption) > 100 or sum(c.isupper() for c in letters) < 0.8 * len(letters):
+            return False
+        rect = page.rect
+        scale = 100 / rect.width
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                              clip=fitz.Rect(0, 0, rect.width, rect.height * 0.13),
+                              colorspace=fitz.csRGB, alpha=False)
+        if pix.width < 95 or pix.height < 5:
+            return False
+        pixels = pix.samples
+        band = badge_pale = badge_ink = 0
+        rows = pix.height - 4
+        for y in range(2, pix.height - 2):
+            for x in range(3, 95):
+                offset = y * pix.stride + x * 3
+                r, g, b = pixels[offset:offset + 3]
+                contrast = max(r, g, b) - min(r, g, b)
+                if x >= 35:
+                    band += contrast > 45
+                elif x < 24:
+                    badge_pale += min(r, g, b) > 201
+                    badge_ink += contrast > 115 and min(r, g, b) < 135
+        return (band > 0.44 * rows * 60 and badge_pale > 0.18 * rows * 21
+                and badge_ink > 0.022 * rows * 21)
+
+    @staticmethod
+    def _layout_fingerprint(page: fitz.Page, spans: tuple[TextSpan, ...]) -> str:
+        """Hash a 12x4 occupancy grid of OCR boxes from the page's top band."""
+        columns, rows = 12, 4
+        occupied = [[False for _ in range(columns)] for _ in range(rows)]
+        band_height = page.rect.height * 0.22 * 110 / 72
+        band_width = page.rect.width * 110 / 72
+        for span in spans:
+            x0, y0, x1, y1 = span.bbox
+            left = max(0, min(columns - 1, int(x0 * columns / band_width)))
+            right = max(0, min(columns - 1, int(max(x0, x1 - 1) * columns / band_width)))
+            top = max(0, min(rows - 1, int(y0 * rows / band_height)))
+            bottom = max(0, min(rows - 1, int(max(y0, y1 - 1) * rows / band_height)))
+            for row in range(top, bottom + 1):
+                for column in range(left, right + 1):
+                    occupied[row][column] = True
+        grid = "".join("1" if cell else "0" for row in occupied for cell in row)
+        return hashlib.sha256(grid.encode("ascii")).hexdigest()
+
     def _extract_native_spans(self, page: fitz.Page) -> list[TextSpan]:
         """Trích xuất các TextSpan từ trang text native."""
         spans: list[TextSpan] = []
@@ -195,7 +394,9 @@ class PdfSource:
                 for span in line.get("spans", []):
                     text = span.get("text", "").strip()
                     if text:
-                        bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
+                        # The editor and persisted table rectangles use rendered 250-DPI pixels.
+                        rect = fitz.Rect(span["bbox"]) * page.rotation_matrix
+                        bbox = tuple(value * 250 / 72 for value in rect)
                         font_size = float(span.get("size", 12.0))
                         spans.append(
                             TextSpan(
@@ -226,7 +427,7 @@ class PdfSource:
             # Head text: lấy các span ở 25% trên cùng trang, font to nhất
             top_spans = [
                 s for s in spans_list
-                if s.bbox[1] < 200  # y0 < 200 (phần trên trang)
+                if s.bbox[1] < (200 if s.is_ocr else 200 * 250 / 72)
             ]
             if top_spans:
                 top_spans.sort(key=lambda s: s.font_size, reverse=True)

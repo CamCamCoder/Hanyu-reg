@@ -23,7 +23,13 @@ from contextlib import contextmanager
 from datetime import date, datetime
 
 from hanzi_app.data import migrate
-from hanzi_app.data.models import LessonBoundary, ReviewOutcome, VocabRow, WordSource
+from hanzi_app.data.models import (
+    LessonBoundary,
+    ReviewOutcome,
+    VocabBlock,
+    VocabRow,
+    WordSource,
+)
 
 
 def _bay_gio() -> str:
@@ -152,11 +158,20 @@ class UserDb:
     def get_lesson_words(self, lesson_id: int) -> list[dict]:
         rows = self._conn.execute(
             "SELECT id, order_no, word, pos, pinyin_src, hanviet_src, "
-            "       meaning_src, source_page, extract_by, needs_review "
+            "       meaning_src, source_page, extract_by, needs_review, source_block_id "
             "FROM lesson_word WHERE lesson_id = ? ORDER BY order_no, id",
             (lesson_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_word_source_crop(self, lesson_word_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT ib.crop_path FROM lesson_word lw "
+            "JOIN import_block ib ON ib.id = lw.source_block_id "
+            "WHERE lw.id = ?",
+            (lesson_word_id,),
+        ).fetchone()
+        return None if row is None else row["crop_path"]
 
     def update_lesson_boundary(
         self,
@@ -210,29 +225,283 @@ class UserDb:
 
         Cột hanviet_src lấy nguyên văn từ bảng giáo trình.
         """
+        self.replace_vocab_many({lesson_id: rows})
+
+    def replace_vocab_many(
+        self, rows_by_lesson: dict[int, list[VocabRow]]
+    ) -> None:
+        """Thay bảng từ của nhiều bài trong cùng một giao dịch nguyên tử."""
         with self.transaction() as conn:
-            conn.execute("DELETE FROM lesson_word WHERE lesson_id = ?", (lesson_id,))
+            for lesson_id, rows in rows_by_lesson.items():
+                conn.execute(
+                    "DELETE FROM lesson_word WHERE lesson_id = ?",
+                    (lesson_id,),
+                )
+                conn.executemany(
+                    "INSERT INTO lesson_word (lesson_id, order_no, word, pos, "
+                    "                         pinyin_src, hanviet_src, meaning_src, source_page, "
+                    "                         extract_by, needs_review, source_block_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            lesson_id,
+                            r.order_no,
+                            r.word,
+                            r.pos,
+                            r.pinyin_src,
+                            r.hanviet_src,
+                            r.meaning_src,
+                            r.source_page,
+                            r.extract_by,
+                            int(r.needs_review),
+                            r.source_block_id,
+                        )
+                        for r in rows
+                    ],
+                )
+
+    # ------------------------------------------------ manifest block nhập từ mới
+    def replace_import_blocks(
+        self, lesson_id: int, blocks: list[VocabBlock]
+    ) -> list[dict]:
+        """Thay nguyên tử manifest block của một bài, trả các block đã lưu."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM import_block WHERE lesson_id = ?", (lesson_id,))
             conn.executemany(
-                "INSERT INTO lesson_word (lesson_id, order_no, word, pos, "
-                "                         pinyin_src, hanviet_src, meaning_src, source_page, "
-                "                         extract_by, needs_review) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO import_block ("
+                "lesson_id, block_no, page_index, bbox_x0, bbox_y0, bbox_x1, "
+                "bbox_y1, crop_path, expected_rows, first_order, last_order, "
+                "status, ai_attempts, region_decision, region_revision"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         lesson_id,
-                        r.order_no,
-                        r.word,
-                        r.pos,
-                        r.pinyin_src,
-                        r.hanviet_src,
-                        r.meaning_src,
-                        r.source_page,
-                        r.extract_by,
-                        int(r.needs_review),
+                        block.block_no,
+                        block.page_index,
+                        *block.bbox,
+                        block.crop_path,
+                        block.expected_rows,
+                        block.first_order,
+                        block.last_order,
+                        block.status,
+                        block.ai_attempts,
+                        "accepted" if block.status == "manual" and block.region_decision == "auto"
+                        else block.region_decision,
+                        block.region_revision,
                     )
-                    for r in rows
+                    for block in blocks
                 ],
             )
+        return self.get_import_blocks(lesson_id)
+
+    def get_import_blocks(self, lesson_id: int) -> list[dict]:
+        """Đọc manifest block theo thứ tự block_no, khôi phục bbox thành tuple."""
+        rows = self._conn.execute(
+            "SELECT id, lesson_id, block_no, page_index, bbox_x0, bbox_y0, "
+            "bbox_x1, bbox_y1, crop_path, expected_rows, first_order, last_order, "
+            "status, ai_attempts, region_decision, region_revision FROM import_block "
+            "WHERE lesson_id = ? ORDER BY block_no, id",
+            (lesson_id,),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "lesson_id": row["lesson_id"],
+                "block_no": row["block_no"],
+                "page_index": row["page_index"],
+                "bbox": (
+                    row["bbox_x0"], row["bbox_y0"],
+                    row["bbox_x1"], row["bbox_y1"],
+                ),
+                "crop_path": row["crop_path"],
+                "expected_rows": row["expected_rows"],
+                "first_order": row["first_order"],
+                "last_order": row["last_order"],
+                "status": row["status"],
+                "region_decision": row["region_decision"],
+                "region_revision": row["region_revision"],
+                "ai_attempts": row["ai_attempts"],
+            }
+            for row in rows
+        ]
+
+    def save_region_review(
+        self, lesson_id: int, page_index: int, bbox: tuple[float, float, float, float],
+        decision: str, block_id: int | None, revision: int, crop_path: str | None,
+        rows: list[VocabRow], status: str,
+    ) -> int:
+        """Commit one page selection and its OCR together without replacing neighbouring rows."""
+        if decision not in {"accepted", "skipped"} or not (0 <= bbox[0] < bbox[2] and 0 <= bbox[1] < bbox[3]):
+            raise ValueError("Khung bảng không hợp lệ")
+        with self.transaction() as conn:
+            lesson = conn.execute("SELECT book_id,page_start,page_end FROM lesson WHERE id=?", (lesson_id,)).fetchone()
+            if not lesson or not lesson["page_start"] <= page_index <= lesson["page_end"]:
+                raise ValueError("Trang nằm ngoài bài")
+            if block_id is None:
+                if decision == "skipped":
+                    raise ValueError("Chưa có vùng để bỏ qua")
+                block_id = conn.execute(
+                    "INSERT INTO import_block(lesson_id,block_no,page_index,bbox_x0,bbox_y0,bbox_x1,bbox_y1) "
+                    "SELECT ?,COALESCE(MAX(block_no),0)+1,?,?,?,?,? FROM import_block WHERE lesson_id=?",
+                    (lesson_id, page_index, *bbox, lesson_id),
+                ).lastrowid
+            updated = conn.execute(
+                "UPDATE import_block SET bbox_x0=?,bbox_y0=?,bbox_x1=?,bbox_y1=?,crop_path=?,"
+                "region_decision=?,region_revision=region_revision+1,status=?,expected_rows=NULL,"
+                "first_order=NULL,last_order=NULL,ai_attempts=0 "
+                "WHERE id=? AND lesson_id=? AND page_index=? AND region_revision=?",
+                (*bbox, crop_path, decision, status, block_id, lesson_id, page_index, revision),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Khung đã thay đổi, hãy mở lại trang")
+            conn.execute("UPDATE lesson_word SET needs_review=1 WHERE source_block_id=? AND extract_by='manual'",
+                         (block_id,))
+            self.replace_vocab_block(block_id, rows, preserve_manual=True)
+            self.set_import_state(lesson["book_id"], "review" if self.book_import_complete(lesson["book_id"]) else "incomplete")
+            return block_id
+
+    def repair_import_blocks(
+        self, lesson_id: int, repairs: list[tuple[int, VocabBlock]]
+    ) -> list[dict]:
+        with self.transaction() as conn:
+            if len({block_id for block_id, _block in repairs}) != len(repairs):
+                raise ValueError("Tr?ng id block c?n s?a")
+            for block_id, _block in repairs:
+                row = conn.execute(
+                    "SELECT * FROM import_block WHERE id = ?", (block_id,)
+                ).fetchone()
+                if row is None or row["lesson_id"] != lesson_id:
+                    raise ValueError("Block kh?ng thu?c b?i h?c")
+                if row["status"] == "manual" or row["region_decision"] != "auto":
+                    raise ValueError("Kh?ng th? t? ??ng s?a block th? c?ng")
+
+            for block_id, _block in repairs:
+                conn.execute(
+                    "DELETE FROM lesson_word WHERE source_block_id = ?",
+                    (block_id,),
+                )
+            for block_id, block in repairs:
+                conn.execute(
+                    "UPDATE import_block SET page_index = ?, bbox_x0 = ?, "
+                    "bbox_y0 = ?, bbox_x1 = ?, bbox_y1 = ?, crop_path = ?, "
+                    "expected_rows = ?, first_order = ?, last_order = ?, "
+                    "status = 'pending' WHERE id = ?",
+                    (
+                        block.page_index,
+                        *block.bbox,
+                        block.crop_path,
+                        block.expected_rows,
+                        block.first_order,
+                        block.last_order,
+                        block_id,
+                    ),
+                )
+        return self.get_import_blocks(lesson_id)
+
+    def delete_import_blocks(
+        self, lesson_id: int, block_ids: list[int]
+    ) -> list[dict]:
+        """Delete selected non-manual import blocks and their checkpointed rows."""
+        unique_ids = list(dict.fromkeys(block_ids))
+        if not unique_ids:
+            return self.get_import_blocks(lesson_id)
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT id, lesson_id, status, region_decision FROM import_block "
+                f"WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            ).fetchall()
+            found = {int(row["id"]): row for row in rows}
+            if set(found) != set(unique_ids):
+                raise ValueError("Co block can xoa khong ton tai")
+            if any(row["lesson_id"] != lesson_id for row in rows):
+                raise ValueError("Block khong thuoc bai hoc")
+            if any(row["status"] == "manual" or row["region_decision"] != "auto" for row in rows):
+                raise ValueError("Khong the tu dong xoa block thu cong")
+            conn.execute(
+                f"DELETE FROM lesson_word WHERE source_block_id IN ({placeholders})",
+                tuple(unique_ids),
+            )
+            conn.execute(
+                f"DELETE FROM import_block WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            )
+        return self.get_import_blocks(lesson_id)
+    def update_import_block(
+        self, block_id: int, *, status: str,
+        ai_attempts: int, crop_path: str | None
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE import_block SET status = ?, ai_attempts = ?, "
+                "crop_path = ? WHERE id = ?",
+                (status, ai_attempts, crop_path, block_id),
+            )
+
+    def replace_vocab_block(
+        self, block_id: int, rows: list[VocabRow], *, preserve_manual: bool = False
+    ) -> None:
+        """Thay các dòng đã checkpoint của đúng một block."""
+        with self.transaction() as conn:
+            block = conn.execute(
+                "SELECT lesson_id FROM import_block WHERE id = ?", (block_id,)
+            ).fetchone()
+            lesson_id = block["lesson_id"]
+            delete = "DELETE FROM lesson_word WHERE source_block_id = ?"
+            if preserve_manual:
+                manual = conn.execute(
+                    "SELECT word,order_no FROM lesson_word WHERE source_block_id=? AND extract_by='manual'",
+                    (block_id,),
+                ).fetchall()
+                words = {r["word"] for r in manual}
+                orders = {r["order_no"] for r in manual if r["order_no"] is not None}
+                rows = [r for r in rows if r.word not in words and r.order_no not in orders]
+                delete += " AND extract_by != 'manual'"
+            conn.execute(delete, (block_id,))
+            conn.executemany(
+                "INSERT INTO lesson_word ("
+                "lesson_id, order_no, word, pos, pinyin_src, hanviet_src, "
+                "meaning_src, source_page, extract_by, needs_review, source_block_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        lesson_id,
+                        row.order_no,
+                        row.word,
+                        row.pos,
+                        row.pinyin_src,
+                        row.hanviet_src,
+                        row.meaning_src,
+                        row.source_page,
+                        row.extract_by,
+                        int(row.needs_review),
+                        block_id,
+                    )
+                    for row in rows
+                ],
+            )
+
+    def book_import_complete(self, book_id: int) -> bool:
+        """Mọi bài dương phải có block và mọi block phải qua kiểm tra."""
+        row = self._conn.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM lesson WHERE book_id = ? AND index_no > 0"
+            ") AND EXISTS(SELECT 1 FROM import_block b JOIN lesson l ON b.lesson_id=l.id "
+            "WHERE l.book_id=? AND l.index_no>0 AND b.region_decision!='skipped'"
+            ") AND NOT EXISTS("
+            "SELECT 1 FROM lesson l WHERE l.book_id = ? AND l.index_no > 0 "
+            "AND ("
+            "NOT EXISTS(SELECT 1 FROM import_block ib WHERE ib.lesson_id = l.id) "
+            "OR EXISTS(SELECT 1 FROM import_block ib "
+            "WHERE ib.lesson_id = l.id "
+            "AND ib.region_decision != 'skipped' AND (ib.region_decision = 'review' "
+            "OR ib.status NOT IN ('local_ok', 'ai_ok', 'manual')))"
+            ")"
+            ")",
+            (book_id, book_id, book_id),
+        ).fetchone()
+        return bool(row[0])
 
     def word_source(self, word: str) -> WordSource | None:
         """Lần gặp ĐẦU TIÊN của từ này trong sách của người dùng.

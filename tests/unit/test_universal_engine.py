@@ -1,14 +1,102 @@
 """Unit test kiểm thử Bộ Xử Lý Tổng Quát 2 Lớp (Universal 2-Layer Engine)."""
 
+import hashlib
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
+import logging
 import pytest
 
-from hanzi_app.data.models import LessonBoundary, PageSummary, VocabRow
+from hanzi_app.adapter.aiclient import AiRateLimitError
+from hanzi_app.data.models import (
+    BlockCoverage,
+    BoundaryIssue,
+    BoundaryEvidence,
+    BoundaryReport,
+    LessonBoundary,
+    PageEvidence,
+    PageSummary,
+    SplitResult,
+    ExtractionResult,
+    TextSpan,
+    VocabBlock,
+    VocabRow,
+)
 from hanzi_app.data.userdb import UserDb
 import hanzi_app.service.importer as importer_module
-from hanzi_app.service.importer import VocabImporterWorker
+from hanzi_app.service.importer import (
+    BookImporterWorker,
+    VocabImporterWorker,
+    _write_crop_atomic,
+    collect_import_issues,
+    cleanup_import_issues,
+)
 from hanzi_app.service.splitter import Splitter, _parse_cn_num
 from hanzi_app.service.vocab import VocabExtractor
+
+
+def test_generic_import_never_accepts_sparse_lesson_sequence():
+    numbers = (1, 2, 3, 4, 8, 12, 13, 14)
+    boundaries = [
+        LessonBoundary(
+            number,
+            f"Lesson {number}",
+            index * 10,
+            index * 10 + 9,
+            0.6,
+            "lesson",
+        )
+        for index, number in enumerate(numbers)
+    ]
+
+    report = Splitter().validate(boundaries, (), total_pages=144)
+
+    assert report.valid is False
+    assert report.missing_lesson_nos == (5, 6, 7, 9, 10, 11)
+
+
+def test_generic_multi_block_book_is_complete_only_after_every_block(monkeypatch):
+    row_counts = (5, 4, 6, 3, 2, 7)
+    blocks = [
+        VocabBlock(
+            index,
+            1,
+            index,
+            index,
+            (0, 0, 100, 200),
+            f"block-{index}.png",
+            count,
+            1,
+            count,
+        )
+        for index, count in enumerate(row_counts, start=1)
+    ]
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor,
+        "_extract_local_block",
+        lambda _pdf, block: [
+            VocabRow(
+                order_no=order,
+                word=f"词{block.id}-{order}",
+                pinyin_src="cí",
+                pos=None,
+                hanviet_src=None,
+                meaning_src=None,
+                source_page=block.page_index + 1,
+                extract_by="regex",
+                needs_review=False,
+                review_reason=None,
+                source_block_id=block.id,
+            )
+            for order in range(1, block.expected_rows + 1)
+        ],
+    )
+
+    result = extractor.extract_blocks(MagicMock(), blocks)
+
+    assert result.complete is True
+    assert sum(coverage.final_rows for coverage in result.coverage) == 27
 
 
 def test_parse_cn_num_composite():
@@ -20,6 +108,474 @@ def test_parse_cn_num_composite():
     assert _parse_cn_num("十二") == 12
     assert _parse_cn_num("二十") == 20
     assert _parse_cn_num("二十一") == 21
+
+
+def test_splitter_calls_ai_only_for_invalid_local_result():
+    """A single-source local split is repaired with one bounded Vision request."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.return_value = [
+        {"index_no": 1, "title": "One", "page_start": 0},
+        {"index_no": 2, "title": "Two", "page_start": 5},
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert client.split_lessons_from_image.call_count == 1
+
+
+def test_splitter_skips_ai_for_valid_two_source_local_result():
+    """Validated TOC plus heading evidence must not consume an AI request."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    evidence = [
+        PageEvidence(0, "scan", "Contents", "i", "1 One 001\n2 Two 005", None, None, None, True),
+        PageEvidence(5, "scan", "Lesson 1 One", "1", None, 1, 1, "Lesson 1 One", False),
+        PageEvidence(9, "scan", "Lesson 2 Two", "5", None, 5, 2, "Lesson 2 Two", False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert client.split_lessons_from_image.call_count == 0
+
+
+def test_splitter_keeps_local_boundaries_that_ai_omits():
+    """A partial AI reply cannot erase a locally detected later lesson."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.return_value = [
+        {"index_no": 1, "title": "One", "page_start": 0},
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(5, "scan", "Lesson 2", "5", None, 5, 2, "Lesson 2", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    result = Splitter().propose(
+        [], evidence, ai_client=client, evidence_image=b"sheet"
+    )
+
+    assert result.report.valid is True
+    assert [boundary.index_no for boundary in result.boundaries] == [1, 2]
+
+
+def test_book_worker_does_not_persist_invalid_boundaries(tmp_path):
+    """An invalid boundary report must abort before the destructive replace."""
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Test book", "book.pdf", "split-invalid", 40)
+    issue = BoundaryIssue("missing_lesson", "error", 2, None, "Lesson 2 missing")
+    fake_result = SplitResult(
+        (), (), BoundaryReport(False, (issue,), (2,)), True
+    )
+    worker = BookImporterWorker("book.pdf", db.path)
+
+    with pytest.raises(RuntimeError, match="Lesson 2 missing"):
+        worker._store_boundaries_or_raise(db, book_id, fake_result)
+    assert db.get_lessons(book_id) == []
+    db.close()
+
+
+def test_ai_merge_preserves_prior_evidence_for_review():
+    """Vision evidence augments the detailed local audit trail instead of replacing it."""
+    original = (
+        BoundaryEvidence("toc", 0, 1, "One", 0.75, "printed page 1"),
+        BoundaryEvidence("heading", 0, 1, "One", 0.8, "Lesson 1 One"),
+        BoundaryEvidence("layout", 0, 1, "One", 0.7, "opening-grid"),
+    )
+    previous = SplitResult(
+        (LessonBoundary(1, "One", 0, 9, 0.8, "lesson"),),
+        original,
+        BoundaryReport(True, (), ()),
+        False,
+    )
+
+    result = Splitter()._merge_ai_candidates(
+        previous, [{"index_no": 1, "title": "One", "page_start": 0}], 10
+    )
+
+    assert result.evidence[:3] == original
+    assert result.evidence[-1].source == "ai"
+
+
+def test_splitter_retry_receives_validator_issues():
+    """The retry prompt must name the actual validator failure from the first reply."""
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.split_lessons_from_image.side_effect = [
+        [],
+        [{"index_no": 1, "title": "One", "page_start": 0}],
+    ]
+    evidence = [
+        PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+        PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+    ]
+
+    Splitter().propose([], evidence, ai_client=client, evidence_image=b"sheet")
+
+    assert client.split_lessons_from_image.call_args_list[1].kwargs["issue_context"] == (
+        "Vision returned no lesson boundaries."
+    )
+
+
+def test_worker_persists_ai_budget_across_two_failed_runs(tmp_path, monkeypatch):
+    """Two failed runs of one existing book can spend only its lifetime budget of two."""
+    pdf_path = tmp_path / "book.pdf"
+    pdf_path.write_bytes(b"same-book")
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book(
+        "Book", str(pdf_path), hashlib.md5(b"same-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class EmptyAi:
+        calls = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            type(self).calls += 1
+            return []
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", EmptyAi)
+
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+
+    checked = UserDb(str(tmp_path / "user.sqlite"))
+    assert EmptyAi.calls == 2
+    assert checked.get_setting(
+        f"import.split_ai_calls.{hashlib.md5(b'same-book').hexdigest()}"
+    ) == "2"
+    checked.close()
+
+
+def test_worker_scopes_ai_budget_to_file_hash_after_new_book_deletion(
+    tmp_path, monkeypatch
+):
+    """Deleted-book IDs must neither reset one PDF nor exhaust a different PDF."""
+    pdf_a = tmp_path / "a.pdf"
+    pdf_b = tmp_path / "b.pdf"
+    pdf_a.write_bytes(b"pdf-a")
+    pdf_b.write_bytes(b"pdf-b")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class EmptyAi:
+        calls = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            type(self).calls += 1
+            return []
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", EmptyAi)
+
+    BookImporterWorker(pdf_a, db_path).run()
+    BookImporterWorker(pdf_b, db_path).run()
+    BookImporterWorker(pdf_a, db_path).run()
+
+    hash_a = hashlib.md5(b"pdf-a").hexdigest()
+    hash_b = hashlib.md5(b"pdf-b").hexdigest()
+    checked = UserDb(db_path)
+    assert EmptyAi.calls == 4
+    assert checked.get_setting(f"import.split_ai_calls.{hash_a}") == "2"
+    assert checked.get_setting(f"import.split_ai_calls.{hash_b}") == "2"
+    checked.close()
+
+
+def test_worker_counts_an_ai_call_that_raises(tmp_path, monkeypatch):
+    """A request that raises still consumes one of the book's two AI calls."""
+    pdf_path = tmp_path / "raises.pdf"
+    pdf_path.write_bytes(b"raising-book")
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book(
+        "Book", str(pdf_path), hashlib.md5(b"raising-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+                PageEvidence(9, "scan", "Appendix", "9", None, 9, None, None, False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b"sheet"
+
+    class RaisingAi:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_configured(self):
+            return True
+
+        def split_lessons_from_image(self, *_args, **_kwargs):
+            raise RuntimeError("AI failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "AiClient", RaisingAi)
+    BookImporterWorker(pdf_path, db_path).run()
+
+    checked = UserDb(db_path)
+    assert checked.get_setting(
+        f"import.split_ai_calls.{hashlib.md5(b'raising-book').hexdigest()}"
+    ) == "1"
+    assert checked.get_book(book_id)["import_state"] == "review_bounds"
+    checked.close()
+
+
+def test_worker_restores_existing_book_state_when_census_fails(tmp_path, monkeypatch):
+    """A failed retry restores its previous state instead of leaving an importing book."""
+    pdf_path = tmp_path / "existing.pdf"
+    pdf_path.write_bytes(b"existing-book")
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book(
+        "Existing", str(pdf_path), hashlib.md5(b"existing-book").hexdigest(), 10
+    )
+    db.set_import_state(book_id, "review_bounds")
+    db.close()
+
+    class FailingPdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            raise RuntimeError("census failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FailingPdfSource)
+    BookImporterWorker(pdf_path, str(tmp_path / "user.sqlite")).run()
+
+    checked = UserDb(str(tmp_path / "user.sqlite"))
+    assert checked.get_book(book_id)["import_state"] == "review_bounds"
+    checked.close()
+
+
+def test_worker_deletes_new_book_when_census_fails(tmp_path, monkeypatch):
+    """A book created during a failed split is removed rather than stranded importing."""
+    pdf_path = tmp_path / "new.pdf"
+    pdf_path.write_bytes(b"new-book")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FailingPdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            raise RuntimeError("census failed")
+
+    monkeypatch.setattr(importer_module, "PdfSource", FailingPdfSource)
+    BookImporterWorker(pdf_path, db_path).run()
+
+    checked = UserDb(db_path)
+    assert checked.get_books() == []
+    checked.close()
+
+
+def test_worker_emits_the_split_result(tmp_path, monkeypatch):
+    """The phase-one signal exposes the reviewed result, including its evidence."""
+    pdf_path = tmp_path / "signal.pdf"
+    pdf_path.write_bytes(b"signal-book")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return [
+                PageEvidence(0, "scan", "Lesson 1", "1", None, 1, 1, "Lesson 1", False),
+            ]
+
+        def boundary_contact_sheet(self, _evidence):
+            return b""
+
+    received = []
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    worker = BookImporterWorker(pdf_path, db_path)
+    worker.boundaries_ready.connect(
+        lambda book_id, title, result: received.append((book_id, title, result))
+    )
+    worker.run()
+
+    assert len(received) == 1
+    assert isinstance(received[0][2], SplitResult)
+    assert received[0][2].evidence[0].source == "heading"
+
+
+def test_worker_emits_invalid_conflict_for_manual_repair_without_db_lessons(
+    tmp_path, monkeypatch
+):
+    pdf_path = tmp_path / "conflict.pdf"
+    pdf_path.write_bytes(b"conflicting-boundaries")
+    db_path = str(tmp_path / "user.sqlite")
+    UserDb(db_path).close()
+    boundary = LessonBoundary(1, "One", 2, 9, 0.9, "lesson")
+    issue = BoundaryIssue(
+        "toc_heading_conflict", "error", 1, None, "sources conflict"
+    )
+    result = SplitResult(
+        (boundary,),
+        (
+            BoundaryEvidence("toc", 2, 1, "One", 0.8, "toc"),
+            BoundaryEvidence("heading", 4, 1, "One", 0.8, "heading"),
+        ),
+        BoundaryReport(False, (issue,), ()),
+        True,
+    )
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def page_count(self):
+            return 10
+
+        def page_census(self):
+            return []
+
+        def boundary_contact_sheet(self, _evidence):
+            return b""
+
+    class ConflictingSplitter:
+        ai_calls_used = 0
+
+        def propose(self, *_args, **_kwargs):
+            return result
+
+    received = []
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "Splitter", ConflictingSplitter)
+    worker = BookImporterWorker(pdf_path, db_path)
+    worker.boundaries_ready.connect(
+        lambda book_id, title, split_result: received.append(
+            (book_id, title, split_result)
+        )
+    )
+    worker.run()
+
+    assert len(received) == 1
+    assert received[0][2] == result
+    checked = UserDb(db_path)
+    assert checked.get_lessons(received[0][0]) == []
+    assert checked.get_book(received[0][0])["import_state"] == "review_bounds"
+    checked.close()
 
 
 def test_splitter_top_20_percent_header():
@@ -111,7 +667,7 @@ def test_vision_empty_response_is_failure_not_valid_empty_vocab(monkeypatch):
 
 
 def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     """Resume must preserve completed lessons and must not mark a partial book review."""
     db_path = str(tmp_path / "user.sqlite")
@@ -162,7 +718,8 @@ def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
         book_id, "boya.pdf", db_path, api_key="test-key"
     )
     worker.failed_import.connect(errors.append)
-    worker.run()
+    with caplog.at_level(logging.ERROR, logger="hanzi_app.service.importer"):
+        worker.run()
 
     checked = UserDb(db_path)
     assert [row["word"] for row in checked.get_lesson_words(lesson_1["id"])] == [
@@ -172,6 +729,15 @@ def test_vocab_import_resumes_after_existing_lesson_and_stops_on_empty(
     assert checked.get_book(book_id)["import_state"] == "review_bounds"
     checked.close()
     assert errors and "Bài 2" in errors[0]
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "hanzi_app.service.importer"
+    ]
+    assert records
+    assert records[-1].exc_info is not None
+    assert "Vocabulary import failed" in records[-1].getMessage()
+
 
 
 def test_multi_page_lesson_uses_one_combined_vision_request():
@@ -425,3 +991,1251 @@ def test_vocab_locator_nhan_header_sinh_tu_bi_tach_span():
             self.text = text
 
     assert VocabExtractor.is_vocab_page([Span("生"), Span("词")])
+
+def test_crop_writer_is_atomic_and_uses_block_path(tmp_path):
+    data = b"png-with-stable-content"
+
+    path = _write_crop_atomic(tmp_path, 4, 9, 2, data)
+
+    stored = Path(path).read_bytes()
+    assert stored == data
+    assert hashlib.sha256(stored).hexdigest() == hashlib.sha256(data).hexdigest()
+    assert Path(path).as_posix().endswith("book-4/lesson-9/block-2.png")
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_crop_writer_cleans_temp_and_preserves_previous_crop_on_replace_failure(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "book-4" / "lesson-9" / "block-2.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"previous")
+
+    def fail_replace(_self, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _write_crop_atomic(tmp_path, 4, 9, 2, b"new")
+
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.rglob("*.tmp"))
+
+def test_vocab_ai_budget_gives_each_pending_block_one_attempt(monkeypatch):
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"crop"
+    blocks = [
+        VocabBlock(
+            i + 1, 2, i + 1, i, (0, 0, 100, 200),
+            f"block-{i + 1}.png", 2, i * 2 + 1, i * 2 + 2,
+        )
+        for i in range(4)
+    ]
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.return_value = []
+
+    result = extractor.extract_blocks(pdf, blocks, ai_client=client)
+
+    assert result.complete is False
+    assert result.ai_attempts == 4
+    assert client.extract_vocab_from_image.call_count == 4
+
+
+def test_429_result_carries_consumed_attempt(monkeypatch):
+    block = VocabBlock(
+        9, 2, 1, 4, (0, 0, 100, 200),
+        "block.png", 2, 1, 2,
+    )
+    extractor = VocabExtractor()
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.side_effect = AiRateLimitError()
+
+    result = extractor.extract_blocks(MagicMock(), [block], client)
+
+    assert result.complete is False
+    assert result.ai_attempts == 1
+    assert result.blocks[0].ai_attempts == 1
+    assert result.blocks[0].status == "incomplete"
+    assert "rate_limited" in result.coverage[0].issues
+
+
+def test_collect_import_issues_groups_whole_book_failures(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Issues", "book.pdf", "issue-report", 40)
+    db.replace_lessons(
+        book_id,
+        [
+            LessonBoundary(1, "Missing rows", 0, 4, 1.0, "lesson"),
+            LessonBoundary(2, "Grammar table", 5, 9, 1.0, "lesson"),
+            LessonBoundary(3, "No blocks", 10, 14, 1.0, "lesson"),
+        ],
+    )
+    lesson_1, lesson_2, _lesson_3 = db.get_lessons(book_id)
+    block_1 = db.replace_import_blocks(lesson_1["id"], [
+        VocabBlock(None, lesson_1["id"], 1, 1, (0, 0, 100, 200), "b1.png", 2, 1, 2,
+                   "incomplete", 4)
+    ])[0]
+    db.replace_vocab_block(block_1["id"], [
+        VocabRow(1, "音", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block_1["id"]),
+    ])
+    block_2 = db.replace_import_blocks(lesson_2["id"], [
+        VocabBlock(None, lesson_2["id"], 1, 6, (0, 0, 100, 200), "b2.png", 3, None, None,
+                   "incomplete", 1)
+    ])[0]
+    db.replace_vocab_block(block_2["id"], [
+        VocabRow(1, "名词", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+        VocabRow(2, "动词", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+        VocabRow(3, "形容", None, None, None, 6, "regex", True, "ocr",
+                 source_block_id=block_2["id"]),
+    ])
+
+    issues = collect_import_issues(db, book_id)
+
+    by_lesson = {item["lesson_no"]: item for item in issues}
+    assert set(by_lesson) == {1, 2, 3}
+    assert by_lesson[1]["issues"] == (
+        "INCOMPLETE_BLOCK", "MISSING_ORDERS", "ROW_COUNT_MISMATCH",
+        "OCR_NOISE", "AI_EXHAUSTED",
+    )
+    assert by_lesson[1]["sample_words"] == ("音",)
+    assert "GRAMMAR_TABLE_FALSE_POSITIVE" in by_lesson[2]["issues"]
+    assert by_lesson[3]["issues"] == ("NO_BLOCKS",)
+    db.close()
+
+def test_collect_import_issues_flags_local_ok_ocr_noise(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Hidden OCR noise", "book.pdf", "hidden-ocr-noise", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 200), "b4.png", 2, None, None,
+                   "local_ok", 0)
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "fragment-a", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block["id"]),
+        VocabRow(2, "fragment-b", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=block["id"]),
+    ])
+
+    issues = collect_import_issues(db, book_id)
+
+    assert len(issues) == 1
+    assert issues[0]["issues"] == ("OCR_NOISE",)
+    assert issues[0]["status"] == "local_ok"
+    db.close()
+
+
+def test_cleanup_import_issues_removes_local_ok_ocr_noise_when_lesson_has_other_blocks(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup local noise", "book.pdf", "cleanup-local-noise", 20)
+    db.replace_lessons(book_id, [LessonBoundary(15, "Fifteen", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, noisy = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "good.png", 1, 1, 1,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (100, 0, 200, 100), "noise.png", 2, None, None,
+                   "local_ok", 0),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "real", "real", None, "real", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    db.replace_vocab_block(noisy["id"], [
+        VocabRow(1, "fragment-a", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=noisy["id"]),
+        VocabRow(2, "fragment-b", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=noisy["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 15,
+        "removed_block_ids": (noisy["id"],),
+        "removed_block_nos": (2,),
+        "reason": "LOCAL_OK_OCR_NOISE_FALSE_POSITIVE",
+    }]
+    assert collect_import_issues(db, book_id) == []
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["real"]
+    db.close()
+
+def test_cleanup_import_issues_removes_false_positive_blocks_only(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup", "book.pdf", "cleanup", 20)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, bad = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "good.png", 1, 1, 1,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 2, (0, 0, 100, 100), "bad.png", 3, None, None,
+                   "incomplete", 2),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "你好", None, None, None, 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    db.replace_vocab_block(bad["id"], [
+        VocabRow(1, "名词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(2, "动词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(3, "形容词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 1,
+        "removed_block_ids": (bad["id"],),
+        "removed_block_nos": (2,),
+        "reason": "GRAMMAR_TABLE_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["你好"]
+    db.close()
+
+
+
+
+
+def _cleanup_span(text, x, y, width=48):
+    return TextSpan(text, (x, y, x + width, y + 18), 14)
+
+
+def _cleanup_vocab_region():
+    return [
+        _cleanup_span("New Words", 20, 40, 90),
+        _cleanup_span("1", 20, 90, 18),
+        _cleanup_span("你好", 80, 90, 48),
+        _cleanup_span("nihao", 150, 90, 60),
+        _cleanup_span("xin chao", 260, 90, 80),
+        _cleanup_span("2", 20, 125, 18),
+        _cleanup_span("老师", 80, 125, 48),
+        _cleanup_span("laoshi", 150, 125, 60),
+        _cleanup_span("giao vien", 260, 125, 80),
+    ]
+
+def test_cleanup_import_issues_removes_stale_locator_false_positive(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup stale", "book.pdf", "cleanup-stale", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    good, stale = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (12, 82, 270, 150), "good.png", 2, 1, 2,
+                   "ai_ok", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (500, 500, 800, 700), "stale.png", 2, 2, 3,
+                   "incomplete", 4),
+    ])
+    db.replace_vocab_block(good["id"], [
+        VocabRow(1, "你好", "nihao", None, "xin chao", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+        VocabRow(2, "老师", "laoshi", None, "giao vien", 1, "vision", False, None,
+                 source_block_id=good["id"]),
+    ])
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _cleanup_vocab_region()
+
+    actions = cleanup_import_issues(db, book_id, pdf=pdf)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 4,
+        "removed_block_ids": (stale["id"],),
+        "removed_block_nos": (2,),
+        "reason": "STALE_LOCATOR_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [good["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["你好", "老师"]
+    db.close()
+
+
+def test_cleanup_import_issues_keeps_issue_still_supported_by_locator(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup keep", "book.pdf", "cleanup-keep", 20)
+    db.replace_lessons(book_id, [LessonBoundary(9, "Nine", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (12, 82, 270, 150), "real.png", 2, 1, 2,
+                   "incomplete", 1),
+    ])[0]
+    pdf = MagicMock()
+    pdf.page_count.return_value = 1
+    pdf.spans.return_value = _cleanup_vocab_region()
+
+    actions = cleanup_import_issues(db, book_id, pdf=pdf)
+
+    assert actions == []
+
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [block["id"]]
+    db.close()
+
+def test_cleanup_import_issues_reconciles_checkpointed_block_metadata(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup reconcile", "book.pdf", "cleanup-reconcile", 20)
+    db.replace_lessons(book_id, [LessonBoundary(20, "Twenty", 100, 109, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 2, 103, (0, 0, 100, 100), "b20.png", 2, None, None,
+                   "ai_ok", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "alpha", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(2, "beta", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(3, "gamma", None, None, None, 104, "vision", False, None,
+                 source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == ("ROW_COUNT_MISMATCH",)
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 20,
+        "block_id": block["id"],
+        "block_no": 2,
+        "reason": "RECONCILED_CHECKPOINTED_BLOCK",
+        "issues_before": ("ROW_COUNT_MISMATCH",),
+        "expected_rows_before": 2,
+        "expected_rows_after": 3,
+        "status_after": "ai_ok",
+        "saved_rows": 3,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 3
+    assert repaired["status"] == "ai_ok"
+    assert repaired["ai_attempts"] == 1
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "alpha", "beta", "gamma",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_reconciles_trusted_ai_rows_without_range(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup trusted rows", "book.pdf", "cleanup-trusted", 20)
+    db.replace_lessons(book_id, [LessonBoundary(9, "Nine", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b9.png", 4, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "教室", "jiàoshì", "n.", "phòng học", 1, "vision", True, None,
+                 hanviet_src="giáo thất", source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "ROW_COUNT_MISMATCH",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 9,
+        "block_id": block["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_TRUSTED_AI_ROWS_WITHOUT_RANGE",
+        "issues_before": ("INCOMPLETE_BLOCK", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 4,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 1
+    assert repaired["status"] == "ai_ok"
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["教室"]
+    db.close()
+
+def test_cleanup_import_issues_does_not_remove_all_blocks(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup skip", "book.pdf", "cleanup-skip", 20)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    bad = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 2, (0, 0, 100, 100), "bad.png", 2, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(bad["id"], [
+        VocabRow(1, "名词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+        VocabRow(2, "动词", None, None, None, 2, "regex", True, "grammar",
+                 source_block_id=bad["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 1,
+        "removed_block_ids": (),
+        "removed_block_nos": (),
+        "reason": "SKIPPED_ALL_BLOCKS_FALSE_POSITIVE",
+    }]
+    assert [block["id"] for block in db.get_import_blocks(lesson["id"])] == [bad["id"]]
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["名词", "动词"]
+    db.close()
+
+
+
+def test_cleanup_import_issues_dedupes_ai_rows_by_order(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup duplicate AI", "book.pdf", "cleanup-dup-ai", 20)
+    db.replace_lessons(book_id, [LessonBoundary(4, "Four", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 3, 0, (0, 0, 100, 100), "b4.png", 5, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(7, "room", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(8, "husband", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(9, "beside", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(10, "really", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(11, "pink_color", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+        VocabRow(11, "pink", None, None, None, 1, "vision", True, "substring duplicate",
+                 source_block_id=block["id"]),
+        VocabRow(12, "color", None, None, None, 1, "vision", False, None,
+                 source_block_id=block["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "DUPLICATE_ORDERS", "ROW_COUNT_MISMATCH",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 4,
+        "block_id": block["id"],
+        "block_no": 3,
+        "reason": "RECONCILED_DEDUPED_AI_ROWS",
+        "issues_before": ("INCOMPLETE_BLOCK", "DUPLICATE_ORDERS", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 5,
+        "expected_rows_after": 6,
+        "status_after": "ai_ok",
+        "saved_rows": 6,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["expected_rows"] == 6
+    assert repaired["status"] == "ai_ok"
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "room", "husband", "beside", "really", "pink_color", "color",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_shrinks_range_when_missing_order_is_in_sibling_block(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup sibling range", "book.pdf", "cleanup-sibling", 20)
+    db.replace_lessons(book_id, [LessonBoundary(22, "Twenty Two", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block_1, block_2 = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b22-1.png", 2, 6, 7,
+                   "incomplete", 1),
+        VocabBlock(None, lesson["id"], 2, 0, (100, 0, 200, 100), "b22-2.png", 1, 7, 7,
+                   "ai_ok", 1),
+    ])
+    db.replace_vocab_block(block_1["id"], [
+        VocabRow(1, "ocr_noise", None, None, None, 1, "regex", True, "out of range",
+                 source_block_id=block_1["id"]),
+        VocabRow(6, "sunny", None, None, None, 1, "vision", False, None,
+                 source_block_id=block_1["id"]),
+    ])
+    db.replace_vocab_block(block_2["id"], [
+        VocabRow(7, "hundred", None, None, None, 1, "vision", False, None,
+                 source_block_id=block_2["id"]),
+    ])
+
+    assert collect_import_issues(db, book_id)[0]["issues"] == (
+        "INCOMPLETE_BLOCK", "MISSING_ORDERS",
+    )
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 22,
+        "block_id": block_1["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_RANGE_SPLIT_BY_SIBLING_BLOCK",
+        "issues_before": ("INCOMPLETE_BLOCK", "MISSING_ORDERS"),
+        "expected_rows_before": 2,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    blocks = db.get_import_blocks(lesson["id"])
+    assert blocks[0]["first_order"] == 6
+    assert blocks[0]["last_order"] == 6
+    assert blocks[0]["expected_rows"] == 1
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == [
+        "sunny", "hundred",
+    ]
+    db.close()
+
+
+def test_cleanup_import_issues_keeps_ai_rows_and_drops_regex_noise_without_range(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup mixed AI", "book.pdf", "cleanup-mixed-ai", 20)
+    db.replace_lessons(book_id, [LessonBoundary(13, "Thirteen", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 0, (0, 0, 100, 100), "b13.png", None, None, None,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "header", None, None, None, 1, "regex", True, "heading",
+                 source_block_id=block["id"]),
+        VocabRow(1, "can", "keyi", None, "can", 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(2, "fragment", None, None, None, 1, "regex", True, "fragment",
+                 source_block_id=block["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 13,
+        "block_id": block["id"],
+        "block_no": 1,
+        "reason": "RECONCILED_AI_ROWS_DROPPED_REGEX_NOISE",
+        "issues_before": ("INCOMPLETE_BLOCK", "DUPLICATE_ORDERS"),
+        "expected_rows_before": None,
+        "expected_rows_after": 1,
+        "status_after": "ai_ok",
+        "saved_rows": 1,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["can"]
+    db.close()
+
+
+def test_cleanup_import_issues_replaces_stale_range_with_contiguous_ai_rows(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Cleanup stale range", "book.pdf", "cleanup-stale-range", 20)
+    db.replace_lessons(book_id, [LessonBoundary(7, "Seven", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    block = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 2, 0, (0, 0, 100, 100), "b7.png", 2, 6, 7,
+                   "incomplete", 1),
+    ])[0]
+    db.replace_vocab_block(block["id"], [
+        VocabRow(1, "noise", None, None, None, 1, "regex", True, "noise",
+                 source_block_id=block["id"]),
+        VocabRow(18, "at", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(19, "home", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+        VocabRow(20, "inside", None, None, None, 1, "vision", True, None,
+                 source_block_id=block["id"]),
+    ])
+
+    actions = cleanup_import_issues(db, book_id)
+
+    assert actions == [{
+        "lesson_id": lesson["id"],
+        "lesson_no": 7,
+        "block_id": block["id"],
+        "block_no": 2,
+        "reason": "RECONCILED_AI_ROWS_REPLACED_STALE_RANGE",
+        "issues_before": ("INCOMPLETE_BLOCK", "MISSING_ORDERS", "ROW_COUNT_MISMATCH"),
+        "expected_rows_before": 2,
+        "expected_rows_after": 3,
+        "status_after": "ai_ok",
+        "saved_rows": 3,
+    }]
+    assert collect_import_issues(db, book_id) == []
+    [repaired] = db.get_import_blocks(lesson["id"])
+    assert repaired["first_order"] == 18
+    assert repaired["last_order"] == 20
+    assert [row["word"] for row in db.get_lesson_words(lesson["id"])] == ["at", "home", "inside"]
+    db.close()
+
+def test_vocab_import_runs_cleanup_before_final_state(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Cleanup in worker", "book.pdf", "worker-cleanup", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 0, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_page_crop_image_bytes(self, _page, _bbox, dpi=200):
+            return b"crop"
+
+    class FakeExtractor:
+        def __init__(self, _dict_db=None):
+            self.lesson_ai_attempts = 0
+
+        def locate_blocks(self, _pdf, boundary):
+            return [
+                VocabBlock(
+                    None, lesson["id"], 1, 0, (0, 0, 100, 100),
+                    None, 4, None, None,
+                )
+            ]
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            block = pending[0]
+            row = VocabRow(
+                1, "教室", "jiàoshì", "n.", "phòng học", 1,
+                "vision", True, None, source_block_id=block.id,
+            )
+            coverage = BlockCoverage(
+                block.id, 4, 0, 1, 1, (), ("expected_row_mismatch",), False
+            )
+            return ExtractionResult(
+                (row,), (coverage,),
+                (replace(block, status="incomplete", ai_attempts=1),),
+                1, False,
+            )
+
+        def reconcile_checkpointed_block(self, block, rows):
+            return replace(block, expected_rows=len(rows), status="ai_ok"), rows
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    finished = []
+    errors = []
+    worker.finished_import.connect(lambda bid, title: finished.append((bid, title)))
+    worker.failed_import.connect(errors.append)
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    assert errors == []
+    assert finished == [(book_id, "Cleanup in worker")]
+    assert reopened.get_book(book_id)["import_state"] == "review"
+    [block] = reopened.get_import_blocks(lesson["id"])
+    assert block["status"] == "ai_ok"
+    assert block["expected_rows"] == 1
+    assert [row["word"] for row in reopened.get_lesson_words(lesson["id"])] == ["教室"]
+    reopened.close()
+
+def test_vocab_import_skips_incomplete_block_and_continues_later_lessons(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Skip errors", "book.pdf", "skip-errors", 20)
+    db.replace_lessons(
+        book_id,
+        [
+            LessonBoundary(1, "One", 0, 4, 1.0, "lesson"),
+            LessonBoundary(2, "Two", 5, 9, 1.0, "lesson"),
+        ],
+    )
+    lesson_1, lesson_2 = db.get_lessons(book_id)
+    block_1 = db.replace_import_blocks(lesson_1["id"], [
+        VocabBlock(None, lesson_1["id"], 4, 1, (0, 0, 100, 200), "b1.png", 3, 1, 3)
+    ])[0]
+    block_2 = db.replace_import_blocks(lesson_2["id"], [
+        VocabBlock(None, lesson_2["id"], 1, 6, (0, 0, 100, 200), "b2.png", 2, 1, 2)
+    ])[0]
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    seen = []
+
+    class FakeExtractor:
+        def __init__(self, _dict_db=None):
+            pass
+
+        def locate_blocks(self, _pdf, _boundary):
+            return []
+
+        def reconcile_checkpointed_block(self, _block, _rows):
+            return None
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            block = pending[0]
+            seen.append(block.lesson_id)
+            if block.lesson_id == lesson_1["id"]:
+                row = VocabRow(
+                    1, "partial", None, None, None, 1, "vision", True,
+                    "missing", source_block_id=block.id,
+                )
+                coverage = BlockCoverage(
+                    block.id, 3, 0, 1, 1, (2, 3), ("missing_orders",), False
+                )
+                return ExtractionResult(
+                    (row,), (coverage,),
+                    (replace(block, status="incomplete", ai_attempts=1),),
+                    1, False,
+                )
+            rows = (
+                VocabRow(1, "done-1", None, None, None, 6, "vision", False, None,
+                         source_block_id=block.id),
+                VocabRow(2, "done-2", None, None, None, 6, "vision", False, None,
+                         source_block_id=block.id),
+            )
+            coverage = BlockCoverage(block.id, 2, 0, 2, 2, (), (), True)
+            return ExtractionResult(
+                rows, (coverage,), (replace(block, status="ai_ok", ai_attempts=1),),
+                1, True,
+            )
+
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    finished = []
+    errors = []
+    worker.finished_import.connect(lambda bid, title: finished.append((bid, title)))
+    worker.failed_import.connect(errors.append)
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    assert errors == []
+    assert finished == [(book_id, "Skip errors")]
+    assert seen == [lesson_1["id"], lesson_2["id"]]
+    assert reopened.get_book(book_id)["import_state"] == "incomplete"
+    assert reopened.get_import_blocks(lesson_1["id"])[0]["status"] == "incomplete"
+    assert reopened.get_import_blocks(lesson_2["id"])[0]["status"] == "ai_ok"
+    assert [row["word"] for row in reopened.get_lesson_words(lesson_2["id"])] == [
+        "done-1", "done-2"
+    ]
+    reopened.close()
+def test_429_keeps_completed_block_and_resume_skips_it(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Sách thử", "book.pdf", "resume-429", 20)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    blocks = db.replace_import_blocks(lesson_id, [
+        VocabBlock(
+            None, lesson_id, 1, 1, (0, 0, 100, 200),
+            "done.png", 1, 1, 1,
+        ),
+        VocabBlock(
+            None, lesson_id, 2, 3, (0, 0, 100, 200),
+            "pending.png", 2, 2, 3,
+        ),
+    ])
+    db.replace_vocab_block(
+        blocks[0]["id"],
+        [VocabRow(
+            1, "你好", "nǐhǎo", None, None, 2,
+            "regex", False, None,
+        )],
+    )
+    db.update_import_block(
+        blocks[0]["id"], status="local_ok", ai_attempts=0,
+        crop_path=blocks[0]["crop_path"],
+    )
+    db.close()
+
+    class FakePdfSource:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeExtractor:
+        def __init__(self, _dict_db=None):
+            pass
+
+        def locate_blocks(self, _pdf, _boundary):
+            return []
+
+        def reconcile_checkpointed_block(self, _block, _rows):
+            return None
+
+        def extract_blocks(self, _pdf, pending, ai_client=None):
+            assert [block.block_no for block in pending] == [2]
+            try:
+                ai_client.extract_vocab_from_image(b"pending")
+            except AiRateLimitError:
+                updated = replace(
+                    pending[0], status="incomplete", ai_attempts=1
+                )
+                coverage = BlockCoverage(
+                    pending[0].id, 2, 0, 0, 0, (2, 3),
+                    ("rate_limited",), False,
+                )
+                return ExtractionResult(
+                    (), (coverage,), (updated,), 1, False
+                )
+            raise AssertionError("Expected rate limit")
+
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.side_effect = AiRateLimitError()
+    monkeypatch.setattr(importer_module, "PdfSource", FakePdfSource)
+    monkeypatch.setattr(importer_module, "VocabExtractor", FakeExtractor)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    worker.ai_client = client
+
+    worker.run()
+
+    reopened = UserDb(db_path)
+    saved = reopened.get_import_blocks(lesson_id)
+    assert saved[0]["status"] == "local_ok"
+    assert saved[1]["ai_attempts"] == 1
+    assert reopened.get_lesson_words(lesson_id)[0]["word"] == "你好"
+    assert reopened.get_book(book_id)["import_state"] == "incomplete"
+    assert client.extract_vocab_from_image.call_count == 1
+    reopened.close()
+
+def test_resume_budget_counts_attempts_used_by_other_blocks(monkeypatch):
+    block = VocabBlock(
+        7, 2, 2, 4, (0, 0, 100, 200),
+        "pending.png", 2, 1, 2,
+    )
+    extractor = VocabExtractor()
+    extractor.lesson_ai_attempts = 2
+    monkeypatch.setattr(
+        extractor, "_extract_local_block", lambda *_args: []
+    )
+    client = MagicMock()
+    client.is_configured.return_value = True
+    client.extract_vocab_from_image.return_value = []
+
+    result = extractor.extract_blocks(MagicMock(), [block], client)
+
+    assert client.extract_vocab_from_image.call_count == 1
+    assert result.ai_attempts == 1
+    assert result.blocks[0].ai_attempts == 1
+    assert result.complete is False
+
+
+def test_checkpoint_keeps_longer_existing_block_rows(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    book_id = db.add_book("Sách thử", "book.pdf", "checkpoint-short", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson_id = db.get_lessons(book_id)[0]["id"]
+    record = db.replace_import_blocks(lesson_id, [
+        VocabBlock(
+            None, lesson_id, 1, 1, (0, 0, 100, 200),
+            "block.png", 2, 1, 2,
+        )
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(
+            1, "你好", "nǐhǎo", None, None, 2,
+            "regex", False, None,
+        ),
+        VocabRow(
+            2, "老师", "lǎoshī", None, None, 2,
+            "regex", False, None,
+        ),
+    ])
+    updated = VocabBlock(
+        record["id"], lesson_id, 1, 1, tuple(record["bbox"]),
+        record["crop_path"], 2, 1, 2, "incomplete", 2,
+    )
+    partial = VocabRow(
+        1, "你好", "nǐhǎo", None, None, 2,
+        "vision", True, "partial", source_block_id=record["id"],
+    )
+    coverage = BlockCoverage(
+        record["id"], 2, 0, 1, 1, (2,),
+        ("missing_orders",), False,
+    )
+
+    VocabImporterWorker._checkpoint_result(
+        db,
+        ExtractionResult(
+            (partial,), (coverage,), (updated,), 1, False
+        ),
+    )
+
+    assert [row["word"] for row in db.get_lesson_words(lesson_id)] == [
+        "你好", "老师"
+    ]
+    saved = db.get_import_blocks(lesson_id)[0]
+    assert saved["status"] == "incomplete"
+    assert saved["ai_attempts"] == 2
+    db.close()
+
+def test_load_or_create_blocks_reuses_persisted_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Sách thử", "book.pdf", "manifest-resume", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")]
+    )
+    lesson = db.get_lessons(book_id)[0]
+    boundary = LessonBoundary(1, "Một", 0, 9, 1.0, "lesson")
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [
+        VocabBlock(
+            None, None, 1, 1, (10, 20, 110, 220),
+            None, 2, 1, 2,
+        )
+    ]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"png"
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    first = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+    second = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+
+    assert first == second
+    assert first[0].id is not None
+    assert Path(first[0].crop_path).read_bytes() == b"png"
+    assert extractor.locate_blocks.call_count == 1
+    assert pdf.get_page_crop_image_bytes.call_count == 1
+    db.close()
+
+
+def test_load_or_create_blocks_retries_once_with_fresh_pdf_source(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Test book", "book.pdf", "locator-retry", 10)
+    db.replace_lessons(
+        book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")]
+    )
+    lesson = db.get_lessons(book_id)[0]
+    boundary = LessonBoundary(1, "One", 0, 9, 1.0, "lesson")
+    located = VocabBlock(
+        None, None, 1, 1, (10, 20, 110, 220),
+        None, 2, 1, 2,
+    )
+    extractor = MagicMock()
+    extractor.locate_blocks.side_effect = [[], [located]]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"png"
+    retry_source = MagicMock()
+    retry_pdf = retry_source.__enter__.return_value
+    source_factory = MagicMock(return_value=retry_source)
+    monkeypatch.setattr(importer_module, "PdfSource", source_factory)
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    blocks = worker._load_or_create_blocks(
+        db, pdf, extractor, lesson, boundary
+    )
+
+    assert len(blocks) == 1
+    assert extractor.locate_blocks.call_count == 2
+    assert extractor.locate_blocks.call_args_list[0].args[0] is pdf
+    assert extractor.locate_blocks.call_args_list[1].args[0] is retry_pdf
+    assert db.get_import_blocks(lesson["id"])[0]["block_no"] == 1
+    db.close()
+def test_resume_repairs_stale_block_and_preserves_valid_manual_blocks(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Repair", "book.pdf", "resume-repair", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    records = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 2, 0, 2,
+                   "incomplete", 4),
+        VocabBlock(None, lesson["id"], 2, 2, (0, 0, 50, 50), "valid.png", 1, 1, 1,
+                   "local_ok", 7),
+        VocabBlock(None, lesson["id"], 3, 3, (0, 0, 50, 50), "manual.png", 1, 1, 1,
+                   "manual", 8),
+    ])
+    db.replace_vocab_block(records[0]["id"], [
+        VocabRow(1, "old", "c2", None, None, 1, "regex", False, None,
+                 source_block_id=records[0]["id"])
+    ])
+    db.replace_vocab_block(records[1]["id"], [
+        VocabRow(1, "valid", "c2", None, None, 2, "regex", False, None,
+                 source_block_id=records[1]["id"])
+    ])
+    db.replace_vocab_block(records[2]["id"], [
+        VocabRow(1, "manual", "c2", None, None, 3, "manual", False, None,
+                 source_block_id=records[2]["id"])
+    ])
+    db.close()
+
+    fresh = VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2)
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [fresh]
+    pdf = MagicMock()
+    pdf.get_page_crop_image_bytes.return_value = b"fresh-crop"
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+
+    reopened = UserDb(db_path)
+    repaired = worker._load_or_create_blocks(
+        reopened, pdf, extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert repaired[0].id == records[0]["id"]
+    assert repaired[0].ai_attempts == 4
+    assert repaired[0].page_index == 1
+    assert repaired[0].first_order == 1
+    assert repaired[0].status == "pending"
+    assert Path(repaired[0].crop_path).read_bytes() == b"fresh-crop"
+    remaining_rows = reopened.get_lesson_words(lesson["id"])
+    assert [row["word"] for row in remaining_rows] == ["valid", "manual"]
+    assert {row["source_block_id"] for row in remaining_rows} == {
+        records[1]["id"], records[2]["id"]
+    }
+    saved = reopened.get_import_blocks(lesson["id"])
+    assert saved[1]["status"] == "local_ok"
+    assert saved[2]["status"] == "manual"
+    reopened.close()
+
+
+def test_resume_rejects_ambiguous_stale_manifest_without_mutation(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Ambiguous", "book.pdf", "resume-ambiguous", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 2, 0, 2,
+                   "incomplete", 4)
+    ])[0]
+    before = db.get_import_blocks(lesson["id"])
+    db.close()
+
+    extractor = MagicMock()
+    extractor.locate_blocks.return_value = [
+        VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2),
+        VocabBlock(None, None, 1, 1, (10, 10, 110, 110), None, 2, 1, 2),
+    ]
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    with pytest.raises(RuntimeError, match="manifest_needs_review"):
+        worker._load_or_create_blocks(
+            reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+            LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+        )
+
+    assert reopened.get_import_blocks(lesson["id"]) == before
+    assert not (Path(db_path).parent / "book_crops").exists()
+    reopened.close()
+
+
+
+def test_resume_reconciles_cached_ai_rows_without_resetting_attempts(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Cached AI", "book.pdf", "cached-ai", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 2, 1, 2,
+                   "incomplete", 3)
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(1, "local-noise", None, None, None, 1, "regex", True, "ocr",
+                 source_block_id=record["id"]),
+        VocabRow(1, "hello", "ai", None, None, 1, "vision", True, "review",
+                 source_block_id=record["id"]),
+        VocabRow(1, "teacher", "ai", None, None, 1, "vision", True, "review",
+                 source_block_id=record["id"]),
+    ])
+    db.close()
+
+    extractor = VocabExtractor()
+    extractor.locate_blocks = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].status == "ai_ok"
+    assert blocks[0].ai_attempts == 3
+    assert [(row["order_no"], row["word"], row["extract_by"])
+            for row in reopened.get_lesson_words(lesson["id"])] == [
+        (1, "hello", "vision"),
+        (2, "teacher", "vision"),
+    ]
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
+
+def test_resume_reconciles_range_manifest_count_without_relocating(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Cached range", "book.pdf", "cached-range", 10)
+    db.replace_lessons(book_id, [LessonBoundary(2, "Two", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "old.png", 3, 9, 12,
+                   "ai_ok", 1)
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(order, f"word-{order}", "ai", None, None, 1, "vision", False, None,
+                 source_block_id=record["id"])
+        for order in range(9, 13)
+    ])
+    db.close()
+
+    extractor = VocabExtractor()
+    extractor.locate_blocks = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(2, "Two", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].status == "ai_ok"
+    assert blocks[0].expected_rows == 4
+    assert blocks[0].ai_attempts == 1
+    saved = reopened.get_import_blocks(lesson["id"])[0]
+    assert saved["expected_rows"] == 4
+    assert [(row["order_no"], row["word"], row["extract_by"])
+            for row in reopened.get_lesson_words(lesson["id"])] == [
+        (9, "word-9", "vision"),
+        (10, "word-10", "vision"),
+        (11, "word-11", "vision"),
+        (12, "word-12", "vision"),
+    ]
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
+def test_resume_clears_stale_rows_for_valid_automatic_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Rows", "book.pdf", "resume-stale-rows", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "valid.png", 2, 1, 2,
+                   "ai_ok", 2)
+    ])[0]
+    db.replace_vocab_block(record["id"], [
+        VocabRow(1, "one", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+        VocabRow(2, "two", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+        VocabRow(3, "three", None, None, None, 1, "vision", False, None,
+                 source_block_id=record["id"]),
+    ])
+    db.close()
+
+    extractor = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].id == record["id"]
+    assert blocks[0].status == "pending"
+    assert blocks[0].ai_attempts == 2
+    assert blocks[0].first_order == 1
+    assert blocks[0].last_order == 2
+    assert reopened.get_lesson_words(lesson["id"]) == []
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
+
+
+def test_resume_clears_zero_rows_for_valid_automatic_manifest(tmp_path):
+    db_path = str(tmp_path / "user.sqlite")
+    db = UserDb(db_path)
+    book_id = db.add_book("Zero Rows", "book.pdf", "resume-zero-rows", 10)
+    db.replace_lessons(book_id, [LessonBoundary(1, "One", 0, 9, 1.0, "lesson")])
+    lesson = db.get_lessons(book_id)[0]
+    record = db.replace_import_blocks(lesson["id"], [
+        VocabBlock(None, lesson["id"], 1, 1, (0, 0, 100, 100), "valid.png", 2, 1, 2,
+                   "local_ok", 2)
+    ])[0]
+    db.close()
+
+    extractor = MagicMock()
+    worker = VocabImporterWorker(book_id, "book.pdf", db_path)
+    reopened = UserDb(db_path)
+
+    blocks = worker._load_or_create_blocks(
+        reopened, MagicMock(), extractor, reopened.get_lessons(book_id)[0],
+        LessonBoundary(1, "One", 0, 9, 1.0, "lesson"),
+    )
+
+    assert blocks[0].id == record["id"]
+    assert blocks[0].status == "pending"
+    assert blocks[0].ai_attempts == 2
+    assert reopened.get_lesson_words(lesson["id"]) == []
+    extractor.locate_blocks.assert_not_called()
+    reopened.close()
+
+
+def test_checkpoint_before_region_redraw_does_not_restore_old_rows_or_crop(tmp_path):
+    db = UserDb(str(tmp_path / "user.sqlite"))
+    try:
+        book = db.add_book("Regions", "test.pdf", "stale-region", 1)
+        db.replace_lessons(book, [LessonBoundary(1, None, 0, 0, 1, "lesson")])
+        lesson = db.get_lessons(book)[0]["id"]
+        record, = db.replace_import_blocks(lesson, [
+            VocabBlock(None, lesson, 1, 0, (10, 20, 100, 200), "old.png", 1, 1, 1)
+        ])
+        stale = replace(VocabImporterWorker._record_to_block(record), status="local_ok")
+        word = VocabRow(1, "新", None, None, None, 1, "manual", False, None,
+                        source_block_id=stale.id)
+        db.save_region_review(lesson, 0, (20, 30, 150, 200), "accepted",
+                              stale.id, 0, "new.png", [word], "manual")
+        result = ExtractionResult((replace(word, word="旧", extract_by="regex"),), (), (stale,), 0, True)
+        VocabImporterWorker._checkpoint_result(db, result)
+        assert [r["word"] for r in db.get_lesson_words(lesson)] == ["新"]
+        current, = db.get_import_blocks(lesson)
+        assert (current["crop_path"], current["status"], current["region_revision"]) == ("new.png", "manual", 1)
+    finally:
+        db.close()
